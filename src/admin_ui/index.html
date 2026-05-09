@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Harmonixia Admin</title>
+  <link rel="stylesheet" href="/admin/styles.css" />
+</head>
+<body>
+  <div id="app" class="app" aria-live="polite">
+    <main class="setup-shell" id="setup-view">
+      <aside class="setup-sidebar" aria-label="Setup progress">
+        <h2>Setup</h2>
+        <div class="step" data-step="admin">1. Create first admin</div>
+        <div class="step" data-step="paths">2. Choose library paths</div>
+        <div class="step" data-step="providers">3. Configure metadata providers</div>
+        <div class="step" data-step="scan">4. Start initial scan</div>
+      </aside>
+
+      <section class="setup-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Admin-only server setup</p>
+            <h1>Harmonixia First-Run Wizard</h1>
+          </div>
+          <span class="badge" id="setup-state">Checking setup</span>
+        </div>
+
+        <p class="progressive-note">
+          The library grows progressively. Artists, albums, podcasts, and tracks become visible only after Harmonixia has grouped them into stable browse results.
+        </p>
+
+        <div class="notice hidden" id="setup-message" role="status"></div>
+
+        <form id="setup-form" autocomplete="off">
+          <div class="group" data-group="admin">
+            <h3>Admin account</h3>
+            <div class="field-grid">
+              <div>
+                <label for="admin-user">Username</label>
+                <input id="admin-user" data-element-id="admin-username" type="text" autocomplete="username" required />
+              </div>
+              <div>
+                <label for="admin-pass">Password</label>
+                <input id="admin-pass" data-element-id="admin-password" type="password" autocomplete="new-password" required />
+              </div>
+            </div>
+          </div>
+
+          <div class="group" data-group="paths">
+            <h3>Managed paths</h3>
+            <label for="library-root">Managed library root</label>
+            <input id="library-root" data-element-id="library-root" type="text" required disabled />
+            <label for="dropbox-root">Dropbox import folder</label>
+            <input id="dropbox-root" data-element-id="dropbox-root" type="text" required disabled />
+            <small>Music is organized as Artist / Album / Track. Podcast placement follows the saved server setting.</small>
+          </div>
+
+          <div class="group" data-group="providers">
+            <h3>Metadata providers</h3>
+            <div class="provider">
+              <span>MusicBrainz / Cover Art Archive</span>
+              <input data-element-id="provider-musicbrainz" id="provider-musicbrainz" type="checkbox" disabled />
+            </div>
+            <small>MusicBrainz and Cover Art Archive stay enabled for baseline matching and artwork.</small>
+
+            <div class="provider">
+              <label for="provider-discogs">Discogs (optional API key)</label>
+              <input data-element-id="provider-discogs" id="provider-discogs" type="checkbox" disabled />
+            </div>
+            <input data-element-id="discogs-api-key" id="discogs-api-key" type="password" placeholder="Optional API key" autocomplete="off" disabled />
+
+            <div class="provider">
+              <label for="provider-fanart">Fanart.tv (optional API key)</label>
+              <input data-element-id="provider-fanart" id="provider-fanart" type="checkbox" disabled />
+            </div>
+            <input data-element-id="fanart-api-key" id="fanart-api-key" type="password" placeholder="Optional API key" autocomplete="off" disabled />
+
+            <div class="provider">
+              <label for="provider-audiodb">TheAudioDB (optional API key)</label>
+              <input data-element-id="provider-audiodb" id="provider-audiodb" type="checkbox" disabled />
+            </div>
+            <input data-element-id="audiodb-api-key" id="audiodb-api-key" type="password" placeholder="Optional API key" autocomplete="off" disabled />
+          </div>
+
+          <div class="group" data-group="scan">
+            <h3>Initial scan</h3>
+            <p>
+              The scan starts with the managed library and dropbox roots. Incomplete, duplicate, failed, or conflicting items stay out of browse and search until resolved.
+            </p>
+          </div>
+
+          <div class="actions">
+            <button data-element-id="back-button" id="back-button" type="button">Back</button>
+            <button data-element-id="start-scan-button" id="start-scan-button" type="submit">Save and Start Initial Scan</button>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <main class="login-shell hidden" id="login-view">
+      <section class="login-panel">
+        <p class="eyebrow">Harmonixia Admin</p>
+        <h1>Sign in</h1>
+        <div class="notice hidden" id="login-message" role="status"></div>
+        <form id="login-form">
+          <label for="login-user">Username</label>
+          <input id="login-user" type="text" autocomplete="username" required />
+          <label for="login-pass">Password</label>
+          <input id="login-pass" type="password" autocomplete="current-password" required />
+          <div class="actions single">
+            <button type="submit" id="login-button">Open Dashboard</button>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <div class="dashboard hidden" id="dashboard-view">
+      <header>
+        <div><strong>Harmonixia Admin</strong></div>
+        <nav aria-label="Admin navigation">
+          <a href="#dashboard" data-element-id="nav-dashboard">Dashboard</a>
+          <a href="#failures" data-element-id="nav-failures">Failures</a>
+          <a href="#quarantine" data-element-id="nav-quarantine" aria-disabled="true">Quarantine</a>
+          <a href="#providers" data-element-id="nav-providers">Providers</a>
+          <a href="#users" data-element-id="nav-users">Users</a>
+        </nav>
+      </header>
+
+      <main>
+        <section class="dashboard-section" id="section-dashboard" data-section="dashboard">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Dashboard</p>
+              <h1>Library operations</h1>
+            </div>
+            <button type="button" data-element-id="refresh-dashboard-button" id="refresh-dashboard-button">Refresh</button>
+          </div>
+
+          <div class="notice hidden" id="dashboard-message" role="status"></div>
+
+          <div class="metric-grid" aria-label="Library summary">
+            <article class="metric-card">
+              <span>Scanning</span>
+              <strong data-element-id="summary-scanning" id="summary-scanning">-</strong>
+            </article>
+            <article class="metric-card">
+              <span>Imported</span>
+              <strong data-element-id="summary-imported" id="summary-imported">-</strong>
+            </article>
+            <article class="metric-card">
+              <span>Quarantined</span>
+              <strong data-element-id="summary-quarantined" id="summary-quarantined">-</strong>
+            </article>
+            <article class="metric-card">
+              <span>Failed</span>
+              <strong data-element-id="summary-failed" id="summary-failed">-</strong>
+            </article>
+          </div>
+
+          <div class="metric-grid library-total-grid" aria-label="Library totals">
+            <article class="metric-card">
+              <span>Artists</span>
+              <strong data-element-id="summary-artists" id="summary-artists">-</strong>
+            </article>
+            <article class="metric-card">
+              <span>Albums</span>
+              <strong data-element-id="summary-albums" id="summary-albums">-</strong>
+            </article>
+            <article class="metric-card">
+              <span>Tracks</span>
+              <strong data-element-id="summary-tracks" id="summary-tracks">-</strong>
+            </article>
+            <article class="metric-card">
+              <span>Playlists</span>
+              <strong data-element-id="summary-playlists" id="summary-playlists">-</strong>
+            </article>
+          </div>
+
+          <div class="dashboard-grid">
+            <section class="admin-card scan-progress-card" aria-labelledby="scan-progress-heading">
+              <h2 id="scan-progress-heading">Scan progress</h2>
+              <div class="progress-list" data-element-id="scan-progress-list" id="scan-progress-list">
+                <p class="progress-empty">No active scans.</p>
+              </div>
+            </section>
+
+            <section class="admin-card" aria-labelledby="transcode-heading">
+              <h2 id="transcode-heading">Transcode capacity</h2>
+              <dl class="stat-list">
+                <div>
+                  <dt>In use</dt>
+                  <dd data-element-id="transcode-in-use" id="transcode-in-use">-</dd>
+                </div>
+                <div>
+                  <dt>Available</dt>
+                  <dd data-element-id="transcode-available" id="transcode-available">-</dd>
+                </div>
+                <div>
+                  <dt>Limit</dt>
+                  <dd data-element-id="transcode-limit" id="transcode-limit">-</dd>
+                </div>
+              </dl>
+            </section>
+
+            <section class="admin-card" aria-labelledby="maintenance-heading">
+              <h2 id="maintenance-heading">Maintenance</h2>
+              <div class="action-stack">
+                <button type="button" data-element-id="full-rescan-button" id="full-rescan-button">Start Full Rescan</button>
+                <form id="subtree-rescan-form" class="inline-form">
+                  <label for="subtree-rescan-path">Subtree path</label>
+                  <div class="inline-controls">
+                    <input id="subtree-rescan-path" data-element-id="subtree-rescan-path" type="text" placeholder="/srv/harmonixia/library/Artist" />
+                    <button type="submit" data-element-id="subtree-rescan-button" id="subtree-rescan-button">Rescan Subtree</button>
+                  </div>
+                </form>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="dashboard-section hidden" id="section-failures" data-section="failures">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Failures</p>
+              <h1>Import failures</h1>
+            </div>
+            <div class="section-actions">
+              <button type="button" data-element-id="clear-failures-filter-button" id="clear-failures-filter-button" class="hidden">Show All</button>
+              <button type="button" data-element-id="refresh-failures-button" id="refresh-failures-button">Refresh</button>
+            </div>
+          </div>
+
+          <div class="notice hidden" id="failures-message" role="status"></div>
+          <div class="table-wrap failures-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Updated</th>
+                  <th scope="col">Job</th>
+                  <th scope="col">Attempts</th>
+                  <th scope="col">Source path</th>
+                  <th scope="col">Failure detail</th>
+                  <th scope="col">Job ID</th>
+                </tr>
+              </thead>
+              <tbody id="failures-table-body" data-element-id="failures-table-body">
+                <tr><td colspan="6">Failures have not loaded.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="dashboard-section hidden" id="section-providers" data-section="providers">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Providers</p>
+              <h1>Metadata provider health</h1>
+            </div>
+            <button type="button" data-element-id="refresh-providers-button" id="refresh-providers-button">Refresh</button>
+          </div>
+
+          <div class="notice hidden" id="providers-message" role="status"></div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Provider</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Enabled</th>
+                  <th scope="col">API key</th>
+                  <th scope="col">Ready</th>
+                  <th scope="col">Failures</th>
+                  <th scope="col">Retry after</th>
+                </tr>
+              </thead>
+              <tbody id="providers-table-body" data-element-id="providers-table-body">
+                <tr><td colspan="7">Provider health has not loaded.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="dashboard-section hidden" id="section-users" data-section="users">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Users</p>
+              <h1>Local accounts</h1>
+            </div>
+            <button type="button" data-element-id="refresh-users-button" id="refresh-users-button">Refresh</button>
+          </div>
+
+          <div class="notice hidden" id="users-message" role="status"></div>
+
+          <section class="admin-card" aria-labelledby="create-user-heading">
+            <h2 id="create-user-heading">Create user</h2>
+            <form id="create-user-form" class="form-grid">
+              <div>
+                <label for="create-user-username">Username</label>
+                <input id="create-user-username" data-element-id="create-user-username" type="text" autocomplete="off" required />
+              </div>
+              <div>
+                <label for="create-user-password">Password</label>
+                <input id="create-user-password" data-element-id="create-user-password" type="password" autocomplete="new-password" required />
+              </div>
+              <div>
+                <label for="create-user-role">Role</label>
+                <select id="create-user-role" data-element-id="create-user-role">
+                  <option value="user">User</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </div>
+              <div class="form-action">
+                <button type="submit" data-element-id="create-user-button" id="create-user-button">Create User</button>
+              </div>
+            </form>
+          </section>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Username</th>
+                  <th scope="col">Role</th>
+                  <th scope="col">State</th>
+                  <th scope="col">Created</th>
+                  <th scope="col">New password</th>
+                  <th scope="col">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="users-table-body" data-element-id="users-table-body">
+                <tr><td colspan="6">Users have not loaded.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script src="/admin/app.js" defer></script>
+</body>
+</html>

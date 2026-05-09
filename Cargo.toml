@@ -1,0 +1,33 @@
+[package]
+name = "harmonixia-server"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+rust-version = "1.75"
+
+[dependencies]
+argon2 = "0.5"
+async-trait = "0.1"
+axum = "=0.7.5"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+image = { version = "0.24", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "=0.7.4", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-normalization = "0.1"
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+utoipa-swagger-ui = { version = "=8.1.0", features = ["axum", "vendored"] }
+uuid = { version = "=1.8.0", features = ["serde", "v4"] }
+walkdir = "2"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = "=0.4.13"
