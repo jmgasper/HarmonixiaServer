@@ -158,6 +158,7 @@ mod tests {
         let html = body_text(response.into_body()).await;
 
         assert!(html.contains("data-element-id=\"nav-dashboard\""));
+        assert!(html.contains("data-element-id=\"nav-library\""));
         assert!(html.contains("data-element-id=\"nav-providers\""));
         assert!(html.contains("data-element-id=\"nav-users\""));
         assert!(!html.contains("data-element-id=\"nav-providers\" aria-disabled=\"true\""));
@@ -175,6 +176,17 @@ mod tests {
         assert!(html.contains("data-element-id=\"full-rescan-button\""));
         assert!(html.contains("data-element-id=\"subtree-rescan-path\""));
         assert!(html.contains("data-element-id=\"providers-table-body\""));
+        assert!(html.contains("data-element-id=\"refresh-library-button\""));
+        assert!(html.contains("data-element-id=\"library-list\""));
+        assert!(html.contains("data-element-id=\"library-detail\""));
+        assert!(html.contains("data-element-id=\"library-tab-artists\""));
+        assert!(html.contains("data-element-id=\"library-tab-albums\""));
+        assert!(html.contains("data-element-id=\"library-tab-tracks\""));
+        assert!(html.contains("data-element-id=\"library-tab-playlists\""));
+        assert!(html.contains("data-element-id=\"player-start-button\""));
+        assert!(html.contains("data-element-id=\"player-stop-button\""));
+        assert!(html.contains("data-element-id=\"player-next-button\""));
+        assert!(html.contains("data-element-id=\"player-prev-button\""));
         assert!(html.contains("data-element-id=\"create-user-username\""));
         assert!(html.contains("data-element-id=\"create-user-password\""));
         assert!(html.contains("data-element-id=\"create-user-role\""));
@@ -289,6 +301,13 @@ mod tests {
             "/api/v1/admin/maintenance/rescans/subtree",
             "/api/v1/admin/users/${userId}/password-reset",
             "/api/v1/admin/users/${userId}",
+            "/api/v1/catalog/artists",
+            "/api/v1/catalog/albums",
+            "/api/v1/catalog/tracks",
+            "/api/v1/catalog/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}/artwork",
+            "/api/v1/playlists",
+            "/api/v1/media/track/${encodeURIComponent(track.id)}/transcode/standard",
+            "/api/v1/me/playback/progress/track/${encodeURIComponent(state.currentTrackId)}",
         ] {
             assert!(APP_JS.contains(endpoint), "missing endpoint {endpoint}");
         }
@@ -296,7 +315,8 @@ mod tests {
         assert!(APP_JS.contains("openDashboardSection"));
         assert!(APP_JS.contains("renderProviderHealth"));
         assert!(APP_JS.contains("renderUsers"));
+        assert!(APP_JS.contains("renderLibrary"));
+        assert!(APP_JS.contains("playTrack("));
         assert!(!APP_JS.contains("/api/v1/admin/quarantine"));
-        assert!(!APP_JS.contains("/api/v1/me/playback"));
     }
 }

@@ -108,6 +108,22 @@ JSON API errors use this shape:
 }
 ```
 
+Some errors may include optional structured details:
+
+```json
+{
+  "code": "conflict",
+  "message": "target is reconnecting",
+  "details": {
+    "reason": "target_reconnecting"
+  }
+}
+```
+
+`details.reason` is currently reserved for Sonos remote playback contracts and
+is omitted on existing non-Sonos API errors unless a handler explicitly provides
+it.
+
 Common codes are:
 
 ```text
@@ -900,6 +916,12 @@ System config:
 GET /api/v1/admin/system/config
 PUT /api/v1/admin/system/config
 ```
+
+The system config object includes `public_base_url`, which is returned as
+`null` when unset. On `PUT`, `library_root` and `dropbox_root` remain required;
+optional fields such as `podcast_subtree`, `public_base_url`,
+`transcode_concurrency_limit`, and `scan_thread_count` preserve their existing
+stored value when omitted.
 
 Provider settings:
 

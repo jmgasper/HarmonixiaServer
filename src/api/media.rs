@@ -417,7 +417,16 @@ async fn serve_original(
 ) -> Result<Response, ApiError> {
     let item_type = parse_media_item_type(&item_type)?;
     let media_file = state.visible_original_media_file(item_type, item_id).await?;
-    let original = resolve_original_file(&state, &media_file)?;
+    serve_original_media_file(&state, media_file, headers, disposition).await
+}
+
+pub(crate) async fn serve_original_media_file(
+    state: &AppState,
+    media_file: MediaFile,
+    headers: HeaderMap,
+    disposition: ContentDisposition,
+) -> Result<Response, ApiError> {
+    let original = resolve_original_file(state, &media_file)?;
     let filename = filename_for_path(&original);
     let mut file = open_original_file(&original).await?;
     let metadata = file.metadata().await.map_err(map_file_error)?;
@@ -542,7 +551,7 @@ where
 ///
 /// Errors:
 /// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
-fn transcode_response<R>(stream: ReaderStream<R>, filename: &str) -> Response
+pub(crate) fn transcode_response<R>(stream: ReaderStream<R>, filename: &str) -> Response
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -666,7 +675,10 @@ async fn open_original_file(path: &FsPath) -> Result<File, ApiError> {
 ///
 /// Errors:
 /// - Returns `ApiError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
-fn resolve_original_file(state: &AppState, media_file: &MediaFile) -> Result<PathBuf, ApiError> {
+pub(crate) fn resolve_original_file(
+    state: &AppState,
+    media_file: &MediaFile,
+) -> Result<PathBuf, ApiError> {
     let raw_path = media_file
         .managed_path
         .as_deref()
@@ -796,7 +808,7 @@ fn parse_aac_transcode_profile(value: &str) -> Result<AacTranscodeProfile, ApiEr
 /// Functionality: Enumerates `Inline`, `Attachment` states or choices for authenticated original media, direct transcode, and HLS HTTP API.
 /// Dependencies: depends on the enum variants plus any derive macros or trait bounds declared on the type.
 /// Used by: referenced from `src/api/media.rs`.
-enum ContentDisposition {
+pub(crate) enum ContentDisposition {
     Inline,
     Attachment,
 }
@@ -849,7 +861,7 @@ fn filename_for_path(path: &FsPath) -> String {
 ///
 /// Errors:
 /// - Does not return recoverable errors.
-fn filename_for_transcode(path: &FsPath, profile: AacTranscodeProfile) -> String {
+pub(crate) fn filename_for_transcode(path: &FsPath, profile: AacTranscodeProfile) -> String {
     let stem = path
         .file_stem()
         .and_then(|filename| filename.to_str())

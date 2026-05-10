@@ -43,6 +43,9 @@ Environment variables:
 - `HARMONIXIA_BIND_ADDR`, default `127.0.0.1:3000`
 - `HARMONIXIA_LIBRARY_ROOT`, bootstrap default `/srv/harmonixia/library`
 - `HARMONIXIA_DROPBOX_ROOT`, bootstrap default `/srv/harmonixia/dropbox`
+- `HARMONIXIA_PUBLIC_BASE_URL`, optional bootstrap-only absolute `http` or
+  `https` URL for LAN-reachable remote playback clients; localhost and loopback
+  hosts are rejected because remote players cannot reach them
 - `HARMONIXIA_FFMPEG_PATH`, default `ffmpeg`
 - `HARMONIXIA_TRANSCODE_CONCURRENCY_LIMIT`, bootstrap default `2`; `0`
   disables new direct and HLS transcodes by saturating admission
@@ -51,10 +54,12 @@ Environment variables:
 - `HARMONIXIA_PROVIDER_<PROVIDER>_ENABLED`, bootstrap default, for example `HARMONIXIA_PROVIDER_DISCOGS_ENABLED=false`
 - `HARMONIXIA_PROVIDER_<PROVIDER>_API_KEY` or `_TOKEN`, bootstrap default for providers that require credentials
 
-The library root, dropbox root, transcode concurrency limit, scan thread count,
-and provider settings are stored durably in Postgres on first startup. Later
-environment changes do not override existing rows; use the admin settings
-endpoints to update runtime configuration:
+The library root, dropbox root, public base URL, transcode concurrency limit,
+scan thread count, and provider settings are stored durably in Postgres on first
+startup. Later environment changes do not override existing rows; use the admin
+settings endpoints to update runtime configuration. The public base URL is
+intended for LAN-reachable remote playback URLs and is not inferred from
+incoming requests.
 
 - `GET /api/v1/admin/system/config`
 - `PUT /api/v1/admin/system/config`

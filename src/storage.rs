@@ -31,6 +31,7 @@ const SYSTEM_CONFIG_SELECT: &str = r#"
     library_root,
     dropbox_root,
     podcast_subtree,
+    public_base_url,
     transcode_concurrency_limit,
     scan_thread_count,
     updated_at
@@ -610,17 +611,19 @@ impl PgMaintenanceRepository {
                 library_root,
                 dropbox_root,
                 podcast_subtree,
+                public_base_url,
                 transcode_concurrency_limit,
                 scan_thread_count,
                 updated_at
             )
-            VALUES (1, $1, $2, $3, $4, $5, $6)
+            VALUES (1, $1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
         .bind(defaults.library_root.as_str())
         .bind(defaults.dropbox_root.as_str())
         .bind(defaults.podcast_subtree.as_str())
+        .bind(defaults.public_base_url.as_deref())
         .bind(defaults.transcode_concurrency_limit)
         .bind(defaults.scan_thread_count)
         .bind(defaults.updated_at)
@@ -672,15 +675,17 @@ impl PgMaintenanceRepository {
                 library_root,
                 dropbox_root,
                 podcast_subtree,
+                public_base_url,
                 transcode_concurrency_limit,
                 scan_thread_count,
                 updated_at
             )
-            VALUES (1, $1, $2, $3, $4, $5, $6)
+            VALUES (1, $1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (id) DO UPDATE SET
                 library_root = EXCLUDED.library_root,
                 dropbox_root = EXCLUDED.dropbox_root,
                 podcast_subtree = EXCLUDED.podcast_subtree,
+                public_base_url = EXCLUDED.public_base_url,
                 transcode_concurrency_limit = EXCLUDED.transcode_concurrency_limit,
                 scan_thread_count = EXCLUDED.scan_thread_count,
                 updated_at = EXCLUDED.updated_at
@@ -691,6 +696,7 @@ impl PgMaintenanceRepository {
             .bind(config.library_root.as_str())
             .bind(config.dropbox_root.as_str())
             .bind(config.podcast_subtree.as_str())
+            .bind(config.public_base_url.as_deref())
             .bind(config.transcode_concurrency_limit)
             .bind(config.scan_thread_count)
             .bind(config.updated_at)
@@ -3247,6 +3253,7 @@ fn system_config_from_row(row: &PgRow) -> Result<SystemConfig, StorageError> {
         library_root: row.try_get("library_root")?,
         dropbox_root: row.try_get("dropbox_root")?,
         podcast_subtree: row.try_get("podcast_subtree")?,
+        public_base_url: row.try_get("public_base_url")?,
         transcode_concurrency_limit: row.try_get("transcode_concurrency_limit")?,
         scan_thread_count: row.try_get("scan_thread_count")?,
         updated_at: row.try_get("updated_at")?,

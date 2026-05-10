@@ -10,7 +10,8 @@ use harmonixia_server::{
         CatalogEntityType, CatalogGrouping, CatalogImportDecision, CatalogImportRequest,
         ImportJobKind, ImportJobSource, ImportJobStatus, MaintenanceScope, MediaFileStatus,
         MediaProbeFacts, MetadataProvenanceDraft, MusicCatalogGrouping, PodcastCatalogGrouping,
-        ProviderHealth, ProviderKind, ProviderStatus, QuarantineItem, QuarantineStatus, RepairPlan,
+        PlaybackItemType, ProviderHealth, ProviderKind, ProviderStatus, QuarantineItem,
+        QuarantineStatus, RepairPlan, SonosDeliveryKind,
     },
     pipeline::ImportWorkRequest,
     providers::{ProviderCredential, ProviderRegistry},
@@ -18,8 +19,9 @@ use harmonixia_server::{
     services::{
         BackgroundServiceConfig, BackgroundServices, DropboxWatcherConfig, ImportWorkerConfig,
     },
-    state::ProviderConfig,
-    storage::DatabaseConfig,
+    sonos::{SonosGroupSnapshot, SonosLiveState, SonosSnapshot, SonosSpeakerSnapshot},
+    state::{ProviderConfig, ServerConfigError, SonosMediaAuthorizationRequest},
+    storage::{DatabaseConfig, StorageError},
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -589,6 +591,50 @@ async fn get_bytes(
     let headers = response.headers().clone();
     let bytes = response.into_body().collect().await.unwrap().to_bytes().to_vec();
     (status, headers, bytes)
+}
+
+async fn configure_public_base_url(
+    state: &AppState,
+    library_root: &Path,
+    dropbox_root: &Path,
+    public_base_url: &str,
+) {
+    state
+        .update_system_config(
+            &library_root.to_string_lossy(),
+            &dropbox_root.to_string_lossy(),
+            Some("Podcasts"),
+            Some(Some(public_base_url)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+fn sonos_media_request(
+    item_type: PlaybackItemType,
+    item_id: Uuid,
+    session_generation: u64,
+    item_generation: u64,
+    target_id: &str,
+) -> SonosMediaAuthorizationRequest {
+    SonosMediaAuthorizationRequest {
+        session_id: Uuid::parse_str("018f26c0-0000-7000-8000-000000000100").unwrap(),
+        session_generation,
+        item_generation,
+        target_id: target_id.into(),
+        item_type,
+        item_id,
+    }
+}
+
+fn path_and_query_from_url(url: &str) -> String {
+    let url = reqwest::Url::parse(url).unwrap();
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
 }
 
 /// Verifies that json array contains id.
@@ -1648,6 +1694,7 @@ async fn first_admin_creation_can_resume_setup_and_complete_from_server_state() 
     .await;
     assert_eq!(config_status, StatusCode::OK);
     assert_eq!(config_body["library_root"], "/srv/harmonixia/library");
+    assert_eq!(config_body["public_base_url"], Value::Null);
     assert_eq!(config_body["scan_thread_count"], 8);
 
     let (settings_status, settings_body) = get_json(
@@ -1730,6 +1777,7 @@ async fn resumed_setup_save_preserves_persisted_config_and_provider_state() {
             "/persisted/harmonixia/library",
             "/persisted/harmonixia/dropbox",
             Some("Shows/Podcasts"),
+            Some(Some("https://speaker-lan.example.test:8443")),
             Some(7),
             Some(4),
         )
@@ -1793,6 +1841,10 @@ async fn resumed_setup_save_preserves_persisted_config_and_provider_state() {
     assert_eq!(config_body["library_root"], "/persisted/harmonixia/library");
     assert_eq!(config_body["dropbox_root"], "/persisted/harmonixia/dropbox");
     assert_eq!(config_body["podcast_subtree"], "Shows/Podcasts");
+    assert_eq!(
+        config_body["public_base_url"],
+        "https://speaker-lan.example.test:8443"
+    );
     assert_eq!(config_body["transcode_concurrency_limit"], 7);
     assert_eq!(config_body["scan_thread_count"], 4);
 
@@ -1828,6 +1880,10 @@ async fn resumed_setup_save_preserves_persisted_config_and_provider_state() {
     assert_eq!(updated_config["library_root"], "/setup/harmonixia/library");
     assert_eq!(updated_config["dropbox_root"], "/setup/harmonixia/dropbox");
     assert_eq!(updated_config["podcast_subtree"], "Shows/Podcasts");
+    assert_eq!(
+        updated_config["public_base_url"],
+        "https://speaker-lan.example.test:8443"
+    );
     assert_eq!(updated_config["transcode_concurrency_limit"], 7);
     assert_eq!(updated_config["scan_thread_count"], 4);
 
@@ -1882,6 +1938,10 @@ async fn resumed_setup_save_preserves_persisted_config_and_provider_state() {
     assert_eq!(final_config["library_root"], "/setup/harmonixia/library");
     assert_eq!(final_config["dropbox_root"], "/setup/harmonixia/dropbox");
     assert_eq!(final_config["podcast_subtree"], "Shows/Podcasts");
+    assert_eq!(
+        final_config["public_base_url"],
+        "https://speaker-lan.example.test:8443"
+    );
     assert_eq!(final_config["transcode_concurrency_limit"], 7);
     assert_eq!(final_config["scan_thread_count"], 4);
     assert_eq!(state.system_config().podcast_subtree, "Shows/Podcasts");
@@ -4575,6 +4635,443 @@ async fn media_original_stream_uses_episode_canonical_file_when_multiple_publish
 }
 
 #[tokio::test]
+async fn sonos_signed_original_fetch_uses_sonos_path_without_basic_auth() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-original-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Podcasts/Show")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+    let managed_path = library_root.join("Podcasts/Show/sonos-original.mp3");
+    let body = b"sonos original bytes";
+    fs::write(&managed_path, body).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test/prefix",
+    )
+    .await;
+    let source_path = dropbox_root.join("sonos-original-source.mp3");
+    let imported = state
+        .repository()
+        .import_catalog_file(with_managed_path(
+            podcast_import_request(
+                &source_path.to_string_lossy(),
+                "sonos-original-hash",
+                "Sonos Podcast",
+                "Original Episode",
+                Some(1),
+            ),
+            &managed_path,
+            body.len() as i64,
+        ))
+        .await
+        .unwrap();
+    let episode_id = imported.episode.as_ref().unwrap().id;
+    let signed = state
+        .register_sonos_media_authorization(sonos_media_request(
+            PlaybackItemType::Episode,
+            episode_id,
+            1,
+            1,
+            "speaker-1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(signed.claim.delivery_kind, SonosDeliveryKind::Original);
+    assert!(signed
+        .url
+        .contains("/prefix/api/v1/sonos/media/"));
+    assert!(!signed.url.contains("/api/v1/media/"));
+
+    let app = router(state);
+    let (status, headers, bytes) =
+        get_bytes(app.clone(), &path_and_query_from_url(&signed.url), None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, body);
+    assert_eq!(headers[header::CONTENT_TYPE], "audio/mpeg");
+
+    let (range_status, _, range_bytes) = get_bytes(
+        app,
+        &path_and_query_from_url(&signed.url),
+        None,
+        &[("range", "bytes=0-4")],
+    )
+    .await;
+    assert_eq!(range_status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(range_bytes, b"sonos");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_unsafe_media_uses_only_aac_high_fallback() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-transcode-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+    let managed_path = library_root.join("Artist/Album/sonos-source.flac");
+    fs::write(&managed_path, b"source media bytes").unwrap();
+    let fake_ffmpeg = root.join("fake-ffmpeg.sh");
+    let args_log = root.join("ffmpeg-args.log");
+    fake_ffmpeg_script(&fake_ffmpeg, &args_log, None, 0);
+
+    let Some(state) = test_state_with_transcode_runtime(
+        library_root.clone(),
+        dropbox_root.clone(),
+        fake_ffmpeg,
+        2,
+    )
+    .await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+    let source_path = dropbox_root.join("sonos-source.flac");
+    let imported = state
+        .repository()
+        .import_catalog_file(with_managed_path(
+            music_import_request(
+                &source_path.to_string_lossy(),
+                "sonos-transcode-hash",
+                "Sonos Artist",
+                "Sonos Album",
+                "Fallback Track",
+                Some(1),
+            ),
+            &managed_path,
+            18,
+        ))
+        .await
+        .unwrap();
+    let track_id = imported.track.as_ref().unwrap().id;
+    let signed = state
+        .register_sonos_media_authorization(sonos_media_request(
+            PlaybackItemType::Track,
+            track_id,
+            1,
+            1,
+            "speaker-1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        signed.claim.delivery_kind,
+        SonosDeliveryKind::TranscodeAacHigh
+    );
+
+    let (status, headers, bytes) =
+        get_bytes(router(state), &path_and_query_from_url(&signed.url), None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"fake-aac-output");
+    assert_eq!(headers[header::CONTENT_TYPE], "audio/aac");
+
+    let args = fs::read_to_string(args_log).unwrap();
+    assert!(args.lines().any(|arg| arg == "256k"));
+    assert!(!args.lines().any(|arg| arg == "64k"));
+    assert!(!args.lines().any(|arg| arg == "128k"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_transcode_slot_exhaustion_returns_planned_reason() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-saturation-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+    let managed_path = library_root.join("Artist/Album/sonos-saturation.flac");
+    fs::write(&managed_path, b"source media bytes").unwrap();
+    let fake_ffmpeg = root.join("fake-ffmpeg.sh");
+    let args_log = root.join("ffmpeg-args.log");
+    let started_marker = root.join("ffmpeg-started");
+    fake_ffmpeg_script(&fake_ffmpeg, &args_log, Some(&started_marker), 4);
+
+    let Some(state) = test_state_with_transcode_runtime(
+        library_root.clone(),
+        dropbox_root.clone(),
+        fake_ffmpeg,
+        1,
+    )
+    .await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+    let source_path = dropbox_root.join("sonos-saturation.flac");
+    let imported = state
+        .repository()
+        .import_catalog_file(with_managed_path(
+            music_import_request(
+                &source_path.to_string_lossy(),
+                "sonos-saturation-hash",
+                "Sonos Artist",
+                "Sonos Album",
+                "Saturation Track",
+                Some(1),
+            ),
+            &managed_path,
+            18,
+        ))
+        .await
+        .unwrap();
+    let track_id = imported.track.as_ref().unwrap().id;
+    let signed = state
+        .register_sonos_media_authorization(sonos_media_request(
+            PlaybackItemType::Track,
+            track_id,
+            1,
+            1,
+            "speaker-1",
+        ))
+        .await
+        .unwrap();
+    let uri = path_and_query_from_url(&signed.url);
+    let app = router(state);
+    let first_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+    assert!(eventually(Duration::from_secs(1), || {
+        let started_marker = started_marker.clone();
+        async move { started_marker.exists() }
+    })
+    .await);
+
+    let started = Instant::now();
+    let (status, _, body) = get_bytes(app, &uri, None, &[]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let body = serde_json::from_slice::<Value>(&body).unwrap();
+    assert_eq!(body["code"], "service_unavailable");
+    assert_eq!(body["details"]["reason"], "transcode_capacity_exhausted");
+
+    drop(first_response);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_signed_urls_tolerate_expiry_and_invalidate_on_context_changes() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-invalidation-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+    let first_path = library_root.join("Artist/Album/first.mp3");
+    let second_path = library_root.join("Artist/Album/second.mp3");
+    fs::write(&first_path, b"first sonos bytes").unwrap();
+    fs::write(&second_path, b"second sonos bytes").unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+    let first_source = dropbox_root.join("first-source.mp3");
+    let first = state
+        .repository()
+        .import_catalog_file(with_managed_path(
+            music_import_request(
+                &first_source.to_string_lossy(),
+                "sonos-first-hash",
+                "Sonos Artist",
+                "Sonos Album",
+                "First Track",
+                Some(1),
+            ),
+            &first_path,
+            17,
+        ))
+        .await
+        .unwrap();
+    let second_source = dropbox_root.join("second-source.mp3");
+    let second = state
+        .repository()
+        .import_catalog_file(with_managed_path(
+            music_import_request(
+                &second_source.to_string_lossy(),
+                "sonos-second-hash",
+                "Sonos Artist",
+                "Sonos Album",
+                "Second Track",
+                Some(2),
+            ),
+            &second_path,
+            18,
+        ))
+        .await
+        .unwrap();
+    let first_id = first.track.as_ref().unwrap().id;
+    let second_id = second.track.as_ref().unwrap().id;
+
+    let old = state
+        .register_sonos_media_authorization(sonos_media_request(
+            PlaybackItemType::Track,
+            first_id,
+            1,
+            1,
+            "speaker-1",
+        ))
+        .await
+        .unwrap();
+    let expired = state
+        .issue_sonos_signed_media_url_with_exp(Utc::now().timestamp() - 60)
+        .unwrap();
+    let app = router(state.clone());
+    let (expired_status, _, expired_bytes) =
+        get_bytes(app.clone(), &path_and_query_from_url(&expired.url), None, &[]).await;
+    assert_eq!(expired_status, StatusCode::OK);
+    assert_eq!(expired_bytes, b"first sonos bytes");
+
+    state
+        .register_sonos_media_authorization(sonos_media_request(
+            PlaybackItemType::Track,
+            first_id,
+            2,
+            1,
+            "speaker-1",
+        ))
+        .await
+        .unwrap();
+    let (session_status, _, _) =
+        get_bytes(app.clone(), &path_and_query_from_url(&old.url), None, &[]).await;
+    assert_eq!(session_status, StatusCode::FORBIDDEN);
+
+    let first_current = state
+        .register_sonos_media_authorization(sonos_media_request(
+            PlaybackItemType::Track,
+            first_id,
+            3,
+            1,
+            "speaker-1",
+        ))
+        .await
+        .unwrap();
+    state
+        .register_sonos_media_authorization(sonos_media_request(
+            PlaybackItemType::Track,
+            second_id,
+            3,
+            2,
+            "speaker-1",
+        ))
+        .await
+        .unwrap();
+    let (item_status, _, _) =
+        get_bytes(app, &path_and_query_from_url(&first_current.url), None, &[]).await;
+    assert_eq!(item_status, StatusCode::FORBIDDEN);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_signed_urls_are_invalidated_by_recreated_app_state() {
+    let Some(mut config) = test_config() else {
+        eprintln!(
+            "skipping Postgres-backed Sonos restart test; set HARMONIXIA_TEST_DATABASE_URL"
+        );
+        return;
+    };
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-restart-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+    let managed_path = library_root.join("Artist/Album/restart.mp3");
+    fs::write(&managed_path, b"restart sonos bytes").unwrap();
+    config.library_root = library_root.clone();
+    config.dropbox_root = dropbox_root.clone();
+    config.public_base_url = Some("https://speaker-lan.example.test".into());
+
+    let state = AppState::connect(config.clone()).await.unwrap();
+    seed_test_accounts(&state).await;
+    let source_path = dropbox_root.join("restart-source.mp3");
+    let imported = state
+        .repository()
+        .import_catalog_file(with_managed_path(
+            music_import_request(
+                &source_path.to_string_lossy(),
+                "sonos-restart-hash",
+                "Sonos Artist",
+                "Sonos Album",
+                "Restart Track",
+                Some(1),
+            ),
+            &managed_path,
+            19,
+        ))
+        .await
+        .unwrap();
+    let track_id = imported.track.as_ref().unwrap().id;
+    let signed = state
+        .register_sonos_media_authorization(sonos_media_request(
+            PlaybackItemType::Track,
+            track_id,
+            1,
+            1,
+            "speaker-1",
+        ))
+        .await
+        .unwrap();
+    let uri = path_and_query_from_url(&signed.url);
+    let app = router(state);
+    let (ok_status, _, _) = get_bytes(app, &uri, None, &[]).await;
+    assert_eq!(ok_status, StatusCode::OK);
+
+    let restarted = AppState::connect(config).await.unwrap();
+    let (restart_status, _, _) = get_bytes(router(restarted), &uri, None, &[]).await;
+    assert_eq!(restart_status, StatusCode::FORBIDDEN);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 /// Verifies that media direct transcode requires auth and uses selected aac profile.
 ///
 /// Inputs:
@@ -5963,15 +6460,21 @@ async fn persisted_system_config_overrides_restart_bootstrap_defaults() {
     };
     config.library_root = PathBuf::from("/bootstrap/library");
     config.dropbox_root = PathBuf::from("/bootstrap/dropbox");
+    config.public_base_url = Some("https://bootstrap.example.test/".into());
     let state = AppState::connect(config.clone()).await.unwrap();
     assert_eq!(state.system_config().library_root, "/bootstrap/library");
     assert_eq!(state.system_config().dropbox_root, "/bootstrap/dropbox");
+    assert_eq!(
+        state.system_config().public_base_url.as_deref(),
+        Some("https://bootstrap.example.test/")
+    );
 
     state
         .update_system_config(
             "/persisted/library",
             "/persisted/dropbox",
             Some("Podcasts"),
+            Some(Some("https://persisted.example.test")),
             None,
             Some(3),
         )
@@ -5981,9 +6484,14 @@ async fn persisted_system_config_overrides_restart_bootstrap_defaults() {
     let mut restarted_config = config.clone();
     restarted_config.library_root = PathBuf::from("/changed/library");
     restarted_config.dropbox_root = PathBuf::from("/changed/dropbox");
+    restarted_config.public_base_url = Some("https://changed.example.test/".into());
     let restarted = AppState::connect(restarted_config).await.unwrap();
     assert_eq!(restarted.system_config().library_root, "/persisted/library");
     assert_eq!(restarted.system_config().dropbox_root, "/persisted/dropbox");
+    assert_eq!(
+        restarted.system_config().public_base_url.as_deref(),
+        Some("https://persisted.example.test")
+    );
     assert_eq!(restarted.system_config().scan_thread_count, 3);
 
     seed_test_accounts(&restarted).await;
@@ -6002,6 +6510,102 @@ async fn persisted_system_config_overrides_restart_bootstrap_defaults() {
         body["job"]["scope"]["path"],
         "/persisted/library/Artists/Album"
     );
+}
+
+#[tokio::test]
+/// Verifies that previously persisted unspecified public base URLs are rejected during restart.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns a future that resolves to `()` after the operation completes.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+async fn persisted_unspecified_public_base_url_is_rejected_on_restart() {
+    let Some(config) = test_config() else {
+        eprintln!(
+            "skipping Postgres-backed maintenance API test; set HARMONIXIA_TEST_DATABASE_URL"
+        );
+        return;
+    };
+
+    let state = AppState::connect(config.clone())
+        .await
+        .expect("test database should connect and migrate");
+    let mut stored = state.system_config();
+    stored.public_base_url = Some("https://0.0.0.0:1400".into());
+    stored.updated_at = Utc::now();
+    state
+        .repository()
+        .save_system_config(&stored)
+        .await
+        .expect("legacy invalid public base URL should be persisted for regression setup");
+    drop(state);
+
+    let restart = AppState::connect(config).await;
+    assert!(matches!(
+        restart,
+        Err(StorageError::InvalidStoredValue {
+            field: "system_config.public_base_url",
+            value
+        }) if value.contains("0.0.0.0") && value.contains("unspecified")
+    ));
+}
+
+#[test]
+/// Verifies that bootstrap public base URL environment validation rejects unspecified hosts and accepts valid schemes.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns `()` after completing the validation checks.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+fn bootstrap_public_base_url_env_validation_rejects_unspecified_and_accepts_valid_schemes() {
+    let Some(config) = test_config() else {
+        eprintln!(
+            "skipping Postgres-backed config env test; set HARMONIXIA_TEST_DATABASE_URL"
+        );
+        return;
+    };
+
+    let _database_url = EnvVarGuard::set("HARMONIXIA_DATABASE_URL", &config.database.url);
+    let _database_max_connections = EnvVarGuard::set("HARMONIXIA_DATABASE_MAX_CONNECTIONS", "2");
+    let _database_connect_timeout =
+        EnvVarGuard::set("HARMONIXIA_DATABASE_CONNECT_TIMEOUT_SECONDS", "5");
+    let _database_schema = EnvVarGuard::set(
+        "HARMONIXIA_DATABASE_SCHEMA",
+        config.database.schema.as_deref().unwrap_or("public"),
+    );
+    let _transcode_limit = EnvVarGuard::set("HARMONIXIA_TRANSCODE_CONCURRENCY_LIMIT", "2");
+    let _scan_thread_count = EnvVarGuard::set("HARMONIXIA_SCAN_THREAD_COUNT", "4");
+
+    for public_base_url in [
+        "https://speaker-lan.example.test",
+        "http://speaker-lan.example.test:1400",
+        "http://192.168.1.50:1400",
+        "http://[2001:db8::1]:1400",
+    ] {
+        let _public_base_url = EnvVarGuard::set("HARMONIXIA_PUBLIC_BASE_URL", public_base_url);
+        let from_env = ServerConfig::from_env().expect("valid public base URL should load");
+        assert_eq!(from_env.public_base_url.as_deref(), Some(public_base_url));
+    }
+
+    for public_base_url in [
+        "https://0.0.0.0:1400",
+        "http://[::]:1400",
+        "http://[0:0:0:0:0:0:0:0]:1400",
+    ] {
+        let _public_base_url = EnvVarGuard::set("HARMONIXIA_PUBLIC_BASE_URL", public_base_url);
+        assert!(matches!(
+            ServerConfig::from_env(),
+            Err(ServerConfigError::InvalidPublicBaseUrl)
+        ));
+    }
 }
 
 #[tokio::test]
@@ -6133,6 +6737,7 @@ async fn admin_settings_endpoints_update_system_and_provider_settings() {
     .await;
     assert_eq!(config_status, StatusCode::OK);
     assert_eq!(config_body["library_root"], "/srv/harmonixia/library");
+    assert_eq!(config_body["public_base_url"], Value::Null);
 
     let (update_status, updated_config) = request_json(
         app.clone(),
@@ -6141,14 +6746,69 @@ async fn admin_settings_endpoints_update_system_and_provider_settings() {
         json!({
             "library_root": "/data/harmonixia/library",
             "dropbox_root": "/data/harmonixia/dropbox",
-            "podcast_subtree": "Podcasts"
+            "podcast_subtree": "Podcasts",
+            "public_base_url": "https://speaker-lan.example.test"
         }),
         Some(TestAuth::Admin),
     )
     .await;
     assert_eq!(update_status, StatusCode::OK);
     assert_eq!(updated_config["library_root"], "/data/harmonixia/library");
+    assert_eq!(
+        updated_config["public_base_url"],
+        "https://speaker-lan.example.test"
+    );
     assert_eq!(state.system_config().library_root, "/data/harmonixia/library");
+    assert_eq!(
+        state.system_config().public_base_url.as_deref(),
+        Some("https://speaker-lan.example.test")
+    );
+
+    let (http_update_status, http_updated_config) = request_json(
+        app.clone(),
+        "PUT",
+        "/api/v1/admin/system/config",
+        json!({
+            "library_root": "/data/harmonixia/library",
+            "dropbox_root": "/data/harmonixia/dropbox",
+            "podcast_subtree": "Podcasts",
+            "public_base_url": "http://speaker-lan.example.test:1400"
+        }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(http_update_status, StatusCode::OK);
+    assert_eq!(
+        http_updated_config["public_base_url"],
+        "http://speaker-lan.example.test:1400"
+    );
+    assert_eq!(
+        state.system_config().public_base_url.as_deref(),
+        Some("http://speaker-lan.example.test:1400")
+    );
+
+    let (ip_update_status, ip_updated_config) = request_json(
+        app.clone(),
+        "PUT",
+        "/api/v1/admin/system/config",
+        json!({
+            "library_root": "/data/harmonixia/library",
+            "dropbox_root": "/data/harmonixia/dropbox",
+            "podcast_subtree": "Podcasts",
+            "public_base_url": "http://192.168.1.51:1400"
+        }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(ip_update_status, StatusCode::OK);
+    assert_eq!(
+        ip_updated_config["public_base_url"],
+        "http://192.168.1.51:1400"
+    );
+    assert_eq!(
+        state.system_config().public_base_url.as_deref(),
+        Some("http://192.168.1.51:1400")
+    );
 
     let (settings_status, settings) = get_json(
         app.clone(),
@@ -6182,6 +6842,105 @@ async fn admin_settings_endpoints_update_system_and_provider_settings() {
 }
 
 #[tokio::test]
+/// Verifies that admin system config update rejects unspecified public base URL hosts.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns a future that resolves to `()` after the operation completes.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+async fn admin_system_config_update_rejects_unspecified_public_base_url_hosts() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = router(state.clone());
+
+    let (seed_status, seed_config) = request_json(
+        app.clone(),
+        "PUT",
+        "/api/v1/admin/system/config",
+        json!({
+            "library_root": "/srv/harmonixia/library",
+            "dropbox_root": "/srv/harmonixia/dropbox",
+            "podcast_subtree": "Shows/Podcasts",
+            "public_base_url": "https://setup-speakers.example.test:9443",
+            "transcode_concurrency_limit": 7,
+            "scan_thread_count": 4
+        }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(seed_status, StatusCode::OK);
+    assert_eq!(
+        seed_config["public_base_url"],
+        "https://setup-speakers.example.test:9443"
+    );
+
+    for public_base_url in [
+        "https://0.0.0.0:1400",
+        "http://[::]:1400",
+        "https://[0:0:0:0:0:0:0:0]/music",
+    ] {
+        let (reject_status, reject_body) = request_json(
+            app.clone(),
+            "PUT",
+            "/api/v1/admin/system/config",
+            json!({
+                "library_root": "/should/not/save/library",
+                "dropbox_root": "/should/not/save/dropbox",
+                "podcast_subtree": "Rejected/Podcasts",
+                "public_base_url": public_base_url,
+                "transcode_concurrency_limit": 9,
+                "scan_thread_count": 8
+            }),
+            Some(TestAuth::Admin),
+        )
+        .await;
+        assert_eq!(reject_status, StatusCode::BAD_REQUEST);
+        assert_eq!(reject_body["code"], "bad_request");
+        assert!(reject_body["message"]
+            .as_str()
+            .unwrap()
+            .contains("public_base_url"));
+        let envelope = reject_body.as_object().unwrap();
+        assert!(envelope.contains_key("code"));
+        assert!(envelope.contains_key("message"));
+        assert!(!envelope.contains_key("details"));
+
+        let saved = state.system_config();
+        assert_eq!(saved.library_root, "/srv/harmonixia/library");
+        assert_eq!(saved.dropbox_root, "/srv/harmonixia/dropbox");
+        assert_eq!(saved.podcast_subtree, "Shows/Podcasts");
+        assert_eq!(
+            saved.public_base_url.as_deref(),
+            Some("https://setup-speakers.example.test:9443")
+        );
+        assert_eq!(saved.transcode_concurrency_limit, 7);
+        assert_eq!(saved.scan_thread_count, 4);
+    }
+
+    let (get_status, saved_config) = get_json(
+        app,
+        "/api/v1/admin/system/config",
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(saved_config["library_root"], "/srv/harmonixia/library");
+    assert_eq!(saved_config["dropbox_root"], "/srv/harmonixia/dropbox");
+    assert_eq!(saved_config["podcast_subtree"], "Shows/Podcasts");
+    assert_eq!(
+        saved_config["public_base_url"],
+        "https://setup-speakers.example.test:9443"
+    );
+    assert_eq!(saved_config["transcode_concurrency_limit"], 7);
+    assert_eq!(saved_config["scan_thread_count"], 4);
+}
+
+#[tokio::test]
 /// Verifies that admin system config update preserves omitted podcast subtree.
 ///
 /// Inputs:
@@ -6206,6 +6965,7 @@ async fn admin_system_config_update_preserves_omitted_podcast_subtree() {
             "library_root": "/srv/harmonixia/library",
             "dropbox_root": "/srv/harmonixia/dropbox",
             "podcast_subtree": "Shows/Podcasts",
+            "public_base_url": "https://setup-speakers.example.test:9443",
             "transcode_concurrency_limit": 7,
             "scan_thread_count": 4
         }),
@@ -6214,6 +6974,10 @@ async fn admin_system_config_update_preserves_omitted_podcast_subtree() {
     .await;
     assert_eq!(initial_status, StatusCode::OK);
     assert_eq!(initial_config["podcast_subtree"], "Shows/Podcasts");
+    assert_eq!(
+        initial_config["public_base_url"],
+        "https://setup-speakers.example.test:9443"
+    );
     assert_eq!(initial_config["transcode_concurrency_limit"], 7);
     assert_eq!(initial_config["scan_thread_count"], 4);
 
@@ -6231,9 +6995,17 @@ async fn admin_system_config_update_preserves_omitted_podcast_subtree() {
     assert_eq!(update_status, StatusCode::OK);
     assert_eq!(updated_config["library_root"], "/data/harmonixia/library");
     assert_eq!(updated_config["podcast_subtree"], "Shows/Podcasts");
+    assert_eq!(
+        updated_config["public_base_url"],
+        "https://setup-speakers.example.test:9443"
+    );
     assert_eq!(updated_config["transcode_concurrency_limit"], 7);
     assert_eq!(updated_config["scan_thread_count"], 4);
     assert_eq!(state.system_config().podcast_subtree, "Shows/Podcasts");
+    assert_eq!(
+        state.system_config().public_base_url.as_deref(),
+        Some("https://setup-speakers.example.test:9443")
+    );
     assert_eq!(state.system_config().transcode_concurrency_limit, 7);
     assert_eq!(state.system_config().scan_thread_count, 4);
 
@@ -6245,6 +7017,10 @@ async fn admin_system_config_update_preserves_omitted_podcast_subtree() {
     .await;
     assert_eq!(get_status, StatusCode::OK);
     assert_eq!(saved_config["podcast_subtree"], "Shows/Podcasts");
+    assert_eq!(
+        saved_config["public_base_url"],
+        "https://setup-speakers.example.test:9443"
+    );
     assert_eq!(saved_config["transcode_concurrency_limit"], 7);
     assert_eq!(saved_config["scan_thread_count"], 4);
 }
@@ -7625,6 +8401,7 @@ async fn dropbox_watcher_enqueues_stable_file_and_worker_publishes_it() {
                 stable_for: Duration::from_millis(100),
                 error_backoff: Duration::from_millis(50),
             },
+            sonos: Default::default(),
         },
     );
 
@@ -7678,6 +8455,173 @@ async fn dropbox_watcher_enqueues_stable_file_and_worker_publishes_it() {
     assert_eq!(watcher_jobs[0].status, ImportJobStatus::Completed);
 
     let _ = fs::remove_dir_all(root);
+}
+
+fn schema_requires_field(schema: &Value, field: &str) -> bool {
+    schema["required"]
+        .as_array()
+        .map(|required| required.iter().any(|value| value.as_str() == Some(field)))
+        .unwrap_or(false)
+}
+
+fn schema_property_is_nullable(schema: &Value, field: &str) -> bool {
+    schema["properties"]
+        .get(field)
+        .map(schema_is_nullable)
+        .unwrap_or(false)
+}
+
+fn schema_is_nullable(schema: &Value) -> bool {
+    if let Some(schema_type) = schema.get("type") {
+        match schema_type {
+            Value::String(value) => return value == "null",
+            Value::Array(values) => {
+                return values.iter().any(|value| value.as_str() == Some("null"));
+            }
+            _ => {}
+        }
+    }
+
+    for composite in ["anyOf", "oneOf", "allOf"] {
+        if schema
+            .get(composite)
+            .and_then(Value::as_array)
+            .map(|schemas| schemas.iter().any(schema_is_nullable))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[tokio::test]
+/// Verifies that sonos targets are authenticated and projected from the live memory snapshot.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns a future that resolves to `()` after the operation completes.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+async fn sonos_targets_are_authenticated_and_project_live_snapshot() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    state.replace_sonos_snapshot(SonosSnapshot::from_targets(
+        vec![
+            SonosSpeakerSnapshot {
+                id: "speaker-kitchen".into(),
+                display_name: "Kitchen".into(),
+                room_name: Some("Kitchen".into()),
+                available: true,
+                live: SonosLiveState {
+                    volume_percent: Some(18),
+                    muted: Some(false),
+                    raw_transport_state: Some("idle".into()),
+                },
+            },
+            SonosSpeakerSnapshot {
+                id: "speaker-office".into(),
+                display_name: "Office".into(),
+                room_name: None,
+                available: true,
+                live: SonosLiveState::unknown(),
+            },
+        ],
+        vec![SonosGroupSnapshot {
+            id: "group-main".into(),
+            display_name: "Kitchen + Office".into(),
+            available: true,
+            live: SonosLiveState {
+                volume_percent: Some(45),
+                muted: Some(true),
+                raw_transport_state: Some("PLAYING".into()),
+            },
+        }],
+    ));
+
+    let app = router(state.clone());
+
+    let (unauth_status, unauth_body) =
+        get_json(app.clone(), "/api/v1/sonos/targets", None).await;
+    assert_eq!(unauth_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(unauth_body["code"], "unauthorized");
+
+    let (status, body) =
+        get_json(app.clone(), "/api/v1/sonos/targets", Some(TestAuth::User)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let response = body.as_object().unwrap();
+    assert_eq!(response.len(), 2);
+    assert!(response.contains_key("speakers"));
+    assert!(response.contains_key("groups"));
+
+    let speakers = body["speakers"].as_array().unwrap();
+    let groups = body["groups"].as_array().unwrap();
+    assert_eq!(speakers.len(), 2);
+    assert_eq!(groups.len(), 1);
+
+    let kitchen = speakers
+        .iter()
+        .find(|target| target["id"].as_str() == Some("speaker-kitchen"))
+        .unwrap();
+    let office = speakers
+        .iter()
+        .find(|target| target["id"].as_str() == Some("speaker-office"))
+        .unwrap();
+    let group = &groups[0];
+
+    assert_eq!(kitchen.as_object().unwrap().len(), 7);
+    assert!(kitchen.as_object().unwrap().contains_key("room_name"));
+    assert_eq!(kitchen["display_name"], "Kitchen");
+    assert_eq!(kitchen["available"], true);
+    assert_eq!(kitchen["room_name"], "Kitchen");
+    assert_eq!(kitchen["volume_percent"], 18);
+    assert_eq!(kitchen["muted"], false);
+    assert_eq!(kitchen["transport_state"], "stopped");
+
+    assert_eq!(office["room_name"], Value::Null);
+    assert_eq!(office["volume_percent"], Value::Null);
+    assert_eq!(office["muted"], Value::Null);
+    assert_eq!(office["transport_state"], Value::Null);
+
+    assert_eq!(group.as_object().unwrap().len(), 6);
+    assert!(!group.as_object().unwrap().contains_key("room_name"));
+    assert_eq!(group["display_name"], "Kitchen + Office");
+    assert_eq!(group["available"], true);
+    assert_eq!(group["volume_percent"], 45);
+    assert_eq!(group["muted"], true);
+    assert_eq!(group["transport_state"], "playing");
+
+    state.replace_sonos_snapshot(SonosSnapshot::from_targets(
+        vec![SonosSpeakerSnapshot {
+            id: "speaker-kitchen".into(),
+            display_name: "Kitchen".into(),
+            room_name: Some("Kitchen".into()),
+            available: true,
+            live: SonosLiveState {
+                volume_percent: Some(18),
+                muted: Some(false),
+                raw_transport_state: Some("playing".into()),
+            },
+        }],
+        Vec::new(),
+    ));
+
+    let (after_status, after_body) =
+        get_json(app, "/api/v1/sonos/targets", Some(TestAuth::User)).await;
+    assert_eq!(after_status, StatusCode::OK);
+    assert_eq!(after_body["speakers"].as_array().unwrap().len(), 1);
+    assert!(after_body["speakers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|target| target["id"].as_str() != Some("speaker-office")));
+    assert!(after_body["groups"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -7772,12 +8716,18 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
     ));
     assert!(paths.contains_key("/api/v1/me/playback/progress"));
     assert!(paths.contains_key("/api/v1/me/playback/history"));
+    assert!(paths.contains_key("/api/v1/sonos/targets"));
 
     let schemes = body["components"]["securitySchemes"]
         .as_object()
         .unwrap();
     assert_eq!(schemes["basicAuth"]["type"], "http");
     assert_eq!(schemes["basicAuth"]["scheme"], "basic");
+    assert!(body["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tag| tag["name"].as_str() == Some("sonos")));
 
     let search_parameters = paths["/api/v1/catalog/search"]["get"]["parameters"]
         .as_array()
@@ -7810,9 +8760,105 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         "PlaybackProgressWriteRequest",
         "PlaybackProgressWriteResponse",
         "DashboardSummaryResponse",
+        "ErrorResponseDetails",
+        "SonosDeliveryKind",
+        "SonosErrorReason",
+        "SonosGroupTarget",
+        "SonosNextItemSummary",
+        "SonosPlayRequest",
+        "SonosPlaySourceType",
+        "SonosSessionStatus",
+        "SonosSessionSummary",
+        "SonosSignedClaim",
+        "SonosSpeakerTarget",
+        "SonosTargetsResponse",
+        "SonosTransportState",
     ] {
         assert!(schemas.contains_key(schema), "missing schema {schema}");
     }
+
+    let system_config_schema = &schemas["SystemConfig"];
+    assert!(system_config_schema["properties"]
+        .as_object()
+        .unwrap()
+        .contains_key("public_base_url"));
+    assert!(schema_requires_field(
+        system_config_schema,
+        "public_base_url"
+    ));
+    assert!(schema_property_is_nullable(
+        system_config_schema,
+        "public_base_url"
+    ));
+
+    let system_config_update_schema = &schemas["SystemConfigUpdateRequest"];
+    assert!(system_config_update_schema["properties"]
+        .as_object()
+        .unwrap()
+        .contains_key("public_base_url"));
+    assert!(!schema_requires_field(
+        system_config_update_schema,
+        "public_base_url"
+    ));
+    assert!(schema_property_is_nullable(
+        system_config_update_schema,
+        "public_base_url"
+    ));
+
+    let error_response_schema = &schemas["ErrorResponse"];
+    assert!(error_response_schema["properties"]
+        .as_object()
+        .unwrap()
+        .contains_key("details"));
+    assert!(!schema_requires_field(error_response_schema, "details"));
+    assert!(!schema_property_is_nullable(error_response_schema, "details"));
+    assert!(schemas["ErrorResponseDetails"]["properties"]
+        .as_object()
+        .unwrap()
+        .contains_key("reason"));
+    assert!(!schema_requires_field(
+        &schemas["ErrorResponseDetails"],
+        "reason"
+    ));
+    assert!(!schema_property_is_nullable(
+        &schemas["ErrorResponseDetails"],
+        "reason"
+    ));
+
+    for field in [
+        "room_name",
+        "volume_percent",
+        "muted",
+        "transport_state",
+    ] {
+        assert!(schema_requires_field(&schemas["SonosSpeakerTarget"], field));
+        assert!(schema_property_is_nullable(
+            &schemas["SonosSpeakerTarget"],
+            field
+        ));
+    }
+    for field in ["volume_percent", "muted", "transport_state"] {
+        assert!(schema_requires_field(&schemas["SonosGroupTarget"], field));
+        assert!(schema_property_is_nullable(
+            &schemas["SonosGroupTarget"],
+            field
+        ));
+    }
+    for field in ["current_duration_seconds", "next_item"] {
+        assert!(schema_requires_field(&schemas["SonosSessionSummary"], field));
+        assert!(schema_property_is_nullable(
+            &schemas["SonosSessionSummary"],
+            field
+        ));
+    }
+    assert!(!schema_requires_field(
+        &schemas["SonosSessionSummary"],
+        "reconnect_seconds_remaining"
+    ));
+    assert!(!schema_property_is_nullable(
+        &schemas["SonosSessionSummary"],
+        "reconnect_seconds_remaining"
+    ));
 
     assert_eq!(
         paths["/api/v1/catalog/podcasts"]["get"]["responses"]["200"]["content"]
@@ -7855,6 +8901,12 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
             ["content"]["application/json"]["schema"]["$ref"]
             .as_str(),
         Some("#/components/schemas/PlaybackProgressWriteResponse")
+    );
+    assert_eq!(
+        paths["/api/v1/sonos/targets"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["$ref"]
+            .as_str(),
+        Some("#/components/schemas/SonosTargetsResponse")
     );
 
     let podcast_response_schema = &schemas["PodcastResponse"]["properties"];
@@ -7953,6 +9005,7 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         ("/api/v1/me/playback/progress", "get"),
         ("/api/v1/me/playback/history", "get"),
         ("/api/v1/me/playback/history", "post"),
+        ("/api/v1/sonos/targets", "get"),
     ];
 
     for (path, method) in protected_operations.iter().copied() {

@@ -3,7 +3,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use utoipa::ToSchema;
 
@@ -30,15 +30,34 @@ pub enum ApiError {
     Internal,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorResponseDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SonosErrorReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SonosErrorReason {
+    TargetReconnecting,
+    TargetUnreachable,
+    SessionNotManaged,
+    PublicBaseUrlUnusable,
+    TranscodeCapacityExhausted,
+    SourceIncompatibleFallbackFailed,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 /// Represents error response in the common API error model used by handlers and state validation.
 ///
-/// Functionality: Carries fields `code`, `message` for common API error model used by handlers and state validation.
-/// Dependencies: depends on `String`, `String` and any derives or trait bounds declared on the type.
+/// Functionality: Carries fields `code`, `message`, `details` for common API error model used by handlers and state validation.
+/// Dependencies: depends on `String`, `String`, `Option<ErrorResponseDetails>` and any derives or trait bounds declared on the type.
 /// Used by: referenced from `src/api/accounts.rs`, `src/api/catalog.rs`, `src/api/config.rs`, `src/api/maintenance.rs`, and 5 more.
 pub struct ErrorResponse {
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<ErrorResponseDetails>,
 }
 
 impl IntoResponse for ApiError {
@@ -69,6 +88,7 @@ impl IntoResponse for ApiError {
         let body = ErrorResponse {
             code: code.to_string(),
             message,
+            details: None,
         };
 
         let mut response = (status, Json(body)).into_response();
@@ -80,5 +100,53 @@ impl IntoResponse for ApiError {
         }
 
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn error_details_are_omitted_when_absent() {
+        let response = ErrorResponse {
+            code: "bad_request".into(),
+            message: "invalid request".into(),
+            details: None,
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("details"));
+    }
+
+    #[test]
+    fn error_details_reason_serializes_when_present() {
+        let response = ErrorResponse {
+            code: "service_unavailable".into(),
+            message: "target is reconnecting".into(),
+            details: Some(ErrorResponseDetails {
+                reason: Some(SonosErrorReason::TargetReconnecting),
+            }),
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "code": "service_unavailable",
+                "message": "target is reconnecting",
+                "details": {
+                    "reason": "target_reconnecting"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn error_details_reason_is_omitted_when_absent() {
+        let details = ErrorResponseDetails { reason: None };
+
+        let value = serde_json::to_value(details).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("reason"));
     }
 }

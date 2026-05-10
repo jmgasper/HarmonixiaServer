@@ -5,7 +5,7 @@ use axum::{
     routing::{get, patch},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
@@ -14,6 +14,30 @@ use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableUpdate<T> {
+    Omitted,
+    Set(Option<T>),
+}
+
+impl<T> Default for NullableUpdate<T> {
+    fn default() -> Self {
+        Self::Omitted
+    }
+}
+
+impl<'de, T> Deserialize<'de> for NullableUpdate<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(Self::Set)
+    }
+}
 
 /// Builds the Axum router for system and provider configuration.
 ///
@@ -48,6 +72,9 @@ pub struct SystemConfigUpdateRequest {
     pub library_root: String,
     pub dropbox_root: String,
     pub podcast_subtree: Option<String>,
+    #[serde(default)]
+    #[schema(value_type = Option<String>, nullable = true)]
+    pub public_base_url: NullableUpdate<String>,
     pub transcode_concurrency_limit: Option<i32>,
     pub scan_thread_count: Option<i32>,
 }
@@ -133,12 +160,18 @@ pub async fn update_system_config(
     _admin: AdminAccount,
     Json(request): Json<SystemConfigUpdateRequest>,
 ) -> Result<Json<SystemConfig>, ApiError> {
+    let public_base_url = match &request.public_base_url {
+        NullableUpdate::Omitted => None,
+        NullableUpdate::Set(value) => Some(value.as_deref()),
+    };
+
     Ok(Json(
         state
             .update_system_config(
                 &request.library_root,
                 &request.dropbox_root,
                 request.podcast_subtree.as_deref(),
+                public_base_url,
                 request.transcode_concurrency_limit,
                 request.scan_thread_count,
             )

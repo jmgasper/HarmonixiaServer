@@ -1,5 +1,9 @@
 use utoipa::{
-    openapi::security::{Http, HttpAuthScheme, SecurityScheme},
+    openapi::{
+        schema::{AnyOf, Object, Schema, SchemaType, Type},
+        security::{Http, HttpAuthScheme, SecurityScheme},
+        RefOr,
+    },
     Modify, OpenApi,
 };
 
@@ -36,6 +40,10 @@ use crate::{
         AddPlaylistItemRequest, CreatePlaylistRequest, PlaylistItemsResponse,
         PlaylistsResponse, ReorderPlaylistItemsRequest, UpdatePlaylistRequest,
     },
+    api::sonos::{
+        SonosGroupTarget, SonosNextItemSummary, SonosPlayRequest, SonosPlaySourceType,
+        SonosSessionSummary, SonosSpeakerTarget, SonosTargetsResponse,
+    },
     domain::{
         AacTranscodeProfile, AccountRole, Album, AlbumKind, Artist, ArtworkAsset, ArtworkAssetDraft,
         ArtworkKind, AuthenticatedAccount, CatalogEntityType, CatalogGrouping,
@@ -48,9 +56,10 @@ use crate::{
         PlaybackItemType, PlaybackProgress, Playlist, PlaylistItem, PlaylistScope, Podcast,
         PodcastCatalogGrouping, ProviderHealth, ProviderKind, ProviderSetting,
         ProviderStatus, QuarantineItem, QuarantineReason, QuarantineStatus, RepairPlan,
+        SonosDeliveryKind, SonosSessionStatus, SonosSignedClaim, SonosTransportState,
         SystemConfig, Track, TranscodeSlotUsage, UserAccount,
     },
-    error::ErrorResponse,
+    error::{ErrorResponse, ErrorResponseDetails, SonosErrorReason},
 };
 
 #[derive(OpenApi)]
@@ -112,11 +121,13 @@ use crate::{
         crate::api::playback::get_progress,
         crate::api::playback::write_history,
         crate::api::playback::list_history,
+        crate::api::sonos::list_targets,
     ),
     components(
         schemas(
             AacTranscodeProfile,
             ErrorResponse,
+            ErrorResponseDetails,
             AccountRole,
             AddPlaylistItemRequest,
             Album,
@@ -212,6 +223,18 @@ use crate::{
             ReorderPlaylistItemsRequest,
             ResetPasswordRequest,
             RepairPlan,
+            SonosDeliveryKind,
+            SonosErrorReason,
+            SonosGroupTarget,
+            SonosNextItemSummary,
+            SonosPlayRequest,
+            SonosPlaySourceType,
+            SonosSessionStatus,
+            SonosSessionSummary,
+            SonosSignedClaim,
+            SonosSpeakerTarget,
+            SonosTargetsResponse,
+            SonosTransportState,
             SubtreeRescanRequest,
             SystemConfig,
             Track,
@@ -234,6 +257,7 @@ use crate::{
         (name = "playlists", description = "Personal and household-shared playlists with ordered track/episode membership"),
         (name = "providers", description = "Metadata provider health and repair operations"),
         (name = "quarantine", description = "Quarantine retry handoff into the import pipeline"),
+        (name = "sonos", description = "Live Sonos speaker and group discovery targets"),
         (name = "settings", description = "Admin system and provider configuration")
     ),
     modifiers(&SecurityAddon)
@@ -271,5 +295,176 @@ impl Modify for SecurityAddon {
                 SecurityScheme::Http(Http::new(HttpAuthScheme::Basic)),
             );
         }
+        apply_contract_schema_overrides(openapi);
     }
+}
+
+fn apply_contract_schema_overrides(openapi: &mut utoipa::openapi::OpenApi) {
+    let Some(components) = openapi.components.as_mut() else {
+        return;
+    };
+    let schemas = &mut components.schemas;
+
+    for (schema_name, field_name) in [
+        ("SystemConfig", "public_base_url"),
+        ("SonosSpeakerTarget", "room_name"),
+        ("SonosSpeakerTarget", "volume_percent"),
+        ("SonosSpeakerTarget", "muted"),
+        ("SonosSpeakerTarget", "transport_state"),
+        ("SonosGroupTarget", "volume_percent"),
+        ("SonosGroupTarget", "muted"),
+        ("SonosGroupTarget", "transport_state"),
+        ("SonosSessionSummary", "current_duration_seconds"),
+        ("SonosSessionSummary", "next_item"),
+    ] {
+        require_nullable_property(schemas, schema_name, field_name);
+    }
+    nullable_property(schemas, "SystemConfigUpdateRequest", "public_base_url");
+    for (schema_name, field_name) in [
+        ("ErrorResponse", "details"),
+        ("ErrorResponseDetails", "reason"),
+        ("SonosSessionSummary", "reconnect_seconds_remaining"),
+    ] {
+        non_nullable_property(schemas, schema_name, field_name);
+    }
+}
+
+fn require_nullable_property(
+    schemas: &mut std::collections::BTreeMap<String, RefOr<Schema>>,
+    schema_name: &str,
+    field_name: &str,
+) {
+    if let Some(schema) = schema_object_mut(schemas, schema_name) {
+        if !schema.required.iter().any(|field| field == field_name) {
+            schema.required.push(field_name.to_string());
+        }
+    }
+    nullable_property(schemas, schema_name, field_name);
+}
+
+fn nullable_property(
+    schemas: &mut std::collections::BTreeMap<String, RefOr<Schema>>,
+    schema_name: &str,
+    field_name: &str,
+) {
+    if let Some(property_schema) = schema_object_mut(schemas, schema_name)
+        .and_then(|schema| schema.properties.get_mut(field_name))
+    {
+        make_nullable(property_schema);
+    }
+}
+
+fn non_nullable_property(
+    schemas: &mut std::collections::BTreeMap<String, RefOr<Schema>>,
+    schema_name: &str,
+    field_name: &str,
+) {
+    if let Some(property_schema) = schema_object_mut(schemas, schema_name)
+        .and_then(|schema| schema.properties.get_mut(field_name))
+    {
+        make_non_nullable(property_schema);
+    }
+}
+
+fn schema_object_mut<'a>(
+    schemas: &'a mut std::collections::BTreeMap<String, RefOr<Schema>>,
+    schema_name: &str,
+) -> Option<&'a mut Object> {
+    match schemas.get_mut(schema_name) {
+        Some(RefOr::T(Schema::Object(schema))) => Some(schema),
+        _ => None,
+    }
+}
+
+fn make_nullable(schema: &mut RefOr<Schema>) {
+    match schema {
+        RefOr::Ref(_) => {
+            let original = schema.clone();
+            *schema = RefOr::T(Schema::AnyOf(AnyOf {
+                items: vec![original, null_schema()],
+                ..Default::default()
+            }));
+        }
+        RefOr::T(schema) => make_schema_nullable(schema),
+    }
+}
+
+fn make_schema_nullable(schema: &mut Schema) {
+    match schema {
+        Schema::Object(schema) => add_null_type(&mut schema.schema_type),
+        Schema::Array(schema) => add_null_type(&mut schema.schema_type),
+        Schema::AnyOf(schema) => {
+            if !schema.items.iter().any(ref_or_is_null_schema) {
+                schema.items.push(null_schema());
+            }
+        }
+        Schema::OneOf(schema) => {
+            if !schema.items.iter().any(ref_or_is_null_schema) {
+                schema.items.push(null_schema());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn make_non_nullable(schema: &mut RefOr<Schema>) {
+    if let RefOr::T(schema) = schema {
+        make_schema_non_nullable(schema);
+    }
+}
+
+fn make_schema_non_nullable(schema: &mut Schema) {
+    match schema {
+        Schema::Object(schema) => remove_null_type(&mut schema.schema_type),
+        Schema::Array(schema) => remove_null_type(&mut schema.schema_type),
+        Schema::AnyOf(schema) => {
+            schema.items.retain(|item| !ref_or_is_null_schema(item));
+        }
+        Schema::OneOf(schema) => {
+            schema.items.retain(|item| !ref_or_is_null_schema(item));
+        }
+        _ => {}
+    }
+}
+
+fn add_null_type(schema_type: &mut SchemaType) {
+    match schema_type {
+        SchemaType::Type(schema_type_value) => {
+            if *schema_type_value != Type::Null {
+                *schema_type =
+                    [schema_type_value.clone(), Type::Null].into_iter().collect();
+            }
+        }
+        SchemaType::Array(schema_types) => {
+            if !schema_types.contains(&Type::Null) {
+                schema_types.push(Type::Null);
+            }
+        }
+        SchemaType::AnyValue => {
+            *schema_type = [Type::Object, Type::Null].into_iter().collect();
+        }
+    }
+}
+
+fn remove_null_type(schema_type: &mut SchemaType) {
+    if let SchemaType::Array(schema_types) = schema_type {
+        schema_types.retain(|schema_type| schema_type != &Type::Null);
+        if schema_types.len() == 1 {
+            *schema_type = SchemaType::Type(schema_types[0].clone());
+        }
+    }
+}
+
+fn null_schema() -> RefOr<Schema> {
+    RefOr::T(Schema::Object(Object::with_type(Type::Null)))
+}
+
+fn ref_or_is_null_schema(schema: &RefOr<Schema>) -> bool {
+    matches!(
+        schema,
+        RefOr::T(Schema::Object(Object {
+            schema_type: SchemaType::Type(Type::Null),
+            ..
+        }))
+    )
 }

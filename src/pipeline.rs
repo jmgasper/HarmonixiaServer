@@ -8,6 +8,7 @@ use std::{
 };
 
 use chrono::{Duration as ChronoDuration, Utc};
+use reqwest::header;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -18,6 +19,7 @@ use tokio::{
 use utoipa::ToSchema;
 use uuid::Uuid;
 use walkdir::WalkDir;
+use tracing::warn;
 
 use crate::{
     catalog::{likely_compilation_artist, sanitize_path_component},
@@ -44,6 +46,8 @@ pub const IMPORT_PIPELINE_NAME: &str = "import_pipeline";
 const IMPORT_JOB_MAX_ATTEMPTS: u32 = 3;
 const FILE_OPERATION_MAX_ATTEMPTS: u32 = 3;
 const FILE_OPERATION_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const REMOTE_ARTWORK_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_ARTWORK_MAX_BYTES: u64 = 10 * 1024 * 1024;
 type SharedProviderBackoff = Arc<Mutex<BTreeSet<ProviderKind>>>;
 
 #[derive(Debug, Clone)]
@@ -777,6 +781,7 @@ impl ImportPipeline {
                         {
                             request.artwork.push(copied_artwork);
                         }
+                        materialize_remote_artwork(&mut request, &final_path).await;
                     }
                     Ok::<(), io::Error>(())
                 }
@@ -2425,6 +2430,189 @@ fn copy_folder_image(
     }))
 }
 
+/// Downloads provider-sourced artwork into the managed library so the authenticated artwork API can serve it later.
+async fn materialize_remote_artwork(request: &mut CatalogImportRequest, managed_path: &Path) {
+    let client = remote_artwork_client();
+    let grouping = request.grouping.clone();
+
+    for artwork in &mut request.artwork {
+        if artwork.file_path.is_some() {
+            continue;
+        }
+        let Some(source_uri) = artwork
+            .source_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(target) = remote_artwork_target_path(&grouping, artwork, managed_path, &source_uri)
+        else {
+            continue;
+        };
+
+        match download_remote_artwork(&client, &source_uri, &target).await {
+            Ok(mime_type) => {
+                artwork.file_path = Some(target.to_string_lossy().to_string());
+                if artwork.mime_type.is_none() {
+                    artwork.mime_type = mime_type;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    source_uri,
+                    target = %target.display(),
+                    error = %error,
+                    "failed to materialize provider artwork"
+                );
+            }
+        }
+    }
+}
+
+fn remote_artwork_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(REMOTE_ARTWORK_TIMEOUT)
+        .user_agent(format!(
+            "HarmonixiaServer/{} (artwork materialization)",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .build()
+        .unwrap_or_else(|error| {
+            warn!(error = %error, "failed to build artwork HTTP client; falling back to defaults");
+            reqwest::Client::new()
+        })
+}
+
+async fn download_remote_artwork(
+    client: &reqwest::Client,
+    source_uri: &str,
+    target: &Path,
+) -> Result<Option<String>, String> {
+    let response = client
+        .get(source_uri)
+        .header(header::ACCEPT, "image/*")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("provider returned HTTP {status}"));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > REMOTE_ARTWORK_MAX_BYTES)
+    {
+        return Err("provider artwork is larger than the configured limit".into());
+    }
+
+    let mime_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(normalize_image_mime_type)
+        .map(str::to_string);
+    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > REMOTE_ARTWORK_MAX_BYTES {
+        return Err("provider artwork is larger than the configured limit".into());
+    }
+    if bytes.is_empty() {
+        return Err("provider artwork response was empty".into());
+    }
+
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    tokio::fs::write(target, bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(mime_type)
+}
+
+fn remote_artwork_target_path(
+    grouping: &CatalogGrouping,
+    artwork: &ArtworkAssetDraft,
+    managed_path: &Path,
+    source_uri: &str,
+) -> Option<PathBuf> {
+    let directory = match artwork.entity_type {
+        CatalogEntityType::Artist => artist_artwork_directory(grouping, managed_path),
+        CatalogEntityType::Album
+        | CatalogEntityType::Track
+        | CatalogEntityType::Podcast
+        | CatalogEntityType::Episode => managed_path.parent().map(Path::to_path_buf),
+        CatalogEntityType::MediaFile | CatalogEntityType::Playlist => None,
+    }?;
+    let extension = artwork_extension(artwork.mime_type.as_deref(), source_uri);
+    let filename = format!(
+        "{}-{}-{}.{}",
+        artwork.entity_type.api_name(),
+        artwork.artwork_kind.api_name(),
+        artwork.provider.api_name(),
+        extension
+    );
+    Some(directory.join("artwork").join(filename))
+}
+
+fn artist_artwork_directory(
+    grouping: &CatalogGrouping,
+    managed_path: &Path,
+) -> Option<PathBuf> {
+    match grouping {
+        CatalogGrouping::Music(_) => managed_path
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf),
+        CatalogGrouping::Podcast(_) => managed_path.parent().map(Path::to_path_buf),
+    }
+}
+
+fn artwork_extension(mime_type: Option<&str>, source_uri: &str) -> &'static str {
+    mime_type
+        .and_then(normalize_image_mime_type)
+        .and_then(extension_for_image_mime_type)
+        .or_else(|| extension_from_uri(source_uri))
+        .unwrap_or("jpg")
+}
+
+fn normalize_image_mime_type(value: &str) -> Option<&'static str> {
+    match value.split(';').next()?.trim().to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/png" => Some("image/png"),
+        "image/webp" => Some("image/webp"),
+        "image/gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
+fn extension_for_image_mime_type(mime_type: &str) -> Option<&'static str> {
+    match mime_type {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        _ => None,
+    }
+}
+
+fn extension_from_uri(source_uri: &str) -> Option<&'static str> {
+    let path = source_uri.split(['?', '#']).next()?;
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())?;
+    match extension.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("jpg"),
+        "png" => Some("png"),
+        "webp" => Some("webp"),
+        "gif" => Some("gif"),
+        _ => None,
+    }
+}
+
 /// Handles add probe provenance for maintenance import pipeline that scans files, enriches metadata, and mutates the catalog.
 ///
 /// Inputs:
@@ -2624,6 +2812,7 @@ mod tests {
             library_root: "/library".to_string(),
             dropbox_root: "/dropbox".to_string(),
             podcast_subtree: "Podcasts".to_string(),
+            public_base_url: None,
             transcode_concurrency_limit: 2,
             scan_thread_count: DEFAULT_SCAN_THREAD_COUNT,
             updated_at: Utc::now(),

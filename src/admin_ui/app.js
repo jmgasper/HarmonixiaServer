@@ -21,9 +21,39 @@
     users: [],
     dashboardPollId: null,
     dashboardPolling: false,
+    libraryLoaded: false,
+    libraryView: "artists",
+    artists: [],
+    albums: [],
+    tracks: [],
+    playlists: [],
+    playlistItems: new Map(),
+    artistById: new Map(),
+    albumById: new Map(),
+    trackById: new Map(),
+    albumsByArtist: new Map(),
+    tracksByAlbum: new Map(),
+    selectedArtistId: null,
+    selectedAlbumId: null,
+    selectedTrackId: null,
+    selectedPlaylistId: null,
+    artworkUrls: new Map(),
+    artworkPromises: new Map(),
+    playbackQueue: [],
+    playbackQueueName: "",
+    currentTrackId: null,
+    playbackObjectUrl: null,
+    playbackLoading: false,
+    playbackAbortController: null,
+    playbackLastProgressAt: 0,
+    playbackWritingProgress: false,
+    playbackError: "",
   };
 
-  const dashboardSections = ["dashboard", "failures", "providers", "users"];
+  const dashboardSections = ["dashboard", "library", "failures", "providers", "users"];
+  const libraryViews = ["artists", "albums", "tracks", "playlists"];
+  const catalogBrowsePageSize = 200;
+  const playbackProgressWriteIntervalSeconds = 15;
 
   const providerControls = [
     {
@@ -121,6 +151,17 @@
     byId("subtree-rescan-form").addEventListener("submit", triggerSubtreeRescan);
     byId("create-user-form").addEventListener("submit", createUser);
     byId("users-table-body").addEventListener("click", handleUserTableClick);
+    byId("refresh-library-button").addEventListener("click", () => loadLibrary(true));
+    byId("library-list").addEventListener("click", handleLibraryListClick);
+    byId("library-detail").addEventListener("click", handleLibraryDetailClick);
+    for (const button of document.querySelectorAll("[data-library-view]")) {
+      button.addEventListener("click", () => setLibraryView(button.dataset.libraryView));
+    }
+    byId("player-start-button").addEventListener("click", startSelectedTrack);
+    byId("player-stop-button").addEventListener("click", () => stopPlayback(true));
+    byId("player-next-button").addEventListener("click", () => advancePlayback(1, false));
+    byId("player-prev-button").addEventListener("click", () => advancePlayback(-1, false));
+    bindLibraryAudio();
   }
 
   /**
@@ -506,6 +547,11 @@
     if (state.activeSection === "providers") {
       stopDashboardPolling();
       await loadProviderHealth();
+      return;
+    }
+    if (state.activeSection === "library") {
+      stopDashboardPolling();
+      await loadLibrary(false);
       return;
     }
     if (state.activeSection === "failures") {
@@ -1000,6 +1046,1098 @@
     setUsersMessage(message, "success");
   }
 
+  async function loadLibrary(force) {
+    if (state.libraryLoaded && !force) {
+      renderLibrary();
+      return;
+    }
+
+    setLibraryMessage("Loading library...", "warning");
+    setBusy(true);
+    setDashboardBusy(true);
+
+    try {
+      if (force) {
+        resetLibraryBrowseState();
+      }
+
+      const [artists, albums, tracks, playlistsResponse] = await Promise.all([
+        loadAllCatalogPages("/api/v1/catalog/artists", "artists", "name"),
+        loadAllCatalogPages("/api/v1/catalog/albums", "albums", "artist_title"),
+        loadAllCatalogPages("/api/v1/catalog/tracks", "tracks", "album_position"),
+        api("/api/v1/playlists"),
+      ]);
+
+      state.artists = artists;
+      state.albums = albums;
+      state.tracks = tracks;
+      state.playlists = playlistsResponse && Array.isArray(playlistsResponse.playlists)
+        ? playlistsResponse.playlists
+        : [];
+      indexLibraryData();
+      ensureLibrarySelection();
+      state.libraryLoaded = true;
+      renderLibrary();
+      setLibraryMessage("Library is up to date.", "success");
+    } catch (error) {
+      setLibraryMessage(error.message, "error");
+    } finally {
+      setBusy(false);
+      setDashboardBusy(false);
+      renderPlayer();
+    }
+  }
+
+  function resetLibraryBrowseState() {
+    state.libraryLoaded = false;
+    state.artists = [];
+    state.albums = [];
+    state.tracks = [];
+    state.playlists = [];
+    state.playlistItems = new Map();
+    state.artistById = new Map();
+    state.albumById = new Map();
+    state.trackById = new Map();
+    state.albumsByArtist = new Map();
+    state.tracksByAlbum = new Map();
+    state.selectedArtistId = null;
+    state.selectedAlbumId = null;
+    state.selectedTrackId = null;
+    state.selectedPlaylistId = null;
+    clearArtworkCache();
+  }
+
+  async function loadAllCatalogPages(path, responseKey, sort) {
+    const items = [];
+    let cursor = null;
+    do {
+      const params = new URLSearchParams({
+        limit: String(catalogBrowsePageSize),
+        sort,
+      });
+      if (cursor) {
+        params.set("cursor", cursor);
+      }
+      const response = await api(`${path}?${params.toString()}`);
+      if (response && Array.isArray(response[responseKey])) {
+        items.push(...response[responseKey]);
+      }
+      cursor = response && response.page ? response.page.next_cursor : null;
+    } while (cursor);
+    return items;
+  }
+
+  function indexLibraryData() {
+    state.artistById = new Map(state.artists.map((artist) => [artist.id, artist]));
+    state.albumById = new Map(state.albums.map((album) => [album.id, album]));
+    state.trackById = new Map(state.tracks.map((track) => [track.id, track]));
+    state.albumsByArtist = new Map();
+    state.tracksByAlbum = new Map();
+
+    for (const album of state.albums) {
+      appendGrouped(state.albumsByArtist, album.artist_id, album);
+    }
+    for (const track of state.tracks) {
+      appendGrouped(state.tracksByAlbum, track.album_id, track);
+    }
+  }
+
+  function appendGrouped(map, key, value) {
+    const current = map.get(key) || [];
+    current.push(value);
+    map.set(key, current);
+  }
+
+  function ensureLibrarySelection() {
+    if (state.selectedArtistId && !state.artistById.has(state.selectedArtistId)) {
+      state.selectedArtistId = null;
+    }
+    if (!state.selectedArtistId && state.artists.length) {
+      state.selectedArtistId = state.artists[0].id;
+    }
+    if (state.selectedAlbumId && !state.albumById.has(state.selectedAlbumId)) {
+      state.selectedAlbumId = null;
+    }
+    if (!state.selectedAlbumId && state.albums.length) {
+      state.selectedAlbumId = state.albums[0].id;
+    }
+    if (state.selectedTrackId && !state.trackById.has(state.selectedTrackId)) {
+      state.selectedTrackId = null;
+    }
+    if (state.selectedPlaylistId && !state.playlists.some((playlist) => playlist.id === state.selectedPlaylistId)) {
+      state.selectedPlaylistId = null;
+    }
+    if (!state.selectedPlaylistId && state.playlists.length) {
+      state.selectedPlaylistId = state.playlists[0].id;
+    }
+  }
+
+  function setLibraryView(view) {
+    if (!libraryViews.includes(view)) {
+      return;
+    }
+    state.libraryView = view;
+    ensureLibrarySelection();
+    renderLibrary();
+  }
+
+  async function handleLibraryListClick(event) {
+    const item = event.target.closest("[data-library-type][data-id]");
+    if (!item) {
+      return;
+    }
+    const type = item.dataset.libraryType;
+    const id = item.dataset.id;
+    if (type === "artist") {
+      selectArtist(id);
+      return;
+    }
+    if (type === "album") {
+      selectAlbum(id);
+      return;
+    }
+    if (type === "track") {
+      selectTrack(id);
+      await playTrackById(id, queueForTrackId(id), albumQueueNameForTrackId(id));
+      return;
+    }
+    if (type === "playlist") {
+      await selectPlaylist(id);
+    }
+  }
+
+  async function handleLibraryDetailClick(event) {
+    const button = event.target.closest("button[data-action]");
+    if (!button) {
+      return;
+    }
+
+    const action = button.dataset.action;
+    const id = button.dataset.id;
+    if (action === "select-album") {
+      state.libraryView = "albums";
+      selectAlbum(id);
+      return;
+    }
+    if (action === "select-track") {
+      state.libraryView = "tracks";
+      selectTrack(id);
+      return;
+    }
+    if (action === "play-track") {
+      const queue = button.dataset.queue === "playlist"
+        ? playlistTrackQueue(button.dataset.playlistId)
+        : queueForTrackId(id);
+      const queueName = button.dataset.queue === "playlist"
+        ? playlistName(button.dataset.playlistId)
+        : albumQueueNameForTrackId(id);
+      await playTrackById(id, queue, queueName);
+    }
+  }
+
+  function selectArtist(artistId) {
+    state.selectedArtistId = artistId;
+    state.libraryView = "artists";
+    renderLibrary();
+  }
+
+  function selectAlbum(albumId) {
+    state.selectedAlbumId = albumId;
+    state.libraryView = "albums";
+    renderLibrary();
+  }
+
+  function selectTrack(trackId) {
+    state.selectedTrackId = trackId;
+    renderLibrary();
+    renderPlayer();
+  }
+
+  async function selectPlaylist(playlistId) {
+    state.selectedPlaylistId = playlistId;
+    state.libraryView = "playlists";
+    renderLibrary();
+    await loadPlaylistItems(playlistId);
+    if (state.selectedPlaylistId === playlistId) {
+      renderLibrary();
+    }
+  }
+
+  async function loadPlaylistItems(playlistId) {
+    if (!playlistId || state.playlistItems.has(playlistId)) {
+      return;
+    }
+    setLibraryMessage("Loading playlist items...", "warning");
+    try {
+      const response = await api(`/api/v1/playlists/${playlistId}/items`);
+      state.playlistItems.set(
+        playlistId,
+        response && Array.isArray(response.items) ? response.items : []
+      );
+      setLibraryMessage("Library is up to date.", "success");
+    } catch (error) {
+      setLibraryMessage(error.message, "error");
+    }
+  }
+
+  function renderLibrary() {
+    renderLibraryTabs();
+    renderLibraryList();
+    renderLibraryDetail();
+    renderPlayer();
+  }
+
+  function renderLibraryTabs() {
+    for (const button of document.querySelectorAll("[data-library-view]")) {
+      const selected = button.dataset.libraryView === state.libraryView;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-selected", selected ? "true" : "false");
+    }
+  }
+
+  function renderLibraryList() {
+    const list = byId("library-list");
+    list.replaceChildren();
+    if (!state.libraryLoaded) {
+      appendParagraph(list, "Library has not loaded.");
+      return;
+    }
+
+    const items = currentLibraryItems();
+    if (!items.length) {
+      appendParagraph(list, `No ${state.libraryView} found.`);
+      return;
+    }
+
+    for (const item of items) {
+      list.appendChild(libraryListItem(state.libraryView.slice(0, -1), item));
+    }
+  }
+
+  function currentLibraryItems() {
+    if (state.libraryView === "artists") {
+      return state.artists;
+    }
+    if (state.libraryView === "albums") {
+      return state.albums;
+    }
+    if (state.libraryView === "tracks") {
+      return state.tracks;
+    }
+    return state.playlists;
+  }
+
+  function libraryListItem(type, item) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "library-list-item";
+    button.dataset.libraryType = type;
+    button.dataset.id = item.id;
+    button.classList.toggle("active", selectedLibraryId(type) === item.id);
+
+    button.appendChild(artworkForListItem(type, item));
+
+    const text = document.createElement("span");
+    text.className = "library-list-text";
+    const title = document.createElement("span");
+    title.className = "library-list-title";
+    title.textContent = titleForLibraryItem(type, item);
+    const meta = document.createElement("span");
+    meta.className = "library-list-meta";
+    meta.textContent = metaForLibraryItem(type, item);
+    text.append(title, meta);
+    button.appendChild(text);
+
+    const count = document.createElement("span");
+    count.className = "library-count";
+    count.textContent = countForLibraryItem(type, item);
+    button.appendChild(count);
+    return button;
+  }
+
+  function artworkForListItem(type, item) {
+    if (type === "artist") {
+      return createArtworkFrame("artist", item.id, "artist", item.name, 96);
+    }
+    if (type === "album") {
+      return createArtworkFrame("album", item.id, "cover", item.title, 96);
+    }
+    if (type === "track") {
+      const album = state.albumById.get(item.album_id);
+      return album
+        ? createArtworkFrame("album", album.id, "cover", album.title, 96)
+        : createPlaceholderArtwork(item.title);
+    }
+    return createPlaceholderArtwork("playlist");
+  }
+
+  function selectedLibraryId(type) {
+    if (type === "artist") {
+      return state.selectedArtistId;
+    }
+    if (type === "album") {
+      return state.selectedAlbumId;
+    }
+    if (type === "track") {
+      return state.selectedTrackId || state.currentTrackId;
+    }
+    return state.selectedPlaylistId;
+  }
+
+  function renderLibraryDetail() {
+    const detail = byId("library-detail");
+    detail.replaceChildren();
+    if (!state.libraryLoaded) {
+      appendParagraph(detail, "Library has not loaded.");
+      return;
+    }
+
+    if (state.libraryView === "artists") {
+      renderArtistDetail(detail);
+      return;
+    }
+    if (state.libraryView === "albums") {
+      renderAlbumDetail(detail);
+      return;
+    }
+    if (state.libraryView === "tracks") {
+      renderTrackDetail(detail);
+      return;
+    }
+    renderPlaylistDetail(detail);
+  }
+
+  function renderArtistDetail(detail) {
+    const artist = state.artistById.get(state.selectedArtistId);
+    if (!artist) {
+      appendParagraph(detail, "No artist selected.");
+      return;
+    }
+
+    const albums = state.albumsByArtist.get(artist.id) || [];
+    const tracks = albums.flatMap((album) => state.tracksByAlbum.get(album.id) || []);
+    detail.appendChild(detailHeader(
+      createArtworkFrame("artist", artist.id, "artist", artist.name, 220),
+      artist.name,
+      `${formatCount(albums.length)} albums. ${formatCount(tracks.length)} tracks.`
+    ));
+    appendDetailSectionTitle(detail, "Albums");
+
+    const list = document.createElement("div");
+    list.className = "detail-list";
+    for (const album of albums) {
+      list.appendChild(detailButton(
+        "select-album",
+        album.id,
+        createArtworkFrame("album", album.id, "cover", album.title, 96),
+        albumLabel(album),
+        `${formatCount((state.tracksByAlbum.get(album.id) || []).length)} tracks`,
+        formatYear(album.release_year)
+      ));
+    }
+    if (!albums.length) {
+      appendParagraph(list, "No albums for this artist.");
+    }
+    detail.appendChild(list);
+  }
+
+  function renderAlbumDetail(detail) {
+    const album = state.albumById.get(state.selectedAlbumId);
+    if (!album) {
+      appendParagraph(detail, "No album selected.");
+      return;
+    }
+
+    const tracks = state.tracksByAlbum.get(album.id) || [];
+    detail.appendChild(detailHeader(
+      createArtworkFrame("album", album.id, "cover", album.title, 220),
+      albumLabel(album),
+      `${artistName(album.artist_id)}. ${formatCount(tracks.length)} tracks.`
+    ));
+    appendDetailSectionTitle(detail, "Tracks");
+    detail.appendChild(trackDetailList(tracks, "album", album.id));
+  }
+
+  function renderTrackDetail(detail) {
+    const track = state.trackById.get(state.selectedTrackId);
+    if (!track) {
+      appendParagraph(detail, "No track selected.");
+      return;
+    }
+
+    const album = state.albumById.get(track.album_id);
+    detail.appendChild(detailHeader(
+      album
+        ? createArtworkFrame("album", album.id, "cover", album.title, 220)
+        : createPlaceholderArtwork(track.title),
+      trackLabel(track),
+      `${artistName(track.artist_id)}. ${album ? albumLabel(album) : "Unknown album"}.`
+    ));
+
+    const actions = document.createElement("div");
+    actions.className = "player-controls";
+    const start = document.createElement("button");
+    start.type = "button";
+    start.dataset.action = "play-track";
+    start.dataset.id = track.id;
+    start.textContent = "Start";
+    actions.appendChild(start);
+    detail.appendChild(actions);
+  }
+
+  function renderPlaylistDetail(detail) {
+    const playlist = state.playlists.find((candidate) => candidate.id === state.selectedPlaylistId);
+    if (!playlist) {
+      appendParagraph(detail, "No playlist selected.");
+      return;
+    }
+
+    detail.appendChild(detailHeader(
+      createPlaceholderArtwork("playlist"),
+      playlist.name,
+      `${formatStatus(playlist.scope)}. ${playlist.description || "No description."}`
+    ));
+
+    appendDetailSectionTitle(detail, "Items");
+    const items = state.playlistItems.get(playlist.id);
+    if (!items) {
+      appendParagraph(detail, "Playlist items have not loaded.");
+      return;
+    }
+
+    const list = document.createElement("div");
+    list.className = "detail-list";
+    if (!items.length) {
+      appendParagraph(list, "No playlist items.");
+    }
+    for (const item of items) {
+      const track = item.item_type === "track" ? state.trackById.get(item.item_id) : null;
+      if (!track) {
+        list.appendChild(detailStaticRow(
+          createPlaceholderArtwork(item.item_type || "item"),
+          formatStatus(item.item_type || "item"),
+          item.item_id || "-",
+          formatCount(Number(item.position) + 1)
+        ));
+        continue;
+      }
+      const row = trackDetailButton(track, "playlist", playlist.id);
+      list.appendChild(row);
+    }
+    detail.appendChild(list);
+  }
+
+  function trackDetailList(tracks, queueType, queueId) {
+    const list = document.createElement("div");
+    list.className = "detail-list";
+    if (!tracks.length) {
+      appendParagraph(list, "No tracks for this album.");
+      return list;
+    }
+    for (const track of tracks) {
+      list.appendChild(trackDetailButton(track, queueType, queueId));
+    }
+    return list;
+  }
+
+  function trackDetailButton(track, queueType, queueId) {
+    const row = document.createElement("div");
+    row.className = "detail-list-item";
+    const album = state.albumById.get(track.album_id);
+    row.appendChild(album
+      ? createArtworkFrame("album", album.id, "cover", album.title, 96)
+      : createPlaceholderArtwork(track.title));
+
+    const text = document.createElement("span");
+    text.className = "detail-list-text";
+    const title = document.createElement("span");
+    title.className = "detail-list-title";
+    title.textContent = trackLabel(track);
+    const meta = document.createElement("span");
+    meta.className = "detail-list-meta";
+    meta.textContent = `${artistName(track.artist_id)}. ${album ? albumLabel(album) : "Unknown album"}.`;
+    text.append(title, meta);
+    row.appendChild(text);
+
+    const play = document.createElement("button");
+    play.type = "button";
+    play.dataset.action = "play-track";
+    play.dataset.id = track.id;
+    play.dataset.queue = queueType;
+    if (queueType === "playlist") {
+      play.dataset.playlistId = queueId;
+    }
+    play.textContent = "Start";
+    row.appendChild(play);
+    return row;
+  }
+
+  function detailButton(action, id, artwork, titleText, metaText, countText) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "detail-list-item";
+    button.dataset.action = action;
+    button.dataset.id = id;
+    button.appendChild(artwork);
+
+    const text = document.createElement("span");
+    text.className = "detail-list-text";
+    const title = document.createElement("span");
+    title.className = "detail-list-title";
+    title.textContent = titleText;
+    const meta = document.createElement("span");
+    meta.className = "detail-list-meta";
+    meta.textContent = metaText;
+    text.append(title, meta);
+    button.appendChild(text);
+
+    const count = document.createElement("span");
+    count.className = "library-count";
+    count.textContent = countText;
+    button.appendChild(count);
+    return button;
+  }
+
+  function detailStaticRow(artwork, titleText, metaText, countText) {
+    const row = document.createElement("div");
+    row.className = "detail-list-item";
+    row.appendChild(artwork);
+    const text = document.createElement("span");
+    text.className = "detail-list-text";
+    const title = document.createElement("span");
+    title.className = "detail-list-title";
+    title.textContent = titleText;
+    const meta = document.createElement("span");
+    meta.className = "detail-list-meta";
+    meta.textContent = metaText;
+    text.append(title, meta);
+    row.appendChild(text);
+    const count = document.createElement("span");
+    count.className = "library-count";
+    count.textContent = countText;
+    row.appendChild(count);
+    return row;
+  }
+
+  function detailHeader(artwork, titleText, metaText) {
+    const header = document.createElement("div");
+    header.className = "detail-header";
+    header.appendChild(artwork);
+    const text = document.createElement("div");
+    const title = document.createElement("h3");
+    title.textContent = titleText;
+    const meta = document.createElement("p");
+    meta.className = "library-detail-meta";
+    meta.textContent = metaText;
+    text.append(title, meta);
+    header.appendChild(text);
+    return header;
+  }
+
+  function appendDetailSectionTitle(parent, text) {
+    const title = document.createElement("h3");
+    title.className = "detail-section-title";
+    title.textContent = text;
+    parent.appendChild(title);
+  }
+
+  function appendParagraph(parent, text) {
+    const paragraph = document.createElement("p");
+    paragraph.className = "progress-empty";
+    paragraph.textContent = text;
+    parent.appendChild(paragraph);
+  }
+
+  function titleForLibraryItem(type, item) {
+    if (type === "artist") {
+      return item.name || "Unknown artist";
+    }
+    if (type === "album") {
+      return albumLabel(item);
+    }
+    if (type === "track") {
+      return trackLabel(item);
+    }
+    return item.name || "Untitled playlist";
+  }
+
+  function metaForLibraryItem(type, item) {
+    if (type === "artist") {
+      return `${formatCount((state.albumsByArtist.get(item.id) || []).length)} albums`;
+    }
+    if (type === "album") {
+      return artistName(item.artist_id);
+    }
+    if (type === "track") {
+      const album = state.albumById.get(item.album_id);
+      return `${artistName(item.artist_id)}. ${album ? albumLabel(album) : "Unknown album"}.`;
+    }
+    return formatStatus(item.scope);
+  }
+
+  function countForLibraryItem(type, item) {
+    if (type === "artist") {
+      const albums = state.albumsByArtist.get(item.id) || [];
+      const tracks = albums.flatMap((album) => state.tracksByAlbum.get(album.id) || []);
+      return `${formatCount(tracks.length)} tracks`;
+    }
+    if (type === "album") {
+      return `${formatCount((state.tracksByAlbum.get(item.id) || []).length)} tracks`;
+    }
+    if (type === "track") {
+      return formatSeconds(item.duration_seconds);
+    }
+    const items = state.playlistItems.get(item.id);
+    return items ? `${formatCount(items.length)} items` : "";
+  }
+
+  function artistName(artistId) {
+    const artist = state.artistById.get(artistId);
+    return artist && artist.name ? artist.name : "Unknown artist";
+  }
+
+  function albumLabel(album) {
+    const title = album && album.title ? album.title : "Unknown album";
+    return album && album.release_year ? `${title} (${album.release_year})` : title;
+  }
+
+  function trackLabel(track) {
+    const title = track && track.title ? track.title : "Unknown track";
+    const disc = Number(track && track.disc_number);
+    const number = Number(track && track.track_number);
+    if (Number.isFinite(disc) && disc > 0 && Number.isFinite(number) && number > 0) {
+      return `${disc}.${String(number).padStart(2, "0")} ${title}`;
+    }
+    if (Number.isFinite(number) && number > 0) {
+      return `${String(number).padStart(2, "0")} ${title}`;
+    }
+    return title;
+  }
+
+  function formatYear(value) {
+    const year = Number(value);
+    return Number.isFinite(year) && year > 0 ? String(year) : "";
+  }
+
+  function formatSeconds(value) {
+    if (value === null || value === undefined) {
+      return "--:--";
+    }
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+      return "--:--";
+    }
+    const seconds = Math.max(0, Math.floor(number));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainder = seconds % 60;
+    if (hours) {
+      return `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+    }
+    return `${minutes}:${String(remainder).padStart(2, "0")}`;
+  }
+
+  function createPlaceholderArtwork(label) {
+    const frame = document.createElement("div");
+    frame.className = "artwork-frame";
+    frame.textContent = initials(label);
+    return frame;
+  }
+
+  function createArtworkFrame(entityType, entityId, kind, label, size) {
+    const frame = createPlaceholderArtwork(label);
+    const placeholder = document.createElement("span");
+    placeholder.textContent = frame.textContent;
+    frame.textContent = "";
+    frame.appendChild(placeholder);
+    const image = document.createElement("img");
+    image.alt = label || "Artwork";
+    image.loading = "lazy";
+    image.hidden = true;
+    frame.appendChild(image);
+    hydrateArtwork(frame, image, placeholder, entityType, entityId, kind, size);
+    return frame;
+  }
+
+  function hydrateArtwork(frame, image, placeholder, entityType, entityId, kind, size) {
+    const key = artworkCacheKey(entityType, entityId, kind, size);
+    frame.dataset.artworkKey = key;
+    loadArtworkUrl(entityType, entityId, kind, size)
+      .then((url) => {
+        if (!url || !frame.isConnected || frame.dataset.artworkKey !== key) {
+          return;
+        }
+        image.addEventListener("load", () => {
+          placeholder.hidden = true;
+          image.hidden = false;
+        }, { once: true });
+        image.src = url;
+      })
+      .catch(() => {
+        state.artworkUrls.set(key, null);
+      });
+  }
+
+  async function loadArtworkUrl(entityType, entityId, kind, size) {
+    const key = artworkCacheKey(entityType, entityId, kind, size);
+    if (state.artworkUrls.has(key)) {
+      return state.artworkUrls.get(key);
+    }
+    if (state.artworkPromises.has(key)) {
+      return state.artworkPromises.get(key);
+    }
+
+    const promise = (async () => {
+      const metadata = await api(
+        `/api/v1/catalog/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}/artwork?kind=${encodeURIComponent(kind)}`
+      );
+      const artwork = metadata && Array.isArray(metadata.artwork) ? metadata.artwork[0] : null;
+      if (!artwork || !artwork.url) {
+        state.artworkUrls.set(key, null);
+        return null;
+      }
+      const separator = artwork.url.includes("?") ? "&" : "?";
+      const blob = await apiBlob(`${artwork.url}${separator}width=${encodeURIComponent(size)}`);
+      const url = URL.createObjectURL(blob);
+      state.artworkUrls.set(key, url);
+      return url;
+    })();
+
+    state.artworkPromises.set(key, promise);
+    try {
+      return await promise;
+    } finally {
+      state.artworkPromises.delete(key);
+    }
+  }
+
+  function artworkCacheKey(entityType, entityId, kind, size) {
+    return `${entityType}:${entityId}:${kind}:${size}`;
+  }
+
+  function clearArtworkCache() {
+    for (const url of state.artworkUrls.values()) {
+      if (url) {
+        URL.revokeObjectURL(url);
+      }
+    }
+    state.artworkUrls = new Map();
+    state.artworkPromises = new Map();
+  }
+
+  function initials(value) {
+    const words = String(value || "").trim().split(/\s+/).filter(Boolean);
+    if (!words.length) {
+      return "--";
+    }
+    return words.slice(0, 2).map((word) => word[0]).join("").toUpperCase();
+  }
+
+  function queueForTrackId(trackId) {
+    const track = state.trackById.get(trackId);
+    if (!track) {
+      return [];
+    }
+    const tracks = state.tracksByAlbum.get(track.album_id) || [track];
+    return tracks.length ? tracks : [track];
+  }
+
+  function albumQueueNameForTrackId(trackId) {
+    const track = state.trackById.get(trackId);
+    if (!track) {
+      return "";
+    }
+    const album = state.albumById.get(track.album_id);
+    return album ? albumLabel(album) : "";
+  }
+
+  function playlistTrackQueue(playlistId) {
+    const items = state.playlistItems.get(playlistId) || [];
+    return items
+      .filter((item) => item.item_type === "track")
+      .map((item) => state.trackById.get(item.item_id))
+      .filter(Boolean);
+  }
+
+  function playlistName(playlistId) {
+    const playlist = state.playlists.find((candidate) => candidate.id === playlistId);
+    return playlist && playlist.name ? playlist.name : "";
+  }
+
+  async function playTrackById(trackId, queue, queueName) {
+    const track = state.trackById.get(trackId);
+    if (!track) {
+      setLibraryMessage("Track is not available.", "warning");
+      return;
+    }
+    await playTrack(track, queue && queue.length ? queue : [track], queueName || "");
+  }
+
+  async function playTrack(track, queue, queueName) {
+    if (state.playbackLoading && state.playbackAbortController) {
+      state.playbackAbortController.abort();
+    }
+    if (state.currentTrackId && state.currentTrackId !== track.id) {
+      await writeCurrentTrackProgress(false, true);
+    }
+
+    clearPlaybackSource(true);
+    state.selectedTrackId = track.id;
+    state.currentTrackId = track.id;
+    state.playbackQueue = queue && queue.length ? queue : [track];
+    state.playbackQueueName = queueName || "";
+    state.playbackLoading = true;
+    state.playbackError = "";
+    renderLibrary();
+    renderPlayer();
+
+    const controller = new AbortController();
+    state.playbackAbortController = controller;
+    try {
+      const blob = await apiBlob(
+        `/api/v1/media/track/${encodeURIComponent(track.id)}/transcode/standard`,
+        { signal: controller.signal, accept: "audio/aac" }
+      );
+      if (state.currentTrackId !== track.id) {
+        return;
+      }
+      state.playbackObjectUrl = URL.createObjectURL(blob);
+      const audio = byId("library-audio");
+      audio.src = state.playbackObjectUrl;
+      state.playbackLoading = false;
+      try {
+        await audio.play();
+        await writeCurrentTrackProgress(false, true);
+      } catch (_playError) {
+        state.playbackError = "Audio is ready. Press Start to play.";
+      }
+    } catch (error) {
+      if (error.name === "AbortError") {
+        return;
+      }
+      if (state.currentTrackId === track.id) {
+        state.playbackError = error.message;
+        state.playbackLoading = false;
+        setLibraryMessage(error.message, "error");
+      }
+    } finally {
+      if (state.playbackAbortController === controller) {
+        state.playbackAbortController = null;
+      }
+      renderPlayer();
+    }
+  }
+
+  async function startSelectedTrack() {
+    if (state.playbackLoading) {
+      return;
+    }
+    const audio = byId("library-audio");
+    const current = state.currentTrackId ? state.trackById.get(state.currentTrackId) : null;
+    if (current && audio.src && audio.paused) {
+      await audio.play();
+      renderPlayer();
+      return;
+    }
+    if (current && audio.src && !audio.paused) {
+      return;
+    }
+
+    const selected = state.selectedTrackId ? state.trackById.get(state.selectedTrackId) : current;
+    if (!selected) {
+      setLibraryMessage("No track selected.", "warning");
+      return;
+    }
+    await playTrack(selected, queueForTrackId(selected.id), albumQueueNameForTrackId(selected.id));
+  }
+
+  async function stopPlayback(writeProgress) {
+    if (writeProgress) {
+      await writeCurrentTrackProgress(false, true);
+    }
+    clearPlaybackSource(true);
+    state.currentTrackId = null;
+    state.playbackLoading = false;
+    state.playbackError = "";
+    renderPlayer();
+  }
+
+  async function advancePlayback(delta, automatic) {
+    const queue = state.playbackQueue.length
+      ? state.playbackQueue
+      : (state.selectedTrackId ? queueForTrackId(state.selectedTrackId) : []);
+    if (!queue.length) {
+      return;
+    }
+
+    const currentId = state.currentTrackId || state.selectedTrackId;
+    const currentIndex = queue.findIndex((track) => track.id === currentId);
+    const startIndex = currentIndex >= 0 ? currentIndex : 0;
+    const nextIndex = (startIndex + delta + queue.length) % queue.length;
+    const nextTrack = queue[nextIndex];
+    await playTrack(nextTrack, queue, state.playbackQueueName);
+    if (automatic) {
+      setLibraryMessage("Started next track.", "success");
+    }
+  }
+
+  function clearPlaybackSource(abortFetch) {
+    if (abortFetch && state.playbackAbortController) {
+      state.playbackAbortController.abort();
+      state.playbackAbortController = null;
+    }
+    const audio = byId("library-audio");
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+    if (state.playbackObjectUrl) {
+      URL.revokeObjectURL(state.playbackObjectUrl);
+      state.playbackObjectUrl = null;
+    }
+  }
+
+  function bindLibraryAudio() {
+    const audio = byId("library-audio");
+    audio.addEventListener("timeupdate", () => {
+      updatePlayerProgress();
+      maybeWritePlaybackProgress();
+    });
+    audio.addEventListener("loadedmetadata", updatePlayerProgress);
+    audio.addEventListener("play", renderPlayer);
+    audio.addEventListener("pause", renderPlayer);
+    audio.addEventListener("ended", handlePlaybackEnded);
+    audio.addEventListener("error", () => {
+      if (!state.currentTrackId) {
+        return;
+      }
+      state.playbackError = "Playback failed for the selected track.";
+      renderPlayer();
+    });
+  }
+
+  async function handlePlaybackEnded() {
+    await writeCurrentTrackProgress(true, true);
+    state.currentTrackId = null;
+    await advancePlayback(1, true);
+  }
+
+  function maybeWritePlaybackProgress() {
+    const now = Date.now();
+    if (now - state.playbackLastProgressAt < playbackProgressWriteIntervalSeconds * 1000) {
+      return;
+    }
+    writeCurrentTrackProgress(false, false);
+  }
+
+  async function writeCurrentTrackProgress(completed, force) {
+    if (!state.currentTrackId || state.playbackWritingProgress) {
+      return;
+    }
+    const now = Date.now();
+    if (!force && now - state.playbackLastProgressAt < playbackProgressWriteIntervalSeconds * 1000) {
+      return;
+    }
+
+    const track = state.trackById.get(state.currentTrackId);
+    const audio = byId("library-audio");
+    const trackDuration = Number(track && track.duration_seconds);
+    const audioDuration = Number(audio.duration);
+    const duration = Number.isFinite(trackDuration) && trackDuration > 0
+      ? Math.floor(trackDuration)
+      : (Number.isFinite(audioDuration) && audioDuration > 0 ? Math.floor(audioDuration) : null);
+    let position = Number.isFinite(audio.currentTime) ? Math.floor(audio.currentTime) : 0;
+    if (completed && duration !== null) {
+      position = duration;
+    }
+    if (duration !== null) {
+      position = Math.min(position, duration);
+    }
+
+    state.playbackWritingProgress = true;
+    try {
+      await api(`/api/v1/me/playback/progress/track/${encodeURIComponent(state.currentTrackId)}`, {
+        method: "PUT",
+        body: {
+          position_seconds: Math.max(0, position),
+          duration_seconds: duration,
+          completed,
+        },
+      });
+      state.playbackLastProgressAt = now;
+    } catch (error) {
+      state.playbackError = `Progress update failed: ${error.message}`;
+      renderPlayer();
+    } finally {
+      state.playbackWritingProgress = false;
+    }
+  }
+
+  function renderPlayer() {
+    const track = state.currentTrackId
+      ? state.trackById.get(state.currentTrackId)
+      : (state.selectedTrackId ? state.trackById.get(state.selectedTrackId) : null);
+    const audio = byId("library-audio");
+    const title = track ? trackLabel(track) : "No track selected";
+    setText("player-title", state.playbackLoading ? "Loading audio..." : title);
+    const album = track ? state.albumById.get(track.album_id) : null;
+    const subtitle = track
+      ? `${artistName(track.artist_id)}. ${album ? albumLabel(album) : "Unknown album"}.`
+      : "No track selected.";
+    byId("player-subtitle").textContent = state.playbackError || subtitle;
+
+    byId("player-start-button").disabled = !track || state.playbackLoading;
+    byId("player-stop-button").disabled = !state.currentTrackId && !state.playbackLoading;
+    byId("player-prev-button").disabled = !track || state.playbackLoading;
+    byId("player-next-button").disabled = !track || state.playbackLoading;
+    byId("player-start-button").textContent = audio.src && !audio.paused ? "Playing" : "Start";
+    renderPlayerArtwork(track);
+    updatePlayerProgress();
+  }
+
+  function renderPlayerArtwork(track) {
+    const frame = byId("player-artwork");
+    frame.replaceChildren();
+    frame.className = "artwork-frame player-artwork";
+    if (!track) {
+      frame.textContent = "--";
+      return;
+    }
+    const album = state.albumById.get(track.album_id);
+    if (!album) {
+      frame.textContent = initials(track.title);
+      return;
+    }
+    const placeholder = document.createElement("span");
+    placeholder.textContent = initials(album.title);
+    const image = document.createElement("img");
+    image.alt = album.title || "Artwork";
+    image.hidden = true;
+    frame.append(placeholder, image);
+    hydrateArtwork(frame, image, placeholder, "album", album.id, "cover", 160);
+  }
+
+  function updatePlayerProgress() {
+    const audio = byId("library-audio");
+    const track = state.currentTrackId ? state.trackById.get(state.currentTrackId) : null;
+    const position = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+    const trackDuration = Number(track && track.duration_seconds);
+    const audioDuration = Number(audio.duration);
+    const duration = Number.isFinite(trackDuration) && trackDuration > 0
+      ? trackDuration
+      : (Number.isFinite(audioDuration) && audioDuration > 0 ? audioDuration : null);
+
+    setText("player-position", formatSeconds(position));
+    setText("player-duration", formatSeconds(duration));
+    const progress = byId("player-progress");
+    if (duration && duration > 0) {
+      progress.max = Math.floor(duration);
+      progress.value = Math.min(Math.floor(position), Math.floor(duration));
+    } else {
+      progress.max = 100;
+      progress.value = 0;
+    }
+  }
+
   /**
    * Starts an asynchronous operation for browser admin UI state, forms, API requests, and dashboard rendering.
    *
@@ -1282,6 +2420,35 @@
     return data;
   }
 
+  async function apiBlob(path, options) {
+    const settings = options || {};
+    const headers = {
+      Accept: settings.accept || "*/*",
+    };
+
+    if (!state.credentials) {
+      throw new Error("Admin credentials are required.");
+    }
+    headers.Authorization = basicAuth(state.credentials);
+
+    const response = await fetch(path, {
+      method: "GET",
+      headers,
+      signal: settings.signal,
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      const data = text ? parseJson(text) : null;
+      const detail = data && data.message ? data.message : `${response.status} ${response.statusText}`;
+      const error = new Error(detail);
+      error.status = response.status;
+      throw error;
+    }
+
+    return response.blob();
+  }
+
   /**
    * Parses and validates input for browser admin UI state, forms, API requests, and dashboard rendering.
    *
@@ -1423,6 +2590,10 @@
    */
   function setFailuresMessage(message, kind) {
     setMessage(byId("failures-message"), message, kind);
+  }
+
+  function setLibraryMessage(message, kind) {
+    setMessage(byId("library-message"), message, kind);
   }
 
   /**

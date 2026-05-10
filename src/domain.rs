@@ -278,9 +278,45 @@ pub struct SystemConfig {
     pub library_root: String,
     pub dropbox_root: String,
     pub podcast_subtree: String,
+    pub public_base_url: Option<String>,
     pub transcode_concurrency_limit: i32,
     pub scan_thread_count: i32,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SonosTransportState {
+    Stopped,
+    Buffering,
+    Paused,
+    Playing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SonosSessionStatus {
+    Active,
+    Reconnecting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SonosDeliveryKind {
+    Original,
+    TranscodeAacHigh,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SonosSignedClaim {
+    pub session_id: Uuid,
+    pub session_generation: u64,
+    pub item_generation: u64,
+    pub target_id: String,
+    pub item_type: PlaybackItemType,
+    pub item_id: Uuid,
+    pub delivery_kind: SonosDeliveryKind,
+    pub exp: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

@@ -120,6 +120,7 @@
         <div><strong>Harmonixia Admin</strong></div>
         <nav aria-label="Admin navigation">
           <a href="#dashboard" data-element-id="nav-dashboard">Dashboard</a>
+          <a href="#library" data-element-id="nav-library">Library</a>
           <a href="#failures" data-element-id="nav-failures">Failures</a>
           <a href="#quarantine" data-element-id="nav-quarantine" aria-disabled="true">Quarantine</a>
           <a href="#providers" data-element-id="nav-providers">Providers</a>
@@ -215,6 +216,65 @@
                   </div>
                 </form>
               </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="dashboard-section hidden" id="section-library" data-section="library">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Library</p>
+              <h1>Catalog browse</h1>
+            </div>
+            <button type="button" data-element-id="refresh-library-button" id="refresh-library-button">Refresh</button>
+          </div>
+
+          <div class="notice hidden" id="library-message" role="status"></div>
+
+          <div class="library-layout">
+            <section class="admin-card library-browser" aria-labelledby="library-browser-heading">
+              <div class="library-browser-heading">
+                <h2 id="library-browser-heading">Browse</h2>
+                <div class="library-tabs" role="tablist" aria-label="Library browse views">
+                  <button type="button" data-element-id="library-tab-artists" data-library-view="artists" role="tab">Artists</button>
+                  <button type="button" data-element-id="library-tab-albums" data-library-view="albums" role="tab">Albums</button>
+                  <button type="button" data-element-id="library-tab-tracks" data-library-view="tracks" role="tab">Tracks</button>
+                  <button type="button" data-element-id="library-tab-playlists" data-library-view="playlists" role="tab">Playlists</button>
+                </div>
+              </div>
+              <div class="library-list" data-element-id="library-list" id="library-list">
+                <p class="progress-empty">Library has not loaded.</p>
+              </div>
+            </section>
+
+            <section class="admin-card library-detail" aria-labelledby="library-detail-heading">
+              <h2 id="library-detail-heading">Detail</h2>
+              <div data-element-id="library-detail" id="library-detail">
+                <p class="progress-empty">No selection.</p>
+              </div>
+            </section>
+
+            <section class="admin-card player-card" aria-labelledby="player-title">
+              <div class="player-summary">
+                <div class="artwork-frame player-artwork" id="player-artwork" data-element-id="player-artwork" aria-hidden="true">--</div>
+                <div>
+                  <p class="eyebrow">Playback</p>
+                  <h2 id="player-title" data-element-id="player-title">No track selected</h2>
+                  <p id="player-subtitle" data-element-id="player-subtitle">No track selected.</p>
+                </div>
+              </div>
+              <div class="player-controls" aria-label="Playback controls">
+                <button type="button" id="player-prev-button" data-element-id="player-prev-button">Previous</button>
+                <button type="button" id="player-start-button" data-element-id="player-start-button">Start</button>
+                <button type="button" id="player-stop-button" data-element-id="player-stop-button">Stop</button>
+                <button type="button" id="player-next-button" data-element-id="player-next-button">Next</button>
+              </div>
+              <div class="player-meter">
+                <span id="player-position" data-element-id="player-position">0:00</span>
+                <progress id="player-progress" data-element-id="player-progress" value="0" max="100"></progress>
+                <span id="player-duration" data-element-id="player-duration">--:--</span>
+              </div>
+              <audio id="library-audio" preload="none"></audio>
             </section>
           </div>
         </section>

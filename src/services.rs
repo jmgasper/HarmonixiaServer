@@ -8,7 +8,11 @@ use std::{
 use tokio::{task::JoinHandle, time::sleep};
 use walkdir::WalkDir;
 
-use crate::{media::is_supported_media_path, state::AppState};
+use crate::{
+    media::is_supported_media_path,
+    sonos::{self, SonosRuntimeConfig},
+    state::AppState,
+};
 
 #[derive(Debug, Clone)]
 /// Represents background service config in the background import worker and dropbox watcher runtime services.
@@ -19,6 +23,7 @@ use crate::{media::is_supported_media_path, state::AppState};
 pub struct BackgroundServiceConfig {
     pub import_worker: ImportWorkerConfig,
     pub dropbox_watcher: DropboxWatcherConfig,
+    pub sonos: SonosRuntimeConfig,
 }
 
 impl Default for BackgroundServiceConfig {
@@ -36,6 +41,7 @@ impl Default for BackgroundServiceConfig {
         Self {
             import_worker: ImportWorkerConfig::default(),
             dropbox_watcher: DropboxWatcherConfig::default(),
+            sonos: SonosRuntimeConfig::default(),
         }
     }
 }
@@ -125,15 +131,16 @@ impl BackgroundServices {
     /// Errors:
     /// - Does not return recoverable errors.
     pub fn spawn(state: AppState, config: BackgroundServiceConfig) -> Self {
-        let mut handles = Vec::with_capacity(2);
+        let mut handles = Vec::with_capacity(3);
         handles.push(tokio::spawn(import_worker_loop(
             state.clone(),
             config.import_worker,
         )));
         handles.push(tokio::spawn(dropbox_watcher_loop(
-            state,
+            state.clone(),
             config.dropbox_watcher,
         )));
+        handles.push(tokio::spawn(sonos::runtime_loop(state, config.sonos)));
         Self { handles }
     }
 

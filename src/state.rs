@@ -1,11 +1,14 @@
 use std::{
     collections::{BTreeMap, HashSet},
     env,
+    net::IpAddr,
     path::{Component, Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -19,19 +22,22 @@ use crate::{
         CatalogPodcastEpisode, CatalogSearchError,
     },
     domain::{
-        AccountRole, Album, Artist, ArtworkAsset, ArtworkKind, AuthenticatedAccount,
+        AacTranscodeProfile, AccountRole, Album, Artist, ArtworkAsset, ArtworkKind,
+        AuthenticatedAccount,
         CatalogEntityType, Episode, ImportJob, ImportJobKind, ImportJobSource, MaintenanceScope,
         MediaFile, PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress, Playlist,
         PlaylistItem, PlaylistScope, Podcast, ProviderHealth, ProviderKind, ProviderSetting,
-        ProviderStatus, QuarantineItem, QuarantineStatus, RepairPlan, SystemConfig, Track,
-        TranscodeSlotUsage, UserAccount, DEFAULT_SCAN_THREAD_COUNT,
+        ProviderStatus, QuarantineItem, QuarantineStatus, RepairPlan, SonosDeliveryKind,
+        SonosSignedClaim, SystemConfig, Track, TranscodeSlotUsage, UserAccount,
+        DEFAULT_SCAN_THREAD_COUNT,
     },
-    error::ApiError,
+    error::{ApiError, SonosErrorReason},
     pipeline::{
         EnqueueOutcome, ImportPipeline, ImportPipelineError, ImportRunSummary,
         ImportWorkRequest,
     },
     providers::reconcile_provider_readiness,
+    sonos::SonosSnapshot,
     storage::{
         CatalogImportFailure, ConfigError as DatabaseConfigError, DatabaseConfig,
         PgMaintenanceRepository, PlaylistItemAddResult, PlaylistItemListResult,
@@ -54,6 +60,7 @@ pub struct ServerConfig {
     pub database: DatabaseConfig,
     pub library_root: PathBuf,
     pub dropbox_root: PathBuf,
+    pub public_base_url: Option<String>,
     pub ffmpeg_path: PathBuf,
     pub transcode_concurrency_limit: i32,
     pub scan_thread_count: i32,
@@ -71,6 +78,62 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     pub api_key_configured: bool,
     pub requires_api_key: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SonosMediaAuthorizationRequest {
+    pub session_id: Uuid,
+    pub session_generation: u64,
+    pub item_generation: u64,
+    pub target_id: String,
+    pub item_type: PlaybackItemType,
+    pub item_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SonosMediaAuthorizationContext {
+    pub session_id: Uuid,
+    pub session_generation: u64,
+    pub item_generation: u64,
+    pub target_id: String,
+    pub item_type: PlaybackItemType,
+    pub item_id: Uuid,
+    pub delivery_kind: SonosDeliveryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SonosSignedMediaUrl {
+    pub url: String,
+    pub claim: SonosSignedClaim,
+}
+
+#[derive(Debug, Error)]
+pub enum SonosSignedMediaIssueError {
+    #[error("public_base_url is not configured for Sonos media URLs")]
+    PublicBaseUrlUnusable,
+    #[error("no current Sonos media authorization context is registered")]
+    NoCurrentContext,
+    #[error("failed to encode Sonos signed media claim")]
+    TokenEncodingFailed,
+    #[error(transparent)]
+    Api(#[from] ApiError),
+}
+
+impl SonosSignedMediaIssueError {
+    pub fn reason(&self) -> Option<SonosErrorReason> {
+        match self {
+            Self::PublicBaseUrlUnusable => Some(SonosErrorReason::PublicBaseUrlUnusable),
+            Self::NoCurrentContext | Self::TokenEncodingFailed | Self::Api(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SonosSignedMediaValidationError {
+    #[error("invalid Sonos signed media token")]
+    InvalidToken,
+    #[error("Sonos signed media URL is no longer valid")]
+    StaleClaim,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +182,8 @@ pub enum ServerConfigError {
     InvalidTranscodeConcurrencyLimit,
     #[error("HARMONIXIA_SCAN_THREAD_COUNT must be a positive integer")]
     InvalidScanThreadCount,
+    #[error("HARMONIXIA_PUBLIC_BASE_URL must be an absolute http(s) URL reachable from Sonos clients")]
+    InvalidPublicBaseUrl,
 }
 
 impl ServerConfig {
@@ -141,6 +206,7 @@ impl ServerConfig {
             dropbox_root: env::var("HARMONIXIA_DROPBOX_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/srv/harmonixia/dropbox")),
+            public_base_url: env_public_base_url()?,
             ffmpeg_path: env::var("HARMONIXIA_FFMPEG_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("ffmpeg")),
@@ -196,6 +262,7 @@ impl Default for ServerConfig {
             },
             library_root: PathBuf::from("/srv/harmonixia/library"),
             dropbox_root: PathBuf::from("/srv/harmonixia/dropbox"),
+            public_base_url: None,
             ffmpeg_path: PathBuf::from("ffmpeg"),
             transcode_concurrency_limit: 2,
             scan_thread_count: DEFAULT_SCAN_THREAD_COUNT,
@@ -274,9 +341,17 @@ pub struct AppState {
 struct AppStateInner {
     config: ServerConfig,
     system_config: RwLock<SystemConfig>,
+    sonos_snapshot: RwLock<SonosSnapshot>,
+    sonos_media_authorization: SonosSignedMediaRuntime,
     transcode_admission: TranscodeAdmission,
     hls_generation_coordinator: HlsGenerationCoordinator,
     repository: PgMaintenanceRepository,
+}
+
+#[derive(Debug)]
+struct SonosSignedMediaRuntime {
+    current: RwLock<Option<SonosMediaAuthorizationContext>>,
+    signing_secret: [u8; 32],
 }
 
 impl AppState {
@@ -310,9 +385,18 @@ impl AppState {
         config: ServerConfig,
         repository: PgMaintenanceRepository,
     ) -> Result<Self, StorageError> {
-        let system_config = repository
+        let mut system_config = repository
             .load_or_initialize_system_config(&system_config_from_bootstrap(&config))
             .await?;
+        if let Some(public_base_url) = system_config.public_base_url.clone() {
+            system_config.public_base_url =
+                Some(normalize_public_base_url_value(&public_base_url).map_err(|reason| {
+                    StorageError::InvalidStoredValue {
+                        field: "system_config.public_base_url",
+                        value: format!("{public_base_url} ({reason})"),
+                    }
+                })?);
+        }
         let provider_settings = repository
             .load_or_initialize_provider_settings(
                 &provider_setting_seeds_from_bootstrap(&config),
@@ -329,6 +413,8 @@ impl AppState {
                 ),
                 hls_generation_coordinator: HlsGenerationCoordinator::new(),
                 system_config: RwLock::new(system_config),
+                sonos_snapshot: RwLock::new(SonosSnapshot::empty()),
+                sonos_media_authorization: SonosSignedMediaRuntime::new(),
                 repository,
             }),
         })
@@ -380,6 +466,89 @@ impl AppState {
             .clone()
     }
 
+    pub fn sonos_snapshot(&self) -> SonosSnapshot {
+        self.inner
+            .sonos_snapshot
+            .read()
+            .expect("sonos snapshot lock poisoned")
+            .clone()
+    }
+
+    pub fn replace_sonos_snapshot(&self, snapshot: SonosSnapshot) {
+        *self
+            .inner
+            .sonos_snapshot
+            .write()
+            .expect("sonos snapshot lock poisoned") = snapshot;
+    }
+
+    pub async fn register_sonos_media_authorization(
+        &self,
+        request: SonosMediaAuthorizationRequest,
+    ) -> Result<SonosSignedMediaUrl, SonosSignedMediaIssueError> {
+        let media_file = self
+            .visible_original_media_file(request.item_type, request.item_id)
+            .await?;
+        let context = SonosMediaAuthorizationContext {
+            session_id: request.session_id,
+            session_generation: request.session_generation,
+            item_generation: request.item_generation,
+            target_id: request.target_id,
+            item_type: request.item_type,
+            item_id: request.item_id,
+            delivery_kind: sonos_delivery_kind_for_media_file(&media_file),
+        };
+        self.replace_sonos_media_authorization_context(context);
+        self.issue_sonos_signed_media_url()
+    }
+
+    pub fn replace_sonos_media_authorization_context(
+        &self,
+        context: SonosMediaAuthorizationContext,
+    ) {
+        self.inner.sonos_media_authorization.replace(context);
+    }
+
+    pub fn clear_sonos_media_authorization_context(&self) {
+        self.inner.sonos_media_authorization.clear();
+    }
+
+    pub fn issue_sonos_signed_media_url(
+        &self,
+    ) -> Result<SonosSignedMediaUrl, SonosSignedMediaIssueError> {
+        let exp = (Utc::now() + Duration::seconds(300)).timestamp();
+        self.issue_sonos_signed_media_url_with_exp(exp)
+    }
+
+    #[doc(hidden)]
+    pub fn issue_sonos_signed_media_url_with_exp(
+        &self,
+        exp: i64,
+    ) -> Result<SonosSignedMediaUrl, SonosSignedMediaIssueError> {
+        let context = self
+            .inner
+            .sonos_media_authorization
+            .current_context()
+            .ok_or(SonosSignedMediaIssueError::NoCurrentContext)?;
+        let claim = context.to_claim(exp);
+        let token = self.inner.sonos_media_authorization.encode_claim(&claim)?;
+        let config = self.system_config();
+        let public_base_url = config
+            .public_base_url
+            .as_deref()
+            .ok_or(SonosSignedMediaIssueError::PublicBaseUrlUnusable)?;
+        let url = sonos_signed_media_url(public_base_url, &token)?;
+
+        Ok(SonosSignedMediaUrl { url, claim })
+    }
+
+    pub fn validate_sonos_signed_media_token(
+        &self,
+        token: &str,
+    ) -> Result<SonosSignedClaim, SonosSignedMediaValidationError> {
+        self.inner.sonos_media_authorization.validate_token(token)
+    }
+
     /// Updates existing state for application state facade used by HTTP handlers and background workers.
     ///
     /// Inputs:
@@ -387,6 +556,7 @@ impl AppState {
     /// - `library_root`: `&str`; expected to be text input; empty strings, unsupported names, or malformed values are rejected where this function validates them.
     /// - `dropbox_root`: `&str`; expected to be text input; empty strings, unsupported names, or malformed values are rejected where this function validates them.
     /// - `podcast_subtree`: `Option<&str>`; expected to be text input; empty strings, unsupported names, or malformed values are rejected where this function validates them.
+    /// - `public_base_url`: `Option<Option<&str>>`; expected to be an absolute http(s) URL when provided, `Some(None)` clears the stored URL, and `None` preserves the existing value.
     /// - `transcode_concurrency_limit`: `Option<i32>`; expected to be an optional value; `None` asks the function to use its default or omit that filter.
     /// - `scan_thread_count`: `Option<i32>`; expected to be an optional value; `None` asks the function to use its default or omit that filter.
     ///
@@ -400,6 +570,7 @@ impl AppState {
         library_root: &str,
         dropbox_root: &str,
         podcast_subtree: Option<&str>,
+        public_base_url: Option<Option<&str>>,
         transcode_concurrency_limit: Option<i32>,
         scan_thread_count: Option<i32>,
     ) -> Result<SystemConfig, ApiError> {
@@ -410,6 +581,11 @@ impl AppState {
             podcast_subtree: normalize_podcast_subtree(
                 podcast_subtree.unwrap_or(current.podcast_subtree.as_str()),
             )?,
+            public_base_url: match public_base_url {
+                Some(Some(value)) => Some(normalize_public_base_url(value)?),
+                Some(None) => None,
+                None => current.public_base_url.clone(),
+            },
             transcode_concurrency_limit: normalize_transcode_concurrency_limit(
                 transcode_concurrency_limit.unwrap_or(current.transcode_concurrency_limit),
             )?,
@@ -2364,6 +2540,248 @@ impl AppState {
     }
 }
 
+impl SonosSignedMediaRuntime {
+    fn new() -> Self {
+        Self::with_secret(new_sonos_signing_secret())
+    }
+
+    fn with_secret(signing_secret: [u8; 32]) -> Self {
+        Self {
+            current: RwLock::new(None),
+            signing_secret,
+        }
+    }
+
+    fn replace(&self, context: SonosMediaAuthorizationContext) {
+        *self
+            .current
+            .write()
+            .expect("sonos media authorization lock poisoned") = Some(context);
+    }
+
+    fn clear(&self) {
+        *self
+            .current
+            .write()
+            .expect("sonos media authorization lock poisoned") = None;
+    }
+
+    fn current_context(&self) -> Option<SonosMediaAuthorizationContext> {
+        self.current
+            .read()
+            .expect("sonos media authorization lock poisoned")
+            .clone()
+    }
+
+    fn encode_claim(
+        &self,
+        claim: &SonosSignedClaim,
+    ) -> Result<String, SonosSignedMediaIssueError> {
+        let payload =
+            serde_json::to_vec(claim).map_err(|_| SonosSignedMediaIssueError::TokenEncodingFailed)?;
+        let signature = sign_sonos_claim_payload(&self.signing_secret, &payload);
+
+        Ok(format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(payload),
+            URL_SAFE_NO_PAD.encode(signature)
+        ))
+    }
+
+    fn decode_claim(
+        &self,
+        token: &str,
+    ) -> Result<SonosSignedClaim, SonosSignedMediaValidationError> {
+        let (payload, signature) = token
+            .split_once('.')
+            .ok_or(SonosSignedMediaValidationError::InvalidToken)?;
+        if payload.is_empty() || signature.is_empty() {
+            return Err(SonosSignedMediaValidationError::InvalidToken);
+        }
+
+        let payload = URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| SonosSignedMediaValidationError::InvalidToken)?;
+        let signature = URL_SAFE_NO_PAD
+            .decode(signature)
+            .map_err(|_| SonosSignedMediaValidationError::InvalidToken)?;
+        let expected = sign_sonos_claim_payload(&self.signing_secret, &payload);
+        if !constant_time_bytes_equal(&signature, &expected) {
+            return Err(SonosSignedMediaValidationError::InvalidToken);
+        }
+
+        serde_json::from_slice::<SonosSignedClaim>(&payload)
+            .map_err(|_| SonosSignedMediaValidationError::InvalidToken)
+    }
+
+    fn validate_token(
+        &self,
+        token: &str,
+    ) -> Result<SonosSignedClaim, SonosSignedMediaValidationError> {
+        let claim = self.decode_claim(token)?;
+        let current = self
+            .current
+            .read()
+            .expect("sonos media authorization lock poisoned");
+        let Some(context) = current.as_ref() else {
+            return Err(SonosSignedMediaValidationError::StaleClaim);
+        };
+        if !context.matches_claim(&claim) {
+            return Err(SonosSignedMediaValidationError::StaleClaim);
+        }
+
+        Ok(claim)
+    }
+}
+
+impl SonosMediaAuthorizationContext {
+    fn to_claim(&self, exp: i64) -> SonosSignedClaim {
+        SonosSignedClaim {
+            session_id: self.session_id,
+            session_generation: self.session_generation,
+            item_generation: self.item_generation,
+            target_id: self.target_id.clone(),
+            item_type: self.item_type,
+            item_id: self.item_id,
+            delivery_kind: self.delivery_kind,
+            exp,
+        }
+    }
+
+    fn matches_claim(&self, claim: &SonosSignedClaim) -> bool {
+        self.session_id == claim.session_id
+            && self.session_generation == claim.session_generation
+            && self.item_generation == claim.item_generation
+            && self.target_id == claim.target_id
+            && self.item_type == claim.item_type
+            && self.item_id == claim.item_id
+            && self.delivery_kind == claim.delivery_kind
+    }
+}
+
+pub fn sonos_delivery_kind_for_media_file(media_file: &MediaFile) -> SonosDeliveryKind {
+    if sonos_original_delivery_is_clearly_safe(media_file) {
+        SonosDeliveryKind::Original
+    } else {
+        SonosDeliveryKind::TranscodeAacHigh
+    }
+}
+
+pub fn sonos_aac_profile_for_delivery(
+    delivery_kind: SonosDeliveryKind,
+) -> Option<AacTranscodeProfile> {
+    match delivery_kind {
+        SonosDeliveryKind::Original => None,
+        SonosDeliveryKind::TranscodeAacHigh => Some(AacTranscodeProfile::High),
+    }
+}
+
+fn sonos_original_delivery_is_clearly_safe(media_file: &MediaFile) -> bool {
+    let Some(mime_type) = media_file
+        .mime_type
+        .as_deref()
+        .map(normalize_sonos_media_token)
+    else {
+        return false;
+    };
+    let Some(audio_codec) = media_file
+        .audio_codec
+        .as_deref()
+        .map(normalize_sonos_media_token)
+    else {
+        return false;
+    };
+    let Some(sample_rate) = media_file.sample_rate else {
+        return false;
+    };
+    let Some(channels) = media_file.channels else {
+        return false;
+    };
+    if !(8_000..=48_000).contains(&sample_rate) || !(1..=2).contains(&channels) {
+        return false;
+    }
+
+    let container_tokens = media_file
+        .container
+        .as_deref()
+        .map(normalize_sonos_container_tokens)
+        .unwrap_or_default();
+    if container_tokens.is_empty() {
+        return false;
+    }
+
+    let is_mp3 = audio_codec == "mp3"
+        && mime_type == "audio/mpeg"
+        && container_tokens.iter().any(|container| container == "mp3");
+    let is_aac_mp4 = matches!(audio_codec.as_str(), "aac" | "mp4a")
+        && matches!(
+            mime_type.as_str(),
+            "audio/mp4" | "audio/x_m4a" | "audio/aac" | "audio/aacp"
+        )
+        && container_tokens
+            .iter()
+            .any(|container| matches!(container.as_str(), "m4a" | "mp4" | "mov"));
+
+    is_mp3 || is_aac_mp4
+}
+
+fn normalize_sonos_container_tokens(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(normalize_sonos_media_token)
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn normalize_sonos_media_token(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_")
+}
+
+fn sonos_signed_media_url(
+    public_base_url: &str,
+    token: &str,
+) -> Result<String, SonosSignedMediaIssueError> {
+    let mut url = reqwest::Url::parse(public_base_url)
+        .map_err(|_| SonosSignedMediaIssueError::PublicBaseUrlUnusable)?;
+    let base_path = url.path().trim_end_matches('/');
+    let path = format!("{base_path}/api/v1/sonos/media/{token}");
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn new_sonos_signing_secret() -> [u8; 32] {
+    let mut secret = [0_u8; 32];
+    secret[..16].copy_from_slice(&Uuid::new_v4().into_bytes());
+    secret[16..].copy_from_slice(&Uuid::new_v4().into_bytes());
+    secret
+}
+
+fn sign_sonos_claim_payload(secret: &[u8; 32], payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"harmonixia-sonos-signed-media-v1");
+    hasher.update(secret);
+    hasher.update((payload.len() as u64).to_be_bytes());
+    hasher.update(payload);
+    hasher.update(secret);
+    hasher.finalize().into()
+}
+
+fn constant_time_bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
+}
+
 /// Validates data for application state facade used by HTTP handlers and background workers.
 ///
 /// Inputs:
@@ -2441,6 +2859,7 @@ fn system_config_from_bootstrap(config: &ServerConfig) -> SystemConfig {
         library_root: config.library_root.to_string_lossy().to_string(),
         dropbox_root: config.dropbox_root.to_string_lossy().to_string(),
         podcast_subtree: "Podcasts".to_string(),
+        public_base_url: config.public_base_url.clone(),
         transcode_concurrency_limit: config.transcode_concurrency_limit,
         scan_thread_count: config.scan_thread_count,
         updated_at: Utc::now(),
@@ -2790,6 +3209,45 @@ fn normalize_podcast_subtree(value: &str) -> Result<String, ApiError> {
     Ok(value.to_string())
 }
 
+/// Normalizes caller-provided public base URLs for remote playback clients.
+fn normalize_public_base_url(value: &str) -> Result<String, ApiError> {
+    normalize_public_base_url_value(value).map_err(ApiError::BadRequest)
+}
+
+fn normalize_public_base_url_value(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("public_base_url cannot be empty".into());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("public_base_url cannot contain control characters".into());
+    }
+
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "public_base_url must be an absolute URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("public_base_url must use http or https".into());
+    }
+    let Some(host) = url.host_str() else {
+        return Err("public_base_url must include a host".into());
+    };
+
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err("public_base_url cannot use localhost".into());
+    }
+    if let Ok(address) = host.parse::<IpAddr>() {
+        if address.is_loopback() {
+            return Err("public_base_url cannot use a loopback host".into());
+        }
+        if address.is_unspecified() {
+            return Err("public_base_url cannot use an unspecified host".into());
+        }
+    }
+
+    Ok(value.to_string())
+}
+
 /// Normalizes caller-provided data for application state facade used by HTTP handlers and background workers.
 ///
 /// Inputs:
@@ -2901,6 +3359,15 @@ fn env_value(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn env_public_base_url() -> Result<Option<String>, ServerConfigError> {
+    env_value("HARMONIXIA_PUBLIC_BASE_URL")
+        .map(|value| {
+            normalize_public_base_url_value(&value)
+                .map_err(|_| ServerConfigError::InvalidPublicBaseUrl)
+        })
+        .transpose()
 }
 
 /// Handles env bool for application state facade used by HTTP handlers and background workers.
@@ -3081,4 +3548,146 @@ fn validate_progress_seconds(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{MediaFileStatus, MediaKind};
+
+    fn media_file(
+        mime_type: Option<&str>,
+        container: Option<&str>,
+        audio_codec: Option<&str>,
+        sample_rate: Option<i32>,
+        channels: Option<i32>,
+    ) -> MediaFile {
+        let now = Utc::now();
+        MediaFile {
+            id: Uuid::new_v4(),
+            media_kind: MediaKind::Music,
+            status: MediaFileStatus::Published,
+            source_path: "/library/source".into(),
+            managed_path: Some("/library/managed".into()),
+            file_hash: "hash".into(),
+            file_size: 128,
+            mime_type: mime_type.map(str::to_string),
+            container: container.map(str::to_string),
+            audio_codec: audio_codec.map(str::to_string),
+            duration_seconds: Some(1),
+            bitrate: Some(128_000),
+            sample_rate,
+            channels,
+            genres: Vec::new(),
+            format_keys: Vec::new(),
+            track_id: Some(Uuid::new_v4()),
+            episode_id: None,
+            duplicate_of_media_file_id: None,
+            import_job_id: None,
+            discovered_at: now,
+            published_at: Some(now),
+            updated_at: now,
+        }
+    }
+
+    fn context() -> SonosMediaAuthorizationContext {
+        SonosMediaAuthorizationContext {
+            session_id: Uuid::parse_str("018f26c0-0000-7000-8000-000000000010").unwrap(),
+            session_generation: 2,
+            item_generation: 7,
+            target_id: "sonos-room-1".into(),
+            item_type: PlaybackItemType::Track,
+            item_id: Uuid::parse_str("018f26c0-0000-7000-8000-000000000011").unwrap(),
+            delivery_kind: SonosDeliveryKind::Original,
+        }
+    }
+
+    #[test]
+    fn sonos_delivery_selection_allows_only_clear_direct_safe_metadata() {
+        assert_eq!(
+            sonos_delivery_kind_for_media_file(&media_file(
+                Some("audio/mpeg"),
+                Some("mp3"),
+                Some("mp3"),
+                Some(44_100),
+                Some(2),
+            )),
+            SonosDeliveryKind::Original
+        );
+        assert_eq!(
+            sonos_delivery_kind_for_media_file(&media_file(
+                Some("audio/mp4"),
+                Some("mov,mp4,m4a,3gp,3g2,mj2"),
+                Some("aac"),
+                Some(44_100),
+                Some(2),
+            )),
+            SonosDeliveryKind::Original
+        );
+        assert_eq!(
+            sonos_delivery_kind_for_media_file(&media_file(
+                Some("audio/flac"),
+                Some("flac"),
+                Some("flac"),
+                Some(44_100),
+                Some(2),
+            )),
+            SonosDeliveryKind::TranscodeAacHigh
+        );
+        assert_eq!(
+            sonos_delivery_kind_for_media_file(&media_file(
+                Some("audio/mpeg"),
+                Some("mp3"),
+                Some("mp3"),
+                None,
+                Some(2),
+            )),
+            SonosDeliveryKind::TranscodeAacHigh
+        );
+    }
+
+    #[test]
+    fn sonos_expired_claim_is_accepted_for_same_current_item() {
+        let runtime = SonosSignedMediaRuntime::with_secret([7_u8; 32]);
+        let context = context();
+        runtime.replace(context.clone());
+        let claim = context.to_claim(Utc::now().timestamp() - 60);
+        let token = runtime.encode_claim(&claim).unwrap();
+
+        assert_eq!(runtime.validate_token(&token).unwrap(), claim);
+    }
+
+    #[test]
+    fn sonos_claim_rejects_session_generation_mismatch_immediately() {
+        let runtime = SonosSignedMediaRuntime::with_secret([7_u8; 32]);
+        let context = context();
+        runtime.replace(context.clone());
+        let token = runtime.encode_claim(&context.to_claim(Utc::now().timestamp())).unwrap();
+        runtime.replace(SonosMediaAuthorizationContext {
+            session_generation: context.session_generation + 1,
+            ..context
+        });
+
+        assert_eq!(
+            runtime.validate_token(&token),
+            Err(SonosSignedMediaValidationError::StaleClaim)
+        );
+    }
+
+    #[test]
+    fn sonos_claim_rejects_item_generation_mismatch_immediately() {
+        let runtime = SonosSignedMediaRuntime::with_secret([7_u8; 32]);
+        let context = context();
+        runtime.replace(context.clone());
+        let token = runtime.encode_claim(&context.to_claim(Utc::now().timestamp())).unwrap();
+        runtime.replace(SonosMediaAuthorizationContext {
+            item_generation: context.item_generation + 1,
+            ..context
+        });
+
+        assert_eq!(
+            runtime.validate_token(&token),
+            Err(SonosSignedMediaValidationError::StaleClaim)
+        );
+    }
 }

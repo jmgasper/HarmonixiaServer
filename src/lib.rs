@@ -7,6 +7,7 @@ pub mod media;
 pub mod pipeline;
 pub mod providers;
 pub mod services;
+pub mod sonos;
 pub mod state;
 pub mod storage;
 pub mod transcode;
