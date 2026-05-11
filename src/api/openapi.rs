@@ -1,6 +1,6 @@
 use utoipa::{
     openapi::{
-        schema::{AnyOf, Object, Schema, SchemaType, Type},
+        schema::{AnyOf, Object, Ref, Schema, SchemaType, Type},
         security::{Http, HttpAuthScheme, SecurityScheme},
         RefOr,
     },
@@ -41,8 +41,9 @@ use crate::{
         PlaylistsResponse, ReorderPlaylistItemsRequest, UpdatePlaylistRequest,
     },
     api::sonos::{
-        SonosGroupTarget, SonosNextItemSummary, SonosPlayRequest, SonosPlaySourceType,
-        SonosSessionSummary, SonosSpeakerTarget, SonosTargetsResponse,
+        SonosGroupTarget, SonosNextItemSummary, SonosPlaybackResponse, SonosPlaybackTarget,
+        SonosPlayRequest, SonosPlaySourceType, SonosSeekRequest, SonosSessionSummary,
+        SonosSpeakerTarget, SonosTargetsResponse,
     },
     domain::{
         AacTranscodeProfile, AccountRole, Album, AlbumKind, Artist, ArtworkAsset, ArtworkAssetDraft,
@@ -122,6 +123,14 @@ use crate::{
         crate::api::playback::write_history,
         crate::api::playback::list_history,
         crate::api::sonos::list_targets,
+        crate::api::sonos::play_target,
+        crate::api::sonos::pause_target,
+        crate::api::sonos::resume_target,
+        crate::api::sonos::stop_target,
+        crate::api::sonos::seek_target,
+        crate::api::sonos::next_target,
+        crate::api::sonos::previous_target,
+        crate::api::sonos::fetch_signed_media,
     ),
     components(
         schemas(
@@ -227,8 +236,11 @@ use crate::{
             SonosErrorReason,
             SonosGroupTarget,
             SonosNextItemSummary,
+            SonosPlaybackResponse,
+            SonosPlaybackTarget,
             SonosPlayRequest,
             SonosPlaySourceType,
+            SonosSeekRequest,
             SonosSessionStatus,
             SonosSessionSummary,
             SonosSignedClaim,
@@ -257,7 +269,7 @@ use crate::{
         (name = "playlists", description = "Personal and household-shared playlists with ordered track/episode membership"),
         (name = "providers", description = "Metadata provider health and repair operations"),
         (name = "quarantine", description = "Quarantine retry handoff into the import pipeline"),
-        (name = "sonos", description = "Live Sonos speaker and group discovery targets"),
+        (name = "sonos", description = "Live Sonos discovery, signed-media delivery, managed playback, and target control"),
         (name = "settings", description = "Admin system and provider configuration")
     ),
     modifiers(&SecurityAddon)
@@ -314,11 +326,13 @@ fn apply_contract_schema_overrides(openapi: &mut utoipa::openapi::OpenApi) {
         ("SonosGroupTarget", "volume_percent"),
         ("SonosGroupTarget", "muted"),
         ("SonosGroupTarget", "transport_state"),
+        ("SonosPlaybackResponse", "session"),
         ("SonosSessionSummary", "current_duration_seconds"),
         ("SonosSessionSummary", "next_item"),
     ] {
         require_nullable_property(schemas, schema_name, field_name);
     }
+    sonos_playback_response_target_schema(schemas);
     nullable_property(schemas, "SystemConfigUpdateRequest", "public_base_url");
     for (schema_name, field_name) in [
         ("ErrorResponse", "details"),
@@ -327,6 +341,27 @@ fn apply_contract_schema_overrides(openapi: &mut utoipa::openapi::OpenApi) {
     ] {
         non_nullable_property(schemas, schema_name, field_name);
     }
+}
+
+fn sonos_playback_response_target_schema(
+    schemas: &mut std::collections::BTreeMap<String, RefOr<Schema>>,
+) {
+    let Some(schema) = schema_object_mut(schemas, "SonosPlaybackResponse") else {
+        return;
+    };
+    if !schema.required.iter().any(|field| field == "target") {
+        schema.required.push("target".to_string());
+    }
+    schema.properties.insert(
+        "target".to_string(),
+        RefOr::T(Schema::AnyOf(AnyOf {
+            items: vec![
+                RefOr::Ref(Ref::from_schema_name("SonosSpeakerTarget")),
+                RefOr::Ref(Ref::from_schema_name("SonosGroupTarget")),
+            ],
+            ..Default::default()
+        })),
+    );
 }
 
 fn require_nullable_property(

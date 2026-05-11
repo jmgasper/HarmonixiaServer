@@ -11,7 +11,7 @@ use harmonixia_server::{
         ImportJobKind, ImportJobSource, ImportJobStatus, MaintenanceScope, MediaFileStatus,
         MediaProbeFacts, MetadataProvenanceDraft, MusicCatalogGrouping, PodcastCatalogGrouping,
         PlaybackItemType, ProviderHealth, ProviderKind, ProviderStatus, QuarantineItem,
-        QuarantineStatus, RepairPlan, SonosDeliveryKind,
+        QuarantineStatus, RepairPlan, SonosDeliveryKind, SonosSessionStatus,
     },
     pipeline::ImportWorkRequest,
     providers::{ProviderCredential, ProviderRegistry},
@@ -26,19 +26,21 @@ use harmonixia_server::{
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     fs,
     future::Future,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::Notify,
     task::JoinHandle,
 };
 use tower::ServiceExt;
@@ -635,6 +637,291 @@ fn path_and_query_from_url(url: &str) -> String {
         Some(query) => format!("{}?{query}", url.path()),
         None => url.path().to_string(),
     }
+}
+
+fn latest_sonos_media_uri(raw_requests: &[String]) -> String {
+    raw_requests
+        .iter()
+        .rev()
+        .find_map(|request| {
+            let start = request.find("<CurrentURI>")? + "<CurrentURI>".len();
+            let end = request[start..].find("</CurrentURI>")? + start;
+            Some(decode_test_xml_entities(&request[start..end]))
+        })
+        .expect("expected a Sonos SetAVTransportURI request")
+}
+
+fn decode_test_xml_entities(value: &str) -> String {
+    value
+        .replace("&apos;", "'")
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+}
+
+struct MockSonosSoapServer {
+    base_url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    raw_requests: Arc<Mutex<Vec<String>>>,
+    fail_next_actions: Arc<Mutex<Vec<String>>>,
+    block_next_action: Arc<Mutex<Option<String>>>,
+    blocked_action_seen: Arc<Notify>,
+    release_blocked_action: Arc<Notify>,
+    handle: JoinHandle<()>,
+}
+
+impl MockSonosSoapServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let raw_requests = Arc::new(Mutex::new(Vec::new()));
+        let fail_next_actions = Arc::new(Mutex::new(Vec::new()));
+        let block_next_action = Arc::new(Mutex::new(None));
+        let blocked_action_seen = Arc::new(Notify::new());
+        let release_blocked_action = Arc::new(Notify::new());
+        let transport_state = Arc::new(Mutex::new("PLAYING".to_string()));
+        let server_requests = requests.clone();
+        let server_raw_requests = raw_requests.clone();
+        let server_fail_next_actions = fail_next_actions.clone();
+        let server_block_next_action = block_next_action.clone();
+        let server_blocked_action_seen = blocked_action_seen.clone();
+        let server_release_blocked_action = release_blocked_action.clone();
+        let server_transport_state = transport_state.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let server_requests = server_requests.clone();
+                let server_raw_requests = server_raw_requests.clone();
+                let server_fail_next_actions = server_fail_next_actions.clone();
+                let server_block_next_action = server_block_next_action.clone();
+                let server_blocked_action_seen = server_blocked_action_seen.clone();
+                let server_release_blocked_action = server_release_blocked_action.clone();
+                let server_transport_state = server_transport_state.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 8192];
+                    let Ok(len) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..len]).to_string();
+                    server_raw_requests.lock().unwrap().push(request.clone());
+                    let first_line = request.lines().next().unwrap_or_default().to_string();
+                    let action = sonos_action_from_request(&request);
+                    let action_suffix = action
+                        .map(|action| format!(" {action}"))
+                        .unwrap_or_default();
+                    server_requests
+                        .lock()
+                        .unwrap()
+                        .push(format!("{first_line}{action_suffix}"));
+
+                    if let Some(action) = action {
+                        let should_block = {
+                            let mut block_next_action = server_block_next_action.lock().unwrap();
+                            if block_next_action.as_deref() == Some(action) {
+                                *block_next_action = None;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_block {
+                            server_blocked_action_seen.notify_one();
+                            server_release_blocked_action.notified().await;
+                        }
+
+                        let should_fail = {
+                            let mut fail_next_actions = server_fail_next_actions.lock().unwrap();
+                            if let Some(index) = fail_next_actions
+                                .iter()
+                                .position(|candidate| candidate == action)
+                            {
+                                fail_next_actions.remove(index);
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_fail {
+                            let body = soap_response("");
+                            let response = format!(
+                                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            return;
+                        }
+                    }
+
+                    match action {
+                        Some("Play") => {
+                            *server_transport_state.lock().unwrap() = "PLAYING".to_string();
+                        }
+                        Some("Pause") => {
+                            *server_transport_state.lock().unwrap() =
+                                "PAUSED_PLAYBACK".to_string();
+                        }
+                        Some("Stop") => {
+                            *server_transport_state.lock().unwrap() = "STOPPED".to_string();
+                        }
+                        _ => {}
+                    }
+
+                    let body = if request.contains("GetVolume") {
+                        soap_response("<CurrentVolume>23</CurrentVolume>")
+                    } else if request.contains("GetMute") {
+                        soap_response("<CurrentMute>0</CurrentMute>")
+                    } else if request.contains("GetTransportInfo") {
+                        let state = server_transport_state.lock().unwrap().clone();
+                        soap_response(&format!(
+                            "<CurrentTransportState>{state}</CurrentTransportState>"
+                        ))
+                    } else {
+                        soap_response("")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Self {
+            base_url,
+            requests,
+            raw_requests,
+            fail_next_actions,
+            block_next_action,
+            blocked_action_seen,
+            release_blocked_action,
+            handle,
+        }
+    }
+
+    fn fail_next_action(&self, action: &str) {
+        self.fail_next_actions
+            .lock()
+            .unwrap()
+            .push(action.to_string());
+    }
+
+    fn block_next_action(&self, action: &str) {
+        *self.block_next_action.lock().unwrap() = Some(action.to_string());
+    }
+
+    async fn wait_for_blocked_action(&self) {
+        self.blocked_action_seen.notified().await;
+    }
+
+    fn release_blocked_action(&self) {
+        self.release_blocked_action.notify_waiters();
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn raw_requests(&self) -> Vec<String> {
+        self.raw_requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for MockSonosSoapServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn sonos_action_from_request(request: &str) -> Option<&'static str> {
+    for action in [
+        "SetAVTransportURI",
+        "Play",
+        "Pause",
+        "Seek",
+        "Stop",
+        "BecomeCoordinatorOfStandaloneGroup",
+        "GetTransportInfo",
+        "GetVolume",
+        "GetMute",
+    ] {
+        if request.contains(action) {
+            return Some(action);
+        }
+    }
+    None
+}
+
+fn soap_response(body: &str) -> String {
+    format!("<?xml version=\"1.0\"?><s:Envelope><s:Body>{body}</s:Body></s:Envelope>")
+}
+
+fn sonos_snapshot_for_speaker(
+    target_id: &str,
+    display_name: &str,
+    base_url: &str,
+    raw_transport_state: &str,
+) -> SonosSnapshot {
+    let mut locations = BTreeMap::new();
+    locations.insert(
+        target_id.to_string(),
+        format!("{base_url}/xml/device.xml"),
+    );
+    SonosSnapshot::from_targets_with_control_locations(
+        vec![SonosSpeakerSnapshot {
+            id: target_id.into(),
+            display_name: display_name.into(),
+            room_name: Some(display_name.into()),
+            available: true,
+            live: SonosLiveState {
+                volume_percent: Some(20),
+                muted: Some(false),
+                raw_transport_state: Some(raw_transport_state.into()),
+            },
+        }],
+        Vec::new(),
+        locations,
+    )
+}
+
+async fn import_sonos_test_track(
+    state: &AppState,
+    dropbox_root: &Path,
+    managed_path: &Path,
+    hash: &str,
+    title: &str,
+    duration_seconds: i32,
+) -> Uuid {
+    let mut request = music_import_request(
+        &dropbox_root.join(format!("{hash}-source.mp3")).to_string_lossy(),
+        hash,
+        "Sonos Test Artist",
+        "Sonos Test Album",
+        title,
+        Some(1),
+    );
+    request.probe.mime_type = Some("audio/mpeg".into());
+    request.probe.container = Some("mp3".into());
+    request.probe.audio_codec = Some("mp3".into());
+    request.probe.duration_seconds = Some(duration_seconds);
+    state
+        .repository()
+        .import_catalog_file(with_managed_path(
+            request,
+            managed_path,
+            i64::from(duration_seconds.max(1)),
+        ))
+        .await
+        .unwrap()
+        .track
+        .unwrap()
+        .id
 }
 
 /// Verifies that json array contains id.
@@ -4635,6 +4922,1828 @@ async fn media_original_stream_uses_episode_canonical_file_when_multiple_publish
 }
 
 #[tokio::test]
+async fn sonos_targets_requires_authentication() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+
+    let (status, body) = get_json(router(state), "/api/v1/sonos/targets", None).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn sonos_targets_returns_live_snapshot_for_authenticated_user_and_replaces_targets() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+
+    state.replace_sonos_snapshot(SonosSnapshot::from_targets(
+        vec![
+            SonosSpeakerSnapshot {
+                id: "speaker-kitchen".into(),
+                display_name: "Kitchen".into(),
+                room_name: Some("Kitchen".into()),
+                available: true,
+                live: SonosLiveState {
+                    volume_percent: Some(18),
+                    muted: Some(false),
+                    raw_transport_state: Some("idle".into()),
+                },
+            },
+            SonosSpeakerSnapshot {
+                id: "speaker-office".into(),
+                display_name: "Office".into(),
+                room_name: None,
+                available: true,
+                live: SonosLiveState {
+                    volume_percent: None,
+                    muted: None,
+                    raw_transport_state: None,
+                },
+            },
+        ],
+        vec![SonosGroupSnapshot {
+            id: "group-downstairs".into(),
+            display_name: "Downstairs".into(),
+            available: true,
+            live: SonosLiveState {
+                volume_percent: Some(71),
+                muted: Some(true),
+                raw_transport_state: Some("playing".into()),
+            },
+        }],
+    ));
+
+    let (status, body) = get_json(
+        router(state.clone()),
+        "/api/v1/sonos/targets",
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let speakers = body["speakers"].as_array().unwrap();
+    let groups = body["groups"].as_array().unwrap();
+    assert_eq!(speakers.len(), 2);
+    assert_eq!(groups.len(), 1);
+
+    let kitchen = speakers
+        .iter()
+        .find(|speaker| speaker["id"] == "speaker-kitchen")
+        .unwrap();
+    let office = speakers
+        .iter()
+        .find(|speaker| speaker["id"] == "speaker-office")
+        .unwrap();
+    let group = &groups[0];
+
+    assert_eq!(kitchen["room_name"], "Kitchen");
+    assert_eq!(kitchen["volume_percent"], json!(18));
+    assert_eq!(kitchen["muted"], json!(false));
+    assert_eq!(kitchen["transport_state"], "stopped");
+    assert!(kitchen.as_object().unwrap().contains_key("room_name"));
+
+    for field in ["room_name", "volume_percent", "muted", "transport_state"] {
+        assert!(office.as_object().unwrap().contains_key(field));
+        assert_eq!(office[field], Value::Null);
+    }
+
+    assert!(!group.as_object().unwrap().contains_key("room_name"));
+    assert_eq!(group["volume_percent"], json!(71));
+    assert_eq!(group["muted"], json!(true));
+    assert_eq!(group["transport_state"], "playing");
+
+    state.replace_sonos_snapshot(SonosSnapshot::empty());
+    let (status, body) = get_json(router(state), "/api/v1/sonos/targets", Some(TestAuth::User))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["speakers"].as_array().unwrap().is_empty());
+    assert!(body["groups"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sonos_managed_playback_controls_queue_replacement_and_owner_attribution() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-playback-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(library_root.join("Podcasts/Show")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+
+    let track_one_path = library_root.join("Artist/Album/sonos-one.mp3");
+    let track_two_path = library_root.join("Artist/Album/sonos-two.mp3");
+    let episode_path = library_root.join("Podcasts/Show/sonos-episode.mp3");
+    fs::write(&track_one_path, b"one").unwrap();
+    fs::write(&track_two_path, b"two").unwrap();
+    fs::write(&episode_path, b"episode").unwrap();
+
+    let mut first_request = music_import_request(
+        &dropbox_root.join("sonos-one-source.mp3").to_string_lossy(),
+        "sonos-managed-one",
+        "Sonos Artist",
+        "Sonos Album",
+        "First Managed Track",
+        Some(1),
+    );
+    first_request.probe.mime_type = Some("audio/mpeg".into());
+    first_request.probe.container = Some("mp3".into());
+    first_request.probe.audio_codec = Some("mp3".into());
+    let track_one = state
+        .repository()
+        .import_catalog_file(with_managed_path(first_request, &track_one_path, 3))
+        .await
+        .unwrap()
+        .track
+        .unwrap()
+        .id;
+
+    let mut second_request = music_import_request(
+        &dropbox_root.join("sonos-two-source.mp3").to_string_lossy(),
+        "sonos-managed-two",
+        "Sonos Artist",
+        "Sonos Album",
+        "Second Managed Track",
+        Some(2),
+    );
+    second_request.probe.mime_type = Some("audio/mpeg".into());
+    second_request.probe.container = Some("mp3".into());
+    second_request.probe.audio_codec = Some("mp3".into());
+    let track_two = state
+        .repository()
+        .import_catalog_file(with_managed_path(second_request, &track_two_path, 3))
+        .await
+        .unwrap()
+        .track
+        .unwrap()
+        .id;
+
+    let episode = state
+        .repository()
+        .import_catalog_file(with_managed_path(
+            podcast_import_request(
+                &dropbox_root.join("sonos-episode-source.mp3").to_string_lossy(),
+                "sonos-managed-episode",
+                "Sonos Podcast",
+                "Managed Episode",
+                Some(1),
+            ),
+            &episode_path,
+            7,
+        ))
+        .await
+        .unwrap()
+        .episode
+        .unwrap()
+        .id;
+
+    let sonos = MockSonosSoapServer::start().await;
+    let mut locations = BTreeMap::new();
+    locations.insert(
+        "speaker-kitchen".to_string(),
+        format!("{}/xml/device.xml", sonos.base_url),
+    );
+    state.replace_sonos_snapshot(SonosSnapshot::from_targets_with_control_locations(
+        vec![SonosSpeakerSnapshot {
+            id: "speaker-kitchen".into(),
+            display_name: "Kitchen".into(),
+            room_name: Some("Kitchen".into()),
+            available: true,
+            live: SonosLiveState {
+                volume_percent: Some(18),
+                muted: Some(false),
+                raw_transport_state: Some("PLAYING".into()),
+            },
+        }],
+        Vec::new(),
+        locations,
+    ));
+
+    let app = router(state.clone());
+    let (track_status, track_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-kitchen/play",
+        json!({ "source_type": "track", "source_id": track_one }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(track_status, StatusCode::OK);
+    assert_eq!(track_body["target"]["id"], "speaker-kitchen");
+    assert_eq!(track_body["session"]["owner_username"], USER_USERNAME);
+    assert_eq!(track_body["session"]["queue_index"], 0);
+    assert_eq!(track_body["session"]["queue_position"], 1);
+    assert_eq!(track_body["session"]["queue_length"], 1);
+    assert_eq!(track_body["session"]["current_duration_seconds"], 180);
+    assert!(track_body["session"]["next_item"].is_null());
+
+    let (pause_status, pause_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-kitchen/pause",
+        json!({}),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(pause_status, StatusCode::OK);
+    assert_eq!(pause_body["session"]["status"], "active");
+
+    let (seek_status, seek_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-kitchen/seek",
+        json!({ "position_seconds": 42 }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(seek_status, StatusCode::OK);
+    assert_eq!(seek_body["session"]["current_position_seconds"], 42);
+
+    let (user_progress_status, user_progress) = get_json(
+        app.clone(),
+        "/api/v1/me/playback/progress",
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(user_progress_status, StatusCode::OK);
+    assert!(user_progress["progress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["item_id"] == json!(track_one)));
+    let (admin_progress_status, admin_progress) = get_json(
+        app.clone(),
+        "/api/v1/me/playback/progress",
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(admin_progress_status, StatusCode::OK);
+    assert!(!admin_progress["progress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["item_id"] == json!(track_one)));
+
+    let (playlist_status, playlist) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/playlists",
+        json!({ "name": "Sonos Queue", "scope": "personal" }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(playlist_status, StatusCode::CREATED);
+    let playlist_id = playlist["id"].as_str().unwrap();
+    for (item_type, item_id) in [
+        ("track", track_one),
+        ("episode", episode),
+        ("track", track_two),
+    ] {
+        let (add_status, _) = request_json(
+            app.clone(),
+            "POST",
+            &format!("/api/v1/playlists/{playlist_id}/items"),
+            json!({ "item_type": item_type, "item_id": item_id }),
+            Some(TestAuth::User),
+        )
+        .await;
+        assert_eq!(add_status, StatusCode::CREATED);
+    }
+
+    let (playlist_play_status, playlist_play) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-kitchen/play",
+        json!({ "source_type": "playlist", "source_id": playlist_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(playlist_play_status, StatusCode::OK);
+    assert_eq!(playlist_play["session"]["queue_length"], 3);
+    assert_eq!(playlist_play["session"]["next_item"]["item_type"], "episode");
+    assert_eq!(playlist_play["session"]["next_item"]["item_id"], json!(episode));
+
+    let (next_status, next_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-kitchen/next",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(next_status, StatusCode::OK);
+    assert_eq!(next_body["session"]["queue_index"], 1);
+    assert_eq!(next_body["session"]["queue_position"], 2);
+    assert_eq!(next_body["session"]["current_item_type"], "episode");
+    assert_eq!(next_body["session"]["next_item"]["item_id"], json!(track_two));
+
+    let (previous_status, previous_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-kitchen/previous",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(previous_status, StatusCode::OK);
+    assert_eq!(previous_body["session"]["queue_index"], 0);
+
+    let (episode_play_status, episode_play) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-kitchen/play",
+        json!({ "source_type": "episode", "source_id": episode }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(episode_play_status, StatusCode::OK);
+    assert_eq!(episode_play["session"]["owner_username"], ADMIN_USERNAME);
+    assert_eq!(episode_play["session"]["queue_length"], 1);
+    assert_eq!(episode_play["session"]["current_item_type"], "episode");
+
+    let (stop_status, stop_body) = request_json(
+        app,
+        "POST",
+        "/api/v1/sonos/targets/speaker-kitchen/stop",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(stop_status, StatusCode::OK);
+    assert_eq!(stop_body["target"]["id"], "speaker-kitchen");
+    assert!(stop_body["session"].is_null());
+
+    let requests = sonos.requests();
+    assert!(requests
+        .iter()
+        .any(|request| request.contains("SetAVTransportURI")));
+    assert!(requests.iter().any(|request| request.contains("Pause")));
+    assert!(requests.iter().any(|request| request.contains("Seek")));
+    assert!(requests.iter().any(|request| request.contains("Stop")));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_skip_writes_outgoing_item_progress_and_history_for_session_owner() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-skip-attribution-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+
+    let first_path = library_root.join("Artist/Album/sonos-skip-one.mp3");
+    let second_path = library_root.join("Artist/Album/sonos-skip-two.mp3");
+    fs::write(&first_path, b"skip-one").unwrap();
+    fs::write(&second_path, b"skip-two").unwrap();
+    let first_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &first_path,
+        "sonos-skip-one",
+        "Skip One",
+        120,
+    )
+    .await;
+    let second_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &second_path,
+        "sonos-skip-two",
+        "Skip Two",
+        120,
+    )
+    .await;
+
+    let sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-skip",
+        "Skip Room",
+        &sonos.base_url,
+        "PLAYING",
+    ));
+
+    let app = router(state.clone());
+    let (playlist_status, playlist) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/playlists",
+        json!({ "name": "Sonos Skip Queue", "scope": "personal" }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(playlist_status, StatusCode::CREATED);
+    let playlist_id = playlist["id"].as_str().unwrap();
+    for track in [first_track, second_track] {
+        let (add_status, _) = request_json(
+            app.clone(),
+            "POST",
+            &format!("/api/v1/playlists/{playlist_id}/items"),
+            json!({ "item_type": "track", "item_id": track }),
+            Some(TestAuth::User),
+        )
+        .await;
+        assert_eq!(add_status, StatusCode::CREATED);
+    }
+
+    let (play_status, play_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-skip/play",
+        json!({ "source_type": "playlist", "source_id": playlist_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(play_status, StatusCode::OK);
+    assert_eq!(play_body["session"]["current_item_id"], json!(first_track));
+    assert_eq!(play_body["session"]["next_item"]["item_id"], json!(second_track));
+
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let (next_status, next_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-skip/next",
+        json!({}),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(next_status, StatusCode::OK);
+    assert_eq!(next_body["session"]["current_item_id"], json!(second_track));
+
+    let (first_progress_status, first_progress) = get_json(
+        app.clone(),
+        &format!("/api/v1/me/playback/progress/track/{first_track}"),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(first_progress_status, StatusCode::OK);
+    assert!(first_progress["position_seconds"].as_u64().unwrap() >= 2);
+
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let (previous_status, previous_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-skip/previous",
+        json!({}),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(previous_status, StatusCode::OK);
+    assert_eq!(previous_body["session"]["current_item_id"], json!(first_track));
+
+    let (second_progress_status, second_progress) = get_json(
+        app.clone(),
+        &format!("/api/v1/me/playback/progress/track/{second_track}"),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(second_progress_status, StatusCode::OK);
+    assert!(second_progress["position_seconds"].as_u64().unwrap() >= 2);
+
+    let (admin_progress_status, admin_progress) = get_json(
+        app.clone(),
+        "/api/v1/me/playback/progress",
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(admin_progress_status, StatusCode::OK);
+    assert!(admin_progress["progress"].as_array().unwrap().is_empty());
+
+    let (history_status, history) = get_json(
+        app,
+        "/api/v1/me/playback/history?limit=20",
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(history_status, StatusCode::OK);
+    let history_items = history["history"].as_array().unwrap();
+    assert!(history_items.iter().any(|event| {
+        event["item_id"] == json!(first_track)
+            && event["position_seconds"].as_u64().unwrap_or_default() >= 2
+    }));
+    assert!(history_items.iter().any(|event| {
+        event["item_id"] == json!(second_track)
+            && event["position_seconds"].as_u64().unwrap_or_default() >= 2
+    }));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_failed_skip_handoff_does_not_write_outgoing_final_history() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-skip-failed-handoff-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+
+    let first_path = library_root.join("Artist/Album/sonos-skip-fail-one.mp3");
+    let second_path = library_root.join("Artist/Album/sonos-skip-fail-two.mp3");
+    fs::write(&first_path, b"skip-fail-one").unwrap();
+    fs::write(&second_path, b"skip-fail-two").unwrap();
+    let first_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &first_path,
+        "sonos-skip-fail-one",
+        "Skip Fail One",
+        120,
+    )
+    .await;
+    let second_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &second_path,
+        "sonos-skip-fail-two",
+        "Skip Fail Two",
+        120,
+    )
+    .await;
+
+    let sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-skip-fail",
+        "Skip Fail Room",
+        &sonos.base_url,
+        "PLAYING",
+    ));
+
+    let app = router(state.clone());
+    let (playlist_status, playlist) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/playlists",
+        json!({ "name": "Sonos Failed Skip Queue", "scope": "personal" }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(playlist_status, StatusCode::CREATED);
+    let playlist_id = playlist["id"].as_str().unwrap();
+    for track in [first_track, second_track] {
+        let (add_status, _) = request_json(
+            app.clone(),
+            "POST",
+            &format!("/api/v1/playlists/{playlist_id}/items"),
+            json!({ "item_type": "track", "item_id": track }),
+            Some(TestAuth::User),
+        )
+        .await;
+        assert_eq!(add_status, StatusCode::CREATED);
+    }
+
+    let (play_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-skip-fail/play",
+        json!({ "source_type": "playlist", "source_id": playlist_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(play_status, StatusCode::OK);
+
+    let (_, history_before) = get_json(
+        app.clone(),
+        "/api/v1/me/playback/history?limit=20",
+        Some(TestAuth::User),
+    )
+    .await;
+    let first_history_before = history_before["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["item_id"] == json!(first_track))
+        .count();
+
+    sonos.fail_next_action("SetAVTransportURI");
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let (next_status, next_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-skip-fail/next",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(next_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(next_body["details"]["reason"], "target_unreachable");
+
+    let summary = state
+        .sonos_managed_sessions()
+        .session_summary("speaker-skip-fail", Instant::now())
+        .unwrap();
+    assert_eq!(summary.current_item_id, first_track);
+
+    let (history_status, history_after) = get_json(
+        app,
+        "/api/v1/me/playback/history?limit=20",
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(history_status, StatusCode::OK);
+    let history_items = history_after["history"].as_array().unwrap();
+    let first_history_after = history_items
+        .iter()
+        .filter(|event| event["item_id"] == json!(first_track))
+        .count();
+    assert_eq!(first_history_after, first_history_before);
+    assert!(!history_items.iter().any(|event| {
+        event["item_id"] == json!(first_track)
+            && event["position_seconds"].as_u64().unwrap_or_default() >= 2
+    }));
+    assert!(!history_items
+        .iter()
+        .any(|event| event["item_id"] == json!(second_track)));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_pause_freezes_progress_across_active_session_ticks() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-pause-freeze-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+    let track_path = library_root.join("Artist/Album/sonos-paused.mp3");
+    fs::write(&track_path, b"paused").unwrap();
+    let track_id = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &track_path,
+        "sonos-paused-track",
+        "Paused Track",
+        90,
+    )
+    .await;
+
+    let sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-pause",
+        "Pause Room",
+        &sonos.base_url,
+        "PLAYING",
+    ));
+
+    let app = router(state.clone());
+    let (play_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-pause/play",
+        json!({ "source_type": "track", "source_id": track_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(play_status, StatusCode::OK);
+
+    let (seek_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-pause/seek",
+        json!({ "position_seconds": 9 }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(seek_status, StatusCode::OK);
+
+    let (pause_status, pause_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-pause/pause",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(pause_status, StatusCode::OK);
+    assert_eq!(pause_body["session"]["current_position_seconds"], 9);
+
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(50))
+        .await;
+
+    let (resume_status, resume_body) = request_json(
+        app,
+        "POST",
+        "/api/v1/sonos/targets/speaker-pause/resume",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(resume_status, StatusCode::OK);
+    assert_eq!(resume_body["session"]["current_position_seconds"], 9);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_reconnect_window_reports_countdown_and_expires_session() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-reconnect-expiry-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+    let track_path = library_root.join("Artist/Album/sonos-reconnect-expiry.mp3");
+    fs::write(&track_path, b"reconnect").unwrap();
+    let track_id = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &track_path,
+        "sonos-reconnect-expiry",
+        "Reconnect Expiry Track",
+        90,
+    )
+    .await;
+
+    let sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-reconnect",
+        "Reconnect Room",
+        &sonos.base_url,
+        "PLAYING",
+    ));
+
+    let app = router(state.clone());
+    let (play_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-reconnect/play",
+        json!({ "source_type": "track", "source_id": track_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(play_status, StatusCode::OK);
+
+    drop(sonos);
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25))
+        .await;
+    let transient_summary = state
+        .sonos_managed_sessions()
+        .session_summary("speaker-reconnect", Instant::now())
+        .unwrap();
+    assert_eq!(transient_summary.status, SonosSessionStatus::Active);
+    assert!(transient_summary.reconnect_seconds_remaining.is_none());
+
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25))
+        .await;
+    let reconnect_summary = state
+        .sonos_managed_sessions()
+        .session_summary("speaker-reconnect", Instant::now())
+        .unwrap();
+    assert_eq!(reconnect_summary.status, SonosSessionStatus::Reconnecting);
+    let remaining = reconnect_summary.reconnect_seconds_remaining.unwrap();
+    assert!((1..=15).contains(&remaining));
+
+    let (resume_status, resume_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-reconnect/resume",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(resume_status, StatusCode::CONFLICT);
+    assert_eq!(resume_body["details"]["reason"], "target_reconnecting");
+
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25))
+        .await;
+    assert!(state
+        .sonos_managed_sessions()
+        .session_summary("speaker-reconnect", Instant::now())
+        .is_none());
+
+    let (stop_status, stop_body) = request_json(
+        app,
+        "POST",
+        "/api/v1/sonos/targets/speaker-reconnect/stop",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(stop_status, StatusCode::CONFLICT);
+    assert_eq!(stop_body["details"]["reason"], "session_not_managed");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_reconnect_resume_seeks_to_saved_position() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-reconnect-seek-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+    let track_path = library_root.join("Artist/Album/sonos-reconnect-seek.mp3");
+    fs::write(&track_path, b"seek").unwrap();
+    let track_id = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &track_path,
+        "sonos-reconnect-seek",
+        "Reconnect Seek Track",
+        120,
+    )
+    .await;
+
+    let first_sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-reconnect-seek",
+        "Reconnect Seek Room",
+        &first_sonos.base_url,
+        "PLAYING",
+    ));
+
+    let app = router(state.clone());
+    let (play_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-reconnect-seek/play",
+        json!({ "source_type": "track", "source_id": track_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(play_status, StatusCode::OK);
+    let (seek_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-reconnect-seek/seek",
+        json!({ "position_seconds": 12 }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(seek_status, StatusCode::OK);
+
+    drop(first_sonos);
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25))
+        .await;
+    assert_eq!(
+        state
+            .sonos_managed_sessions()
+            .session_summary("speaker-reconnect-seek", Instant::now())
+            .unwrap()
+            .status,
+        SonosSessionStatus::Active
+    );
+
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25))
+        .await;
+    assert_eq!(
+        state
+            .sonos_managed_sessions()
+            .session_summary("speaker-reconnect-seek", Instant::now())
+            .unwrap()
+            .status,
+        SonosSessionStatus::Reconnecting
+    );
+
+    let second_sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-reconnect-seek",
+        "Reconnect Seek Room",
+        &second_sonos.base_url,
+        "PLAYING",
+    ));
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(100))
+        .await;
+
+    let active_summary = state
+        .sonos_managed_sessions()
+        .session_summary("speaker-reconnect-seek", Instant::now())
+        .unwrap();
+    assert_eq!(active_summary.status, SonosSessionStatus::Active);
+    assert_eq!(active_summary.current_position_seconds, 12);
+    assert!(second_sonos
+        .raw_requests()
+        .iter()
+        .any(|request| {
+            request.contains("Seek") && request.contains("<Target>00:00:12</Target>")
+        }));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_stale_reconnect_resume_does_not_replace_new_play_after_stop() {
+    sonos_stale_reconnect_resume_does_not_replace_new_play_after_stop_for_blocked_action(
+        "SetAVTransportURI",
+        "set-uri",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sonos_stale_reconnect_play_does_not_restart_after_stop() {
+    sonos_stale_reconnect_resume_does_not_replace_new_play_after_stop_for_blocked_action(
+        "Play",
+        "play",
+    )
+    .await;
+}
+
+async fn sonos_stale_reconnect_resume_does_not_replace_new_play_after_stop_for_blocked_action(
+    blocked_action: &'static str,
+    suffix: &str,
+) {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-stale-reconnect-{suffix}-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+
+    let old_body = b"stale reconnect old";
+    let new_body = b"stale reconnect new";
+    let old_path = library_root.join(format!("Artist/Album/sonos-stale-old-{suffix}.mp3"));
+    let new_path = library_root.join(format!("Artist/Album/sonos-stale-new-{suffix}.mp3"));
+    fs::write(&old_path, old_body).unwrap();
+    fs::write(&new_path, new_body).unwrap();
+    let old_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &old_path,
+        &format!("sonos-stale-old-{suffix}"),
+        "Stale Old",
+        120,
+    )
+    .await;
+    let new_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &new_path,
+        &format!("sonos-stale-new-{suffix}"),
+        "Stale New",
+        120,
+    )
+    .await;
+
+    let target_id = format!("speaker-stale-reconnect-{suffix}");
+    let play_uri = format!("/api/v1/sonos/targets/{target_id}/play");
+    let stop_uri = format!("/api/v1/sonos/targets/{target_id}/stop");
+    let first_sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        &target_id,
+        "Stale Reconnect Room",
+        &first_sonos.base_url,
+        "PLAYING",
+    ));
+
+    let app = router(state.clone());
+    let (old_play_status, _) = request_json(
+        app.clone(),
+        "POST",
+        &play_uri,
+        json!({ "source_type": "track", "source_id": old_track }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(old_play_status, StatusCode::OK);
+
+    drop(first_sonos);
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25))
+        .await;
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25))
+        .await;
+    assert_eq!(
+        state
+            .sonos_managed_sessions()
+            .session_summary(&target_id, Instant::now())
+            .unwrap()
+            .status,
+        SonosSessionStatus::Reconnecting
+    );
+
+    let replacement_sonos = MockSonosSoapServer::start().await;
+    replacement_sonos.block_next_action(blocked_action);
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        &target_id,
+        "Stale Reconnect Room",
+        &replacement_sonos.base_url,
+        "PLAYING",
+    ));
+
+    let reconcile_state = state.clone();
+    let reconcile = tokio::spawn(async move {
+        harmonixia_server::sonos::reconcile_active_sessions(
+            &reconcile_state,
+            Duration::from_secs(5),
+        )
+        .await;
+    });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        replacement_sonos.wait_for_blocked_action(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("reconnect resume should block on {blocked_action}"));
+
+    let stop_app = app.clone();
+    let stop_uri_for_task = stop_uri.clone();
+    let stop = tokio::spawn(async move {
+        request_json(
+            stop_app,
+            "POST",
+            &stop_uri_for_task,
+            json!({}),
+            Some(TestAuth::User),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+
+    let play_app = app.clone();
+    let play_uri_for_task = play_uri.clone();
+    let replacement_play = tokio::spawn(async move {
+        request_json(
+            play_app,
+            "POST",
+            &play_uri_for_task,
+            json!({ "source_type": "track", "source_id": new_track }),
+            Some(TestAuth::Admin),
+        )
+        .await
+    });
+
+    let removed_while_blocked = eventually(Duration::from_millis(250), || {
+        let state = state.clone();
+        let target_id = target_id.clone();
+        async move {
+            state
+                .sonos_managed_sessions()
+                .session_summary(&target_id, Instant::now())
+                .is_none()
+        }
+    })
+    .await;
+    assert!(
+        !removed_while_blocked,
+        "stop must wait for the target transport guard before invalidating the stale session"
+    );
+    assert!(
+        !stop.is_finished(),
+        "stop should remain pending while the reconnect {blocked_action} request is blocked"
+    );
+    assert!(
+        !replacement_play.is_finished(),
+        "replacement play should wait behind stop while the reconnect {blocked_action} request is blocked"
+    );
+
+    replacement_sonos.release_blocked_action();
+
+    let (stop_status, _) = stop.await.unwrap();
+    assert_eq!(stop_status, StatusCode::OK);
+
+    let (new_play_status, new_play_body) = replacement_play.await.unwrap();
+    assert_eq!(new_play_status, StatusCode::OK);
+    assert_eq!(new_play_body["session"]["current_item_id"], json!(new_track));
+    let new_play_uri = latest_sonos_media_uri(&replacement_sonos.raw_requests());
+
+    reconcile.await.unwrap();
+
+    let summary = state
+        .sonos_managed_sessions()
+        .session_summary(&target_id, Instant::now())
+        .unwrap();
+    assert_eq!(summary.status, SonosSessionStatus::Active);
+    assert_eq!(summary.current_item_id, new_track);
+    let requests = replacement_sonos.requests();
+    let last_stop = requests
+        .iter()
+        .rposition(|request| request.ends_with(" Stop"))
+        .expect("stop should be sent after the stale reconnect transport action finishes");
+    let last_play = requests
+        .iter()
+        .rposition(|request| request.ends_with(" Play"))
+        .expect("replacement play should send Play");
+    assert!(
+        last_stop < last_play,
+        "replacement Play should be the playback start after Stop"
+    );
+    let latest_uri = latest_sonos_media_uri(&replacement_sonos.raw_requests());
+    assert_eq!(latest_uri, new_play_uri);
+    let (media_status, _, media_bytes) = get_bytes(
+        app,
+        &path_and_query_from_url(&latest_uri),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(media_status, StatusCode::OK);
+    assert_eq!(media_bytes, new_body);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_handoff_signed_media_urls_validate_for_play_skip_and_reconnect_resume() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-handoff-signed-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+
+    let first_body = b"handoff first sonos bytes";
+    let second_body = b"handoff second sonos bytes";
+    let first_path = library_root.join("Artist/Album/sonos-handoff-one.mp3");
+    let second_path = library_root.join("Artist/Album/sonos-handoff-two.mp3");
+    fs::write(&first_path, first_body).unwrap();
+    fs::write(&second_path, second_body).unwrap();
+    let first_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &first_path,
+        "sonos-handoff-one",
+        "Handoff One",
+        120,
+    )
+    .await;
+    let second_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &second_path,
+        "sonos-handoff-two",
+        "Handoff Two",
+        120,
+    )
+    .await;
+
+    let first_sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-handoff",
+        "Handoff Room",
+        &first_sonos.base_url,
+        "PLAYING",
+    ));
+
+    let app = router(state.clone());
+    let (playlist_status, playlist) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/playlists",
+        json!({ "name": "Sonos Handoff Queue", "scope": "personal" }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(playlist_status, StatusCode::CREATED);
+    let playlist_id = playlist["id"].as_str().unwrap();
+    for track in [first_track, second_track] {
+        let (add_status, _) = request_json(
+            app.clone(),
+            "POST",
+            &format!("/api/v1/playlists/{playlist_id}/items"),
+            json!({ "item_type": "track", "item_id": track }),
+            Some(TestAuth::User),
+        )
+        .await;
+        assert_eq!(add_status, StatusCode::CREATED);
+    }
+
+    let (play_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-handoff/play",
+        json!({ "source_type": "playlist", "source_id": playlist_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(play_status, StatusCode::OK);
+    let play_uri = latest_sonos_media_uri(&first_sonos.raw_requests());
+    let (play_media_status, _, play_bytes) = get_bytes(
+        app.clone(),
+        &path_and_query_from_url(&play_uri),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(play_media_status, StatusCode::OK);
+    assert_eq!(play_bytes, first_body);
+
+    let (next_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-handoff/next",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(next_status, StatusCode::OK);
+    let next_uri = latest_sonos_media_uri(&first_sonos.raw_requests());
+    let (next_media_status, _, next_bytes) = get_bytes(
+        app.clone(),
+        &path_and_query_from_url(&next_uri),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(next_media_status, StatusCode::OK);
+    assert_eq!(next_bytes, second_body);
+    let (stale_play_status, _, _) = get_bytes(
+        app.clone(),
+        &path_and_query_from_url(&play_uri),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(stale_play_status, StatusCode::FORBIDDEN);
+
+    drop(first_sonos);
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25))
+        .await;
+    assert_eq!(
+        state
+            .sonos_managed_sessions()
+            .session_summary("speaker-handoff", Instant::now())
+            .unwrap()
+            .status,
+        SonosSessionStatus::Active
+    );
+
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25))
+        .await;
+    assert_eq!(
+        state
+            .sonos_managed_sessions()
+            .session_summary("speaker-handoff", Instant::now())
+            .unwrap()
+            .status,
+        SonosSessionStatus::Reconnecting
+    );
+
+    let second_sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-handoff",
+        "Handoff Room",
+        &second_sonos.base_url,
+        "PLAYING",
+    ));
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(100))
+        .await;
+    let resume_uri = latest_sonos_media_uri(&second_sonos.raw_requests());
+    let (resume_media_status, _, resume_bytes) = get_bytes(
+        app.clone(),
+        &path_and_query_from_url(&resume_uri),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(resume_media_status, StatusCode::OK);
+    assert_eq!(resume_bytes, second_body);
+    let (stale_next_status, _, _) = get_bytes(
+        app,
+        &path_and_query_from_url(&next_uri),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(stale_next_status, StatusCode::FORBIDDEN);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_replacement_writes_previous_owner_final_snapshot() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-replacement-final-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+    let first_path = library_root.join("Artist/Album/sonos-replace-one.mp3");
+    let second_path = library_root.join("Artist/Album/sonos-replace-two.mp3");
+    fs::write(&first_path, b"replace-one").unwrap();
+    fs::write(&second_path, b"replace-two").unwrap();
+    let first_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &first_path,
+        "sonos-replace-one",
+        "Replace One",
+        120,
+    )
+    .await;
+    let second_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &second_path,
+        "sonos-replace-two",
+        "Replace Two",
+        120,
+    )
+    .await;
+
+    let sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-replace",
+        "Replace Room",
+        &sonos.base_url,
+        "PLAYING",
+    ));
+
+    let app = router(state.clone());
+    let (play_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-replace/play",
+        json!({ "source_type": "track", "source_id": first_track }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(play_status, StatusCode::OK);
+
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(100))
+        .await;
+
+    let (replace_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-replace/play",
+        json!({ "source_type": "track", "source_id": second_track }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(replace_status, StatusCode::OK);
+
+    let (progress_status, progress) = get_json(
+        app.clone(),
+        &format!("/api/v1/me/playback/progress/track/{first_track}"),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(progress_status, StatusCode::OK);
+    assert!(progress["position_seconds"].as_u64().unwrap() >= 2);
+
+    let (history_status, history) = get_json(
+        app,
+        "/api/v1/me/playback/history?limit=10",
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(history_status, StatusCode::OK);
+    assert!(history["history"].as_array().unwrap().iter().any(|event| {
+        event["item_id"] == json!(first_track)
+            && event["position_seconds"].as_u64().unwrap_or_default() >= 2
+    }));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_control_errors_and_reconnect_window_use_planned_reasons() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-errors-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+    let managed_path = library_root.join("Artist/Album/sonos-error-track.mp3");
+    fs::write(&managed_path, b"track").unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await else {
+        return;
+    };
+
+    let mut track_request = music_import_request(
+        &dropbox_root.join("sonos-error-source.mp3").to_string_lossy(),
+        "sonos-error-track",
+        "Sonos Artist",
+        "Sonos Album",
+        "Error Track",
+        Some(1),
+    );
+    track_request.probe.mime_type = Some("audio/mpeg".into());
+    track_request.probe.container = Some("mp3".into());
+    track_request.probe.audio_codec = Some("mp3".into());
+    let track_id = state
+        .repository()
+        .import_catalog_file(with_managed_path(track_request, &managed_path, 5))
+        .await
+        .unwrap()
+        .track
+        .unwrap()
+        .id;
+
+    let sonos = MockSonosSoapServer::start().await;
+    let mut locations = BTreeMap::new();
+    locations.insert(
+        "speaker-office".to_string(),
+        format!("{}/xml/device.xml", sonos.base_url),
+    );
+    state.replace_sonos_snapshot(SonosSnapshot::from_targets_with_control_locations(
+        vec![SonosSpeakerSnapshot {
+            id: "speaker-office".into(),
+            display_name: "Office".into(),
+            room_name: Some("Office".into()),
+            available: true,
+            live: SonosLiveState {
+                volume_percent: Some(10),
+                muted: Some(false),
+                raw_transport_state: Some("PLAYING".into()),
+            },
+        }],
+        Vec::new(),
+        locations,
+    ));
+
+    let app = router(state.clone());
+    let (unmanaged_status, unmanaged_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-office/pause",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(unmanaged_status, StatusCode::CONFLICT);
+    assert_eq!(unmanaged_body["details"]["reason"], "session_not_managed");
+
+    let (no_base_status, no_base_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-office/play",
+        json!({ "source_type": "track", "source_id": track_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(no_base_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        no_base_body["details"]["reason"],
+        "public_base_url_unusable"
+    );
+
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+    let (missing_status, missing_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/missing-speaker/play",
+        json!({ "source_type": "track", "source_id": track_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(missing_body["details"]["reason"], "target_unreachable");
+
+    let (play_status, _) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-office/play",
+        json!({ "source_type": "track", "source_id": track_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(play_status, StatusCode::OK);
+
+    state.replace_sonos_snapshot(SonosSnapshot::empty());
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25)).await;
+    let active_summary = state
+        .sonos_managed_sessions()
+        .session_summary("speaker-office", Instant::now())
+        .unwrap();
+    assert_eq!(active_summary.status, SonosSessionStatus::Active);
+
+    let (resume_status, resume_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-office/resume",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(resume_status, StatusCode::OK);
+    assert_eq!(resume_body["session"]["status"], "active");
+
+    drop(sonos);
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25)).await;
+    let transient_failed_summary = state
+        .sonos_managed_sessions()
+        .session_summary("speaker-office", Instant::now())
+        .unwrap();
+    assert_eq!(
+        transient_failed_summary.status,
+        SonosSessionStatus::Active
+    );
+    assert!(transient_failed_summary.reconnect_seconds_remaining.is_none());
+
+    harmonixia_server::sonos::reconcile_active_sessions(&state, Duration::from_millis(25)).await;
+    let sustained_failed_summary = state
+        .sonos_managed_sessions()
+        .session_summary("speaker-office", Instant::now())
+        .unwrap();
+    assert_eq!(
+        sustained_failed_summary.status,
+        SonosSessionStatus::Reconnecting
+    );
+    let reconnect_remaining = sustained_failed_summary
+        .reconnect_seconds_remaining
+        .unwrap();
+    assert!((1..=15).contains(&reconnect_remaining));
+
+    let (reconnecting_resume_status, reconnecting_resume_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-office/resume",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(reconnecting_resume_status, StatusCode::CONFLICT);
+    assert_eq!(
+        reconnecting_resume_body["details"]["reason"],
+        "target_reconnecting"
+    );
+
+    let (stop_status, stop_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-office/stop",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(stop_status, StatusCode::OK);
+    assert!(stop_body["session"].is_null());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn sonos_play_fails_fast_for_fallback_capacity_and_source_access() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-sonos-fallback-errors-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+    let managed_path = library_root.join("Artist/Album/sonos-fallback.flac");
+    fs::write(&managed_path, b"flac").unwrap();
+    let fake_ffmpeg = root.join("fake-ffmpeg.sh");
+    let args_log = root.join("ffmpeg-args.log");
+    fake_ffmpeg_script(&fake_ffmpeg, &args_log, None, 0);
+
+    let Some(state) =
+        test_state_with_transcode_runtime(library_root.clone(), dropbox_root.clone(), fake_ffmpeg, 0)
+            .await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+
+    let track_id = state
+        .repository()
+        .import_catalog_file(with_managed_path(
+            music_import_request(
+                &dropbox_root.join("sonos-fallback-source.flac").to_string_lossy(),
+                "sonos-fallback-capacity",
+                "Sonos Artist",
+                "Sonos Album",
+                "Fallback Capacity",
+                Some(1),
+            ),
+            &managed_path,
+            4,
+        ))
+        .await
+        .unwrap()
+        .track
+        .unwrap()
+        .id;
+
+    let sonos = MockSonosSoapServer::start().await;
+    let mut locations = BTreeMap::new();
+    locations.insert(
+        "speaker-den".to_string(),
+        format!("{}/xml/device.xml", sonos.base_url),
+    );
+    state.replace_sonos_snapshot(SonosSnapshot::from_targets_with_control_locations(
+        vec![SonosSpeakerSnapshot {
+            id: "speaker-den".into(),
+            display_name: "Den".into(),
+            room_name: Some("Den".into()),
+            available: true,
+            live: SonosLiveState {
+                volume_percent: Some(10),
+                muted: Some(false),
+                raw_transport_state: Some("STOPPED".into()),
+            },
+        }],
+        Vec::new(),
+        locations,
+    ));
+
+    let app = router(state.clone());
+    let (capacity_status, capacity_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-den/play",
+        json!({ "source_type": "track", "source_id": track_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(capacity_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        capacity_body["details"]["reason"],
+        "transcode_capacity_exhausted"
+    );
+    assert!(sonos.requests().is_empty());
+
+    let missing_path = library_root.join("Artist/Album/missing-fallback.flac");
+    let missing_track = state
+        .repository()
+        .import_catalog_file(with_managed_path(
+            music_import_request(
+                &dropbox_root.join("missing-fallback-source.flac").to_string_lossy(),
+                "sonos-fallback-missing",
+                "Sonos Artist",
+                "Sonos Album",
+                "Missing Fallback",
+                Some(2),
+            ),
+            &missing_path,
+            4,
+        ))
+        .await
+        .unwrap()
+        .track
+        .unwrap()
+        .id;
+    state
+        .update_system_config(
+            &library_root.to_string_lossy(),
+            &dropbox_root.to_string_lossy(),
+            Some("Podcasts"),
+            None,
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (source_status, source_body) = request_json(
+        app,
+        "POST",
+        "/api/v1/sonos/targets/speaker-den/play",
+        json!({ "source_type": "track", "source_id": missing_track }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(source_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        source_body["details"]["reason"],
+        "source_incompatible_fallback_failed"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn sonos_signed_original_fetch_uses_sonos_path_without_basic_auth() {
     let root = std::env::temp_dir().join(format!(
         "harmonixia-sonos-original-{}",
@@ -8497,134 +10606,6 @@ fn schema_is_nullable(schema: &Value) -> bool {
 }
 
 #[tokio::test]
-/// Verifies that sonos targets are authenticated and projected from the live memory snapshot.
-///
-/// Inputs:
-/// - None.
-///
-/// Output:
-/// - Returns a future that resolves to `()` after the operation completes.
-///
-/// Errors:
-/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
-async fn sonos_targets_are_authenticated_and_project_live_snapshot() {
-    let Some(state) = test_state().await else {
-        return;
-    };
-    state.replace_sonos_snapshot(SonosSnapshot::from_targets(
-        vec![
-            SonosSpeakerSnapshot {
-                id: "speaker-kitchen".into(),
-                display_name: "Kitchen".into(),
-                room_name: Some("Kitchen".into()),
-                available: true,
-                live: SonosLiveState {
-                    volume_percent: Some(18),
-                    muted: Some(false),
-                    raw_transport_state: Some("idle".into()),
-                },
-            },
-            SonosSpeakerSnapshot {
-                id: "speaker-office".into(),
-                display_name: "Office".into(),
-                room_name: None,
-                available: true,
-                live: SonosLiveState::unknown(),
-            },
-        ],
-        vec![SonosGroupSnapshot {
-            id: "group-main".into(),
-            display_name: "Kitchen + Office".into(),
-            available: true,
-            live: SonosLiveState {
-                volume_percent: Some(45),
-                muted: Some(true),
-                raw_transport_state: Some("PLAYING".into()),
-            },
-        }],
-    ));
-
-    let app = router(state.clone());
-
-    let (unauth_status, unauth_body) =
-        get_json(app.clone(), "/api/v1/sonos/targets", None).await;
-    assert_eq!(unauth_status, StatusCode::UNAUTHORIZED);
-    assert_eq!(unauth_body["code"], "unauthorized");
-
-    let (status, body) =
-        get_json(app.clone(), "/api/v1/sonos/targets", Some(TestAuth::User)).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let response = body.as_object().unwrap();
-    assert_eq!(response.len(), 2);
-    assert!(response.contains_key("speakers"));
-    assert!(response.contains_key("groups"));
-
-    let speakers = body["speakers"].as_array().unwrap();
-    let groups = body["groups"].as_array().unwrap();
-    assert_eq!(speakers.len(), 2);
-    assert_eq!(groups.len(), 1);
-
-    let kitchen = speakers
-        .iter()
-        .find(|target| target["id"].as_str() == Some("speaker-kitchen"))
-        .unwrap();
-    let office = speakers
-        .iter()
-        .find(|target| target["id"].as_str() == Some("speaker-office"))
-        .unwrap();
-    let group = &groups[0];
-
-    assert_eq!(kitchen.as_object().unwrap().len(), 7);
-    assert!(kitchen.as_object().unwrap().contains_key("room_name"));
-    assert_eq!(kitchen["display_name"], "Kitchen");
-    assert_eq!(kitchen["available"], true);
-    assert_eq!(kitchen["room_name"], "Kitchen");
-    assert_eq!(kitchen["volume_percent"], 18);
-    assert_eq!(kitchen["muted"], false);
-    assert_eq!(kitchen["transport_state"], "stopped");
-
-    assert_eq!(office["room_name"], Value::Null);
-    assert_eq!(office["volume_percent"], Value::Null);
-    assert_eq!(office["muted"], Value::Null);
-    assert_eq!(office["transport_state"], Value::Null);
-
-    assert_eq!(group.as_object().unwrap().len(), 6);
-    assert!(!group.as_object().unwrap().contains_key("room_name"));
-    assert_eq!(group["display_name"], "Kitchen + Office");
-    assert_eq!(group["available"], true);
-    assert_eq!(group["volume_percent"], 45);
-    assert_eq!(group["muted"], true);
-    assert_eq!(group["transport_state"], "playing");
-
-    state.replace_sonos_snapshot(SonosSnapshot::from_targets(
-        vec![SonosSpeakerSnapshot {
-            id: "speaker-kitchen".into(),
-            display_name: "Kitchen".into(),
-            room_name: Some("Kitchen".into()),
-            available: true,
-            live: SonosLiveState {
-                volume_percent: Some(18),
-                muted: Some(false),
-                raw_transport_state: Some("playing".into()),
-            },
-        }],
-        Vec::new(),
-    ));
-
-    let (after_status, after_body) =
-        get_json(app, "/api/v1/sonos/targets", Some(TestAuth::User)).await;
-    assert_eq!(after_status, StatusCode::OK);
-    assert_eq!(after_body["speakers"].as_array().unwrap().len(), 1);
-    assert!(after_body["speakers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|target| target["id"].as_str() != Some("speaker-office")));
-    assert!(after_body["groups"].as_array().unwrap().is_empty());
-}
-
-#[tokio::test]
 /// Verifies that openapi documents maintenance and provider repair endpoints.
 ///
 /// Inputs:
@@ -8717,6 +10698,82 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
     assert!(paths.contains_key("/api/v1/me/playback/progress"));
     assert!(paths.contains_key("/api/v1/me/playback/history"));
     assert!(paths.contains_key("/api/v1/sonos/targets"));
+    for route in ["play", "pause", "resume", "stop", "seek", "next", "previous"] {
+        assert!(paths.contains_key(&format!(
+            "/api/v1/sonos/targets/{{target_id}}/{route}"
+        )));
+    }
+    for route in ["play", "pause", "resume", "seek", "next", "previous"] {
+        let operation =
+            &paths[&format!("/api/v1/sonos/targets/{{target_id}}/{route}")]["post"];
+        assert!(operation["responses"].get("409").is_some());
+        assert!(operation["responses"]["409"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reconnecting"));
+    }
+    assert!(paths.contains_key("/api/v1/sonos/media/{token}"));
+    let sonos_targets = &paths["/api/v1/sonos/targets"]["get"];
+    assert!(sonos_targets["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tag| tag.as_str() == Some("sonos")));
+    assert!(sonos_targets
+        .get("security")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().any(|entry| entry.get("basicAuth").is_some()))
+        .unwrap_or(false));
+    assert!(sonos_targets["responses"].get("401").is_some());
+    assert_eq!(
+        sonos_targets["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+            .as_str(),
+        Some("#/components/schemas/SonosTargetsResponse")
+    );
+
+    let sonos_media = &paths["/api/v1/sonos/media/{token}"]["get"];
+    assert!(sonos_media["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tag| tag.as_str() == Some("sonos")));
+    assert!(!sonos_media
+        .get("security")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().any(|entry| entry.get("basicAuth").is_some()))
+        .unwrap_or(false));
+    assert!(sonos_media["responses"].get("401").is_none());
+
+    let sonos_play = &paths["/api/v1/sonos/targets/{target_id}/play"]["post"];
+    assert!(sonos_play["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tag| tag.as_str() == Some("sonos")));
+    assert!(sonos_play
+        .get("security")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().any(|entry| entry.get("basicAuth").is_some()))
+        .unwrap_or(false));
+    assert_eq!(
+        sonos_play["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+            .as_str(),
+        Some("#/components/schemas/SonosPlaybackResponse")
+    );
+    for route in ["play", "pause", "resume", "seek", "next", "previous"] {
+        assert!(
+            paths[&format!("/api/v1/sonos/targets/{{target_id}}/{route}")]["post"]["responses"]
+                .get("409")
+                .is_some(),
+            "Sonos {route} should document a 409 response"
+        );
+    }
+    assert_eq!(
+        paths["/api/v1/sonos/targets/{target_id}/seek"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"]["$ref"]
+            .as_str(),
+        Some("#/components/schemas/SonosSeekRequest")
+    );
 
     let schemes = body["components"]["securitySchemes"]
         .as_object()
@@ -8765,8 +10822,11 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         "SonosErrorReason",
         "SonosGroupTarget",
         "SonosNextItemSummary",
+        "SonosPlaybackResponse",
+        "SonosPlaybackTarget",
         "SonosPlayRequest",
         "SonosPlaySourceType",
+        "SonosSeekRequest",
         "SonosSessionStatus",
         "SonosSessionSummary",
         "SonosSignedClaim",
@@ -8851,6 +10911,26 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
             field
         ));
     }
+    assert!(schema_requires_field(
+        &schemas["SonosPlaybackResponse"],
+        "session"
+    ));
+    assert!(schema_property_is_nullable(
+        &schemas["SonosPlaybackResponse"],
+        "session"
+    ));
+    let playback_target_schema =
+        &schemas["SonosPlaybackResponse"]["properties"]["target"]["anyOf"];
+    assert!(playback_target_schema
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|schema| schema["$ref"] == "#/components/schemas/SonosSpeakerTarget"));
+    assert!(playback_target_schema
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|schema| schema["$ref"] == "#/components/schemas/SonosGroupTarget"));
     assert!(!schema_requires_field(
         &schemas["SonosSessionSummary"],
         "reconnect_seconds_remaining"
@@ -8902,13 +10982,6 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
             .as_str(),
         Some("#/components/schemas/PlaybackProgressWriteResponse")
     );
-    assert_eq!(
-        paths["/api/v1/sonos/targets"]["get"]["responses"]["200"]["content"]
-            ["application/json"]["schema"]["$ref"]
-            .as_str(),
-        Some("#/components/schemas/SonosTargetsResponse")
-    );
-
     let podcast_response_schema = &schemas["PodcastResponse"]["properties"];
     assert_eq!(
         podcast_response_schema["podcast"]["$ref"].as_str(),
@@ -9005,7 +11078,6 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         ("/api/v1/me/playback/progress", "get"),
         ("/api/v1/me/playback/history", "get"),
         ("/api/v1/me/playback/history", "post"),
-        ("/api/v1/sonos/targets", "get"),
     ];
 
     for (path, method) in protected_operations.iter().copied() {

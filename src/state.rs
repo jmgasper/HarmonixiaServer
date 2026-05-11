@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     net::IpAddr,
     path::{Component, Path, PathBuf},
@@ -37,7 +37,7 @@ use crate::{
         ImportWorkRequest,
     },
     providers::reconcile_provider_readiness,
-    sonos::SonosSnapshot,
+    sonos::{ManagedSonosSessions, SonosOperationError, SonosSnapshot},
     storage::{
         CatalogImportFailure, ConfigError as DatabaseConfigError, DatabaseConfig,
         PgMaintenanceRepository, PlaylistItemAddResult, PlaylistItemListResult,
@@ -342,6 +342,7 @@ struct AppStateInner {
     config: ServerConfig,
     system_config: RwLock<SystemConfig>,
     sonos_snapshot: RwLock<SonosSnapshot>,
+    sonos_sessions: ManagedSonosSessions,
     sonos_media_authorization: SonosSignedMediaRuntime,
     transcode_admission: TranscodeAdmission,
     hls_generation_coordinator: HlsGenerationCoordinator,
@@ -350,7 +351,7 @@ struct AppStateInner {
 
 #[derive(Debug)]
 struct SonosSignedMediaRuntime {
-    current: RwLock<Option<SonosMediaAuthorizationContext>>,
+    current: RwLock<HashMap<String, SonosMediaAuthorizationContext>>,
     signing_secret: [u8; 32],
 }
 
@@ -414,6 +415,7 @@ impl AppState {
                 hls_generation_coordinator: HlsGenerationCoordinator::new(),
                 system_config: RwLock::new(system_config),
                 sonos_snapshot: RwLock::new(SonosSnapshot::empty()),
+                sonos_sessions: ManagedSonosSessions::new(),
                 sonos_media_authorization: SonosSignedMediaRuntime::new(),
                 repository,
             }),
@@ -482,6 +484,10 @@ impl AppState {
             .expect("sonos snapshot lock poisoned") = snapshot;
     }
 
+    pub fn sonos_managed_sessions(&self) -> &ManagedSonosSessions {
+        &self.inner.sonos_sessions
+    }
+
     pub async fn register_sonos_media_authorization(
         &self,
         request: SonosMediaAuthorizationRequest,
@@ -498,8 +504,8 @@ impl AppState {
             item_id: request.item_id,
             delivery_kind: sonos_delivery_kind_for_media_file(&media_file),
         };
-        self.replace_sonos_media_authorization_context(context);
-        self.issue_sonos_signed_media_url()
+        self.replace_sonos_media_authorization_context(context.clone());
+        self.issue_sonos_signed_media_url_for_context(context)
     }
 
     pub fn replace_sonos_media_authorization_context(
@@ -530,6 +536,50 @@ impl AppState {
             .sonos_media_authorization
             .current_context()
             .ok_or(SonosSignedMediaIssueError::NoCurrentContext)?;
+        self.issue_sonos_signed_media_url_for_context_with_exp(context, exp)
+    }
+
+    pub fn validate_sonos_signed_media_token(
+        &self,
+        token: &str,
+    ) -> Result<SonosSignedClaim, SonosSignedMediaValidationError> {
+        let claim = self.inner.sonos_media_authorization.decode_claim(token)?;
+        if let Some(is_current) = self
+            .inner
+            .sonos_sessions
+            .validate_claim_for_current_session(&claim)
+        {
+            return if is_current {
+                Ok(claim)
+            } else {
+                Err(SonosSignedMediaValidationError::StaleClaim)
+            };
+        }
+
+        if self
+            .inner
+            .sonos_media_authorization
+            .matches_registered_context(&claim)
+        {
+            Ok(claim)
+        } else {
+            Err(SonosSignedMediaValidationError::StaleClaim)
+        }
+    }
+
+    pub(crate) fn issue_sonos_signed_media_url_for_context(
+        &self,
+        context: SonosMediaAuthorizationContext,
+    ) -> Result<SonosSignedMediaUrl, SonosSignedMediaIssueError> {
+        let exp = (Utc::now() + Duration::seconds(300)).timestamp();
+        self.issue_sonos_signed_media_url_for_context_with_exp(context, exp)
+    }
+
+    fn issue_sonos_signed_media_url_for_context_with_exp(
+        &self,
+        context: SonosMediaAuthorizationContext,
+        exp: i64,
+    ) -> Result<SonosSignedMediaUrl, SonosSignedMediaIssueError> {
         let claim = context.to_claim(exp);
         let token = self.inner.sonos_media_authorization.encode_claim(&claim)?;
         let config = self.system_config();
@@ -542,11 +592,65 @@ impl AppState {
         Ok(SonosSignedMediaUrl { url, claim })
     }
 
-    pub fn validate_sonos_signed_media_token(
+    pub fn take_sonos_reserved_transcode_slot(
         &self,
-        token: &str,
-    ) -> Result<SonosSignedClaim, SonosSignedMediaValidationError> {
-        self.inner.sonos_media_authorization.validate_token(token)
+        claim: &SonosSignedClaim,
+    ) -> Option<TranscodeSlot> {
+        self.inner
+            .sonos_sessions
+            .take_reserved_transcode_slot(claim)
+    }
+
+    pub async fn sonos_play_target(
+        &self,
+        target_id: String,
+        owner: AuthenticatedAccount,
+        request: crate::api::sonos::SonosPlayRequest,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::play_target(self.clone(), target_id, owner, request).await
+    }
+
+    pub async fn sonos_pause_target(
+        &self,
+        target_id: String,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::pause_target(self.clone(), target_id).await
+    }
+
+    pub async fn sonos_resume_target(
+        &self,
+        target_id: String,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::resume_target(self.clone(), target_id).await
+    }
+
+    pub async fn sonos_stop_target(
+        &self,
+        target_id: String,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::stop_target(self.clone(), target_id).await
+    }
+
+    pub async fn sonos_seek_target(
+        &self,
+        target_id: String,
+        request: crate::api::sonos::SonosSeekRequest,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::seek_target(self.clone(), target_id, request).await
+    }
+
+    pub async fn sonos_next_target(
+        &self,
+        target_id: String,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::next_target(self.clone(), target_id).await
+    }
+
+    pub async fn sonos_previous_target(
+        &self,
+        target_id: String,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::previous_target(self.clone(), target_id).await
     }
 
     /// Updates existing state for application state facade used by HTTP handlers and background workers.
@@ -2547,30 +2651,32 @@ impl SonosSignedMediaRuntime {
 
     fn with_secret(signing_secret: [u8; 32]) -> Self {
         Self {
-            current: RwLock::new(None),
+            current: RwLock::new(HashMap::new()),
             signing_secret,
         }
     }
 
     fn replace(&self, context: SonosMediaAuthorizationContext) {
-        *self
-            .current
+        self.current
             .write()
-            .expect("sonos media authorization lock poisoned") = Some(context);
+            .expect("sonos media authorization lock poisoned")
+            .insert(context.target_id.clone(), context);
     }
 
     fn clear(&self) {
-        *self
-            .current
+        self.current
             .write()
-            .expect("sonos media authorization lock poisoned") = None;
+            .expect("sonos media authorization lock poisoned")
+            .clear();
     }
 
     fn current_context(&self) -> Option<SonosMediaAuthorizationContext> {
         self.current
             .read()
             .expect("sonos media authorization lock poisoned")
-            .clone()
+            .values()
+            .next()
+            .cloned()
     }
 
     fn encode_claim(
@@ -2614,28 +2720,33 @@ impl SonosSignedMediaRuntime {
             .map_err(|_| SonosSignedMediaValidationError::InvalidToken)
     }
 
+    fn matches_registered_context(&self, claim: &SonosSignedClaim) -> bool {
+        let current = self
+            .current
+            .read()
+            .expect("sonos media authorization lock poisoned");
+        current
+            .get(&claim.target_id)
+            .map(|context| context.matches_claim(claim))
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
     fn validate_token(
         &self,
         token: &str,
     ) -> Result<SonosSignedClaim, SonosSignedMediaValidationError> {
         let claim = self.decode_claim(token)?;
-        let current = self
-            .current
-            .read()
-            .expect("sonos media authorization lock poisoned");
-        let Some(context) = current.as_ref() else {
-            return Err(SonosSignedMediaValidationError::StaleClaim);
-        };
-        if !context.matches_claim(&claim) {
-            return Err(SonosSignedMediaValidationError::StaleClaim);
+        if self.matches_registered_context(&claim) {
+            Ok(claim)
+        } else {
+            Err(SonosSignedMediaValidationError::StaleClaim)
         }
-
-        Ok(claim)
     }
 }
 
 impl SonosMediaAuthorizationContext {
-    fn to_claim(&self, exp: i64) -> SonosSignedClaim {
+    pub(crate) fn to_claim(&self, exp: i64) -> SonosSignedClaim {
         SonosSignedClaim {
             session_id: self.session_id,
             session_generation: self.session_generation,
@@ -2648,7 +2759,7 @@ impl SonosMediaAuthorizationContext {
         }
     }
 
-    fn matches_claim(&self, claim: &SonosSignedClaim) -> bool {
+    pub(crate) fn matches_claim(&self, claim: &SonosSignedClaim) -> bool {
         self.session_id == claim.session_id
             && self.session_generation == claim.session_generation
             && self.item_generation == claim.item_generation

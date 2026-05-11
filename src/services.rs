@@ -131,7 +131,7 @@ impl BackgroundServices {
     /// Errors:
     /// - Does not return recoverable errors.
     pub fn spawn(state: AppState, config: BackgroundServiceConfig) -> Self {
-        let mut handles = Vec::with_capacity(3);
+        let mut handles = Vec::with_capacity(4);
         handles.push(tokio::spawn(import_worker_loop(
             state.clone(),
             config.import_worker,
@@ -140,7 +140,15 @@ impl BackgroundServices {
             state.clone(),
             config.dropbox_watcher,
         )));
-        handles.push(tokio::spawn(sonos::runtime_loop(state, config.sonos)));
+        let sonos_config = config.sonos;
+        handles.push(tokio::spawn(sonos::runtime_loop(
+            state.clone(),
+            sonos_config.clone(),
+        )));
+        handles.push(tokio::spawn(sonos::active_session_loop(
+            state,
+            sonos_config.request_timeout,
+        )));
         Self { handles }
     }
 
