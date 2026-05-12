@@ -237,6 +237,48 @@ impl FromStr for PlaybackItemType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+/// Represents the collection context that produced a playback event.
+///
+/// Functionality: Enumerates `Album`, `Playlist`, and `Podcast` contexts for server-side recently played grouping and resume hints.
+/// Dependencies: depends on serde, utoipa schema derivation, and text parsing helpers.
+/// Used by: referenced from `src/api/playback.rs`, `src/domain.rs`, `src/state.rs`, and `src/storage.rs`.
+pub enum PlaybackContextType {
+    Album,
+    Playlist,
+    Podcast,
+}
+
+impl PlaybackContextType {
+    pub fn api_name(self) -> &'static str {
+        match self {
+            PlaybackContextType::Album => "album",
+            PlaybackContextType::Playlist => "playlist",
+            PlaybackContextType::Podcast => "podcast",
+        }
+    }
+}
+
+impl fmt::Display for PlaybackContextType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.api_name())
+    }
+}
+
+impl FromStr for PlaybackContextType {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "album" => Ok(PlaybackContextType::Album),
+            "playlist" => Ok(PlaybackContextType::Playlist),
+            "podcast" => Ok(PlaybackContextType::Podcast),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 /// Represents playback progress in the shared domain model used by storage, state, API, pipeline, and provider layers.
 ///
@@ -246,6 +288,8 @@ impl FromStr for PlaybackItemType {
 pub struct PlaybackProgress {
     pub item_type: PlaybackItemType,
     pub item_id: Uuid,
+    pub context_type: Option<PlaybackContextType>,
+    pub context_id: Option<Uuid>,
     pub position_seconds: u32,
     pub duration_seconds: Option<u32>,
     pub completed: bool,
@@ -262,6 +306,8 @@ pub struct PlaybackHistoryEvent {
     pub id: Uuid,
     pub item_type: PlaybackItemType,
     pub item_id: Uuid,
+    pub context_type: Option<PlaybackContextType>,
+    pub context_id: Option<Uuid>,
     pub position_seconds: u32,
     pub duration_seconds: Option<u32>,
     pub completed: bool,

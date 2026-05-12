@@ -7961,6 +7961,7 @@ async fn playback_progress_and_history_are_scoped_per_user() {
     };
     let app = router(state);
     let track_id = Uuid::new_v4();
+    let album_id = Uuid::new_v4();
     let episode_id = Uuid::new_v4();
 
     let (unauth_status, unauth_body) =
@@ -7972,14 +7973,24 @@ async fn playback_progress_and_history_are_scoped_per_user() {
         app.clone(),
         "PUT",
         &format!("/api/v1/me/playback/progress/track/{track_id}"),
-        json!({ "position_seconds": 42, "duration_seconds": 180, "completed": false }),
+        json!({
+            "context_type": "album",
+            "context_id": album_id,
+            "position_seconds": 42,
+            "duration_seconds": 180,
+            "completed": false
+        }),
         Some(TestAuth::User),
     )
     .await;
     assert_eq!(write_status, StatusCode::OK);
     assert_eq!(written["progress"]["item_type"], "track");
+    assert_eq!(written["progress"]["context_type"], "album");
+    assert_eq!(written["progress"]["context_id"], json!(album_id));
     assert_eq!(written["progress"]["position_seconds"], 42);
     assert_eq!(written["history_event"]["item_id"], json!(track_id));
+    assert_eq!(written["history_event"]["context_type"], "album");
+    assert_eq!(written["history_event"]["context_id"], json!(album_id));
 
     let (get_status, progress) = get_json(
         app.clone(),
@@ -7989,6 +8000,19 @@ async fn playback_progress_and_history_are_scoped_per_user() {
     .await;
     assert_eq!(get_status, StatusCode::OK);
     assert_eq!(progress["item_id"], json!(track_id));
+    assert_eq!(progress["context_type"], "album");
+    assert_eq!(progress["context_id"], json!(album_id));
+
+    let (invalid_context_status, invalid_context_body) = request_json(
+        app.clone(),
+        "PUT",
+        &format!("/api/v1/me/playback/progress/track/{track_id}"),
+        json!({ "context_type": "album", "position_seconds": 4, "duration_seconds": 180 }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(invalid_context_status, StatusCode::BAD_REQUEST);
+    assert_eq!(invalid_context_body["code"], "bad_request");
 
     let (admin_get_status, admin_get_body) = get_json(
         app.clone(),

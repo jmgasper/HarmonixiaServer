@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthenticatedUser,
-    domain::{PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress},
+    domain::{PlaybackContextType, PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress},
     error::{ApiError, ErrorResponse},
     state::AppState,
 };
@@ -43,6 +43,8 @@ pub fn router() -> Router<AppState> {
 /// Dependencies: depends on `u32`, `Option<u32>`, `bool` and any derives or trait bounds declared on the type.
 /// Used by: referenced from `src/api/catalog.rs`, `src/api/openapi.rs`, `src/api/playback.rs`, `tests/maintenance_api.rs`.
 pub struct PlaybackProgressWriteRequest {
+    pub context_type: Option<PlaybackContextType>,
+    pub context_id: Option<Uuid>,
     pub position_seconds: u32,
     pub duration_seconds: Option<u32>,
     #[serde(default)]
@@ -69,6 +71,8 @@ pub struct PlaybackProgressWriteResponse {
 pub struct PlaybackHistoryWriteRequest {
     pub item_type: PlaybackItemType,
     pub item_id: Uuid,
+    pub context_type: Option<PlaybackContextType>,
+    pub context_id: Option<Uuid>,
     pub position_seconds: u32,
     pub duration_seconds: Option<u32>,
     #[serde(default)]
@@ -146,6 +150,8 @@ pub async fn write_progress(
             account.id,
             item_type,
             item_id,
+            request.context_type,
+            request.context_id,
             request.position_seconds,
             request.duration_seconds,
             request.completed,
@@ -156,6 +162,8 @@ pub async fn write_progress(
             account.id,
             item_type,
             item_id,
+            request.context_type,
+            request.context_id,
             request.position_seconds,
             request.duration_seconds,
             request.completed,
@@ -274,6 +282,8 @@ pub async fn write_history(
                 account.id,
                 request.item_type,
                 request.item_id,
+                request.context_type,
+                request.context_id,
                 request.position_seconds,
                 request.duration_seconds,
                 request.completed,

@@ -22,8 +22,8 @@ use crate::{
         },
     },
     domain::{
-        AuthenticatedAccount, MediaFile, PlaybackItemType, SonosDeliveryKind,
-        SonosSessionStatus, SonosSignedClaim, SonosTransportState,
+        AuthenticatedAccount, MediaFile, PlaybackContextType, PlaybackItemType,
+        SonosDeliveryKind, SonosSessionStatus, SonosSignedClaim, SonosTransportState,
     },
     error::{ApiError, SonosErrorReason},
     state::{
@@ -468,6 +468,8 @@ struct ManagedSonosSession {
     grouped_coordinator_id: Option<String>,
     owner_account_id: Uuid,
     owner_username: String,
+    context_type: Option<PlaybackContextType>,
+    context_id: Option<Uuid>,
     session_id: Uuid,
     session_generation: u64,
     item_generation: u64,
@@ -494,6 +496,8 @@ struct ManagedSonosSessionSnapshot {
     coordinator_location: Option<String>,
     grouped_coordinator_id: Option<String>,
     owner_account_id: Uuid,
+    context_type: Option<PlaybackContextType>,
+    context_id: Option<Uuid>,
     session_id: Uuid,
     session_generation: u64,
     item_generation: u64,
@@ -565,6 +569,8 @@ impl ManagedSonosSession {
             coordinator_location: self.coordinator_location.clone(),
             grouped_coordinator_id: self.grouped_coordinator_id.clone(),
             owner_account_id: self.owner_account_id,
+            context_type: self.context_type,
+            context_id: self.context_id,
             session_id: self.session_id,
             session_generation: self.session_generation,
             item_generation: self.item_generation,
@@ -780,6 +786,7 @@ pub async fn play_target(
     }
 
     let resolved_target = resolve_live_target(&state, &target_id)?;
+    let playback_context = playback_context_for_sonos_request(&request);
     let queue = resolve_play_queue(&state, owner.id, request).await?;
     if queue.is_empty() {
         return Err(
@@ -822,6 +829,8 @@ pub async fn play_target(
         grouped_coordinator_id: resolved_target.grouped_coordinator_id.clone(),
         owner_account_id: owner.id,
         owner_username: owner.username,
+        context_type: playback_context.map(|context| context.0),
+        context_id: playback_context.map(|context| context.1),
         session_id,
         session_generation,
         item_generation,
@@ -1383,6 +1392,17 @@ async fn resolve_play_queue(
             }
             Ok(queue)
         }
+    }
+}
+
+fn playback_context_for_sonos_request(
+    request: &SonosPlayRequest,
+) -> Option<(PlaybackContextType, Uuid)> {
+    match request {
+        SonosPlayRequest::Playlist { source_id } => {
+            Some((PlaybackContextType::Playlist, *source_id))
+        }
+        SonosPlayRequest::Track { .. } | SonosPlayRequest::Episode { .. } => None,
     }
 }
 
@@ -1982,6 +2002,8 @@ async fn write_session_snapshot_attribution(
             snapshot.owner_account_id,
             current.item_type,
             current.item_id,
+            snapshot.context_type,
+            snapshot.context_id,
             snapshot.current_position_seconds,
             snapshot.current_duration_seconds,
             completed,
@@ -1996,6 +2018,8 @@ async fn write_session_snapshot_attribution(
                 snapshot.owner_account_id,
                 current.item_type,
                 current.item_id,
+                snapshot.context_type,
+                snapshot.context_id,
                 snapshot.current_position_seconds,
                 snapshot.current_duration_seconds,
                 completed,
@@ -2845,6 +2869,8 @@ mod tests {
             grouped_coordinator_id: None,
             owner_account_id: Uuid::new_v4(),
             owner_username: "owner".into(),
+            context_type: None,
+            context_id: None,
             session_id: Uuid::new_v4(),
             session_generation: 1,
             item_generation: 1,

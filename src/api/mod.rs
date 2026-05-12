@@ -15,6 +15,7 @@ pub mod admin_ui;
 pub mod artwork;
 pub mod catalog;
 pub mod config;
+pub mod events;
 pub mod maintenance;
 pub mod media;
 pub mod openapi;
@@ -48,6 +49,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1/bootstrap", accounts::bootstrap_router())
         .nest("/api/v1/auth", accounts::auth_router())
         .nest("/api/v1/catalog", catalog::router().merge(artwork::catalog_router()))
+        .route("/api/v1/events", get(events::stream_events))
+        .nest("/api/v1/events", events::router())
         .nest("/api/v1/artwork", artwork::router())
         .nest("/api/v1/media", media::router())
         .nest("/api/v1/sonos", sonos::router())

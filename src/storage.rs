@@ -19,8 +19,8 @@ use crate::{
     domain::{
         AccountRole, CatalogMutationPolicy, ImportJob, ImportJobKind, ImportJobSource,
         ImportJobStatus, LocalAccount, MaintenanceScope, MediaFileStatus,
-        PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress, Playlist, PlaylistItem,
-        PlaylistScope, ProviderHealth, ProviderKind, ProviderSetting, ProviderStatus,
+        PlaybackContextType, PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress, Playlist,
+        PlaylistItem, PlaylistScope, ProviderHealth, ProviderKind, ProviderSetting, ProviderStatus,
         QuarantineItem, QuarantineReason, QuarantineStatus, RepairPlan, SystemConfig,
     },
     pipeline::ImportWorkRequest,
@@ -156,6 +156,8 @@ const PLAYLIST_ELIGIBLE_MEDIA_FILE_PREDICATE: &str = r#"
 const PLAYBACK_PROGRESS_SELECT: &str = r#"
     item_type::text AS item_type,
     item_id,
+    context_type::text AS context_type,
+    context_id,
     position_seconds,
     duration_seconds,
     completed,
@@ -166,6 +168,8 @@ const PLAYBACK_HISTORY_SELECT: &str = r#"
     id,
     item_type::text AS item_type,
     item_id,
+    context_type::text AS context_type,
+    context_id,
     position_seconds,
     duration_seconds,
     completed,
@@ -1780,6 +1784,8 @@ impl PgMaintenanceRepository {
         account_id: Uuid,
         item_type: PlaybackItemType,
         item_id: Uuid,
+        context_type: Option<PlaybackContextType>,
+        context_id: Option<Uuid>,
         position_seconds: u32,
         duration_seconds: Option<u32>,
         completed: bool,
@@ -1790,6 +1796,8 @@ impl PgMaintenanceRepository {
                 account_id,
                 item_type,
                 item_id,
+                context_type,
+                context_id,
                 position_seconds,
                 duration_seconds,
                 completed,
@@ -1802,9 +1810,13 @@ impl PgMaintenanceRepository {
                 $4,
                 $5,
                 $6,
-                $7
+                $7,
+                $8,
+                $9
             )
             ON CONFLICT (account_id, item_type, item_id) DO UPDATE SET
+                context_type = EXCLUDED.context_type,
+                context_id = EXCLUDED.context_id,
                 position_seconds = EXCLUDED.position_seconds,
                 duration_seconds = EXCLUDED.duration_seconds,
                 completed = EXCLUDED.completed,
@@ -1816,6 +1828,8 @@ impl PgMaintenanceRepository {
             .bind(account_id)
             .bind(playback_item_type_name(item_type))
             .bind(item_id)
+            .bind(context_type.map(playback_context_type_name))
+            .bind(context_id)
             .bind(u32_to_i32(position_seconds, "playback_progress.position_seconds")?)
             .bind(optional_u32_to_i32(
                 duration_seconds,
@@ -1916,6 +1930,8 @@ impl PgMaintenanceRepository {
         account_id: Uuid,
         item_type: PlaybackItemType,
         item_id: Uuid,
+        context_type: Option<PlaybackContextType>,
+        context_id: Option<Uuid>,
         position_seconds: u32,
         duration_seconds: Option<u32>,
         completed: bool,
@@ -1927,6 +1943,8 @@ impl PgMaintenanceRepository {
                 account_id,
                 item_type,
                 item_id,
+                context_type,
+                context_id,
                 position_seconds,
                 duration_seconds,
                 completed,
@@ -1940,7 +1958,9 @@ impl PgMaintenanceRepository {
                 $5,
                 $6,
                 $7,
-                $8
+                $8,
+                $9,
+                $10
             )
             RETURNING {PLAYBACK_HISTORY_SELECT}
             "#
@@ -1950,6 +1970,8 @@ impl PgMaintenanceRepository {
             .bind(account_id)
             .bind(playback_item_type_name(item_type))
             .bind(item_id)
+            .bind(context_type.map(playback_context_type_name))
+            .bind(context_id)
             .bind(u32_to_i32(
                 position_seconds,
                 "playback_history_events.position_seconds",
@@ -3756,6 +3778,11 @@ fn playback_progress_from_row(row: &PgRow) -> Result<PlaybackProgress, StorageEr
     Ok(PlaybackProgress {
         item_type: parse_playback_item_type(row.try_get::<String, _>("item_type")?)?,
         item_id: row.try_get("item_id")?,
+        context_type: row
+            .try_get::<Option<String>, _>("context_type")?
+            .map(parse_playback_context_type)
+            .transpose()?,
+        context_id: row.try_get("context_id")?,
         position_seconds,
         duration_seconds,
         completed: row.try_get("completed")?,
@@ -3789,6 +3816,11 @@ fn playback_history_event_from_row(
         id: row.try_get("id")?,
         item_type: parse_playback_item_type(row.try_get::<String, _>("item_type")?)?,
         item_id: row.try_get("item_id")?,
+        context_type: row
+            .try_get::<Option<String>, _>("context_type")?
+            .map(parse_playback_context_type)
+            .transpose()?,
+        context_id: row.try_get("context_id")?,
         position_seconds,
         duration_seconds,
         completed: row.try_get("completed")?,
@@ -4062,6 +4094,23 @@ fn parse_playback_item_type(value: String) -> Result<PlaybackItemType, StorageEr
         "track" => Ok(PlaybackItemType::Track),
         "episode" => Ok(PlaybackItemType::Episode),
         _ => invalid_value("playback_item_type", value),
+    }
+}
+
+fn playback_context_type_name(context_type: PlaybackContextType) -> &'static str {
+    match context_type {
+        PlaybackContextType::Album => "album",
+        PlaybackContextType::Playlist => "playlist",
+        PlaybackContextType::Podcast => "podcast",
+    }
+}
+
+fn parse_playback_context_type(value: String) -> Result<PlaybackContextType, StorageError> {
+    match value.as_str() {
+        "album" => Ok(PlaybackContextType::Album),
+        "playlist" => Ok(PlaybackContextType::Playlist),
+        "podcast" => Ok(PlaybackContextType::Podcast),
+        _ => invalid_value("playback_context_type", value),
     }
 }
 

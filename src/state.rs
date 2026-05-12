@@ -3,13 +3,18 @@ use std::{
     env,
     net::IpAddr,
     path::{Component, Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
@@ -25,10 +30,11 @@ use crate::{
         AacTranscodeProfile, AccountRole, Album, Artist, ArtworkAsset, ArtworkKind,
         AuthenticatedAccount,
         CatalogEntityType, Episode, ImportJob, ImportJobKind, ImportJobSource, MaintenanceScope,
-        MediaFile, PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress, Playlist,
-        PlaylistItem, PlaylistScope, Podcast, ProviderHealth, ProviderKind, ProviderSetting,
-        ProviderStatus, QuarantineItem, QuarantineStatus, RepairPlan, SonosDeliveryKind,
-        SonosSignedClaim, SystemConfig, Track, TranscodeSlotUsage, UserAccount,
+        MediaFile, PlaybackContextType, PlaybackHistoryEvent, PlaybackItemType,
+        PlaybackProgress, Playlist, PlaylistItem, PlaylistScope, Podcast, ProviderHealth,
+        ProviderKind, ProviderSetting, ProviderStatus, QuarantineItem, QuarantineStatus,
+        RepairPlan, SonosDeliveryKind, SonosSignedClaim, SystemConfig, Track,
+        TranscodeSlotUsage, UserAccount,
         DEFAULT_SCAN_THREAD_COUNT,
     },
     error::{ApiError, SonosErrorReason},
@@ -167,6 +173,21 @@ pub struct AdminDashboardActiveImportJob {
     pub quarantined_files: i64,
     pub failed_files: i64,
     pub last_progress_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+/// Represents a lightweight server event delivered to connected clients.
+///
+/// Functionality: Carries fields `sequence`, `event`, `resource`, `action`, `entity_id`, and `timestamp` for client-side cache invalidation and view refreshes.
+/// Dependencies: depends on `u64`, `String`, `Option<Uuid>`, `DateTime<Utc>`, and serde serialization.
+/// Used by: referenced from `src/api/events.rs`, `src/state.rs`, and background services.
+pub struct AppEvent {
+    pub sequence: u64,
+    pub event: String,
+    pub resource: String,
+    pub action: String,
+    pub entity_id: Option<Uuid>,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Error)]
@@ -341,6 +362,8 @@ pub struct AppState {
 struct AppStateInner {
     config: ServerConfig,
     system_config: RwLock<SystemConfig>,
+    event_sequence: AtomicU64,
+    event_tx: broadcast::Sender<AppEvent>,
     sonos_snapshot: RwLock<SonosSnapshot>,
     sonos_sessions: ManagedSonosSessions,
     sonos_media_authorization: SonosSignedMediaRuntime,
@@ -405,6 +428,7 @@ impl AppState {
             .await?;
         seed_provider_health(&repository, &provider_settings).await?;
         repository.backfill_catalog_search_upgrade_data().await?;
+        let (event_tx, _event_rx) = broadcast::channel(256);
 
         Ok(Self {
             inner: Arc::new(AppStateInner {
@@ -414,6 +438,8 @@ impl AppState {
                 ),
                 hls_generation_coordinator: HlsGenerationCoordinator::new(),
                 system_config: RwLock::new(system_config),
+                event_sequence: AtomicU64::new(0),
+                event_tx,
                 sonos_snapshot: RwLock::new(SonosSnapshot::empty()),
                 sonos_sessions: ManagedSonosSessions::new(),
                 sonos_media_authorization: SonosSignedMediaRuntime::new(),
@@ -448,6 +474,36 @@ impl AppState {
     /// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
     pub fn repository(&self) -> &PgMaintenanceRepository {
         &self.inner.repository
+    }
+
+    /// Subscribes to runtime events for connected clients.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<AppEvent> {
+        self.inner.event_tx.subscribe()
+    }
+
+    /// Publishes an event to connected clients. Slow or disconnected receivers are ignored.
+    pub fn publish_event(
+        &self,
+        event: &str,
+        resource: &str,
+        action: &str,
+        entity_id: Option<Uuid>,
+    ) {
+        let sequence = self.inner.event_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let event = AppEvent {
+            sequence,
+            event: event.to_string(),
+            resource: resource.to_string(),
+            action: action.to_string(),
+            entity_id,
+            timestamp: Utc::now(),
+        };
+        let _ = self.inner.event_tx.send(event);
+    }
+
+    /// Publishes a catalog/library invalidation event for connected clients.
+    pub fn publish_library_updated(&self) {
+        self.publish_event("library_updated", "library", "updated", None);
     }
 
     /// Handles system config for application state facade used by HTTP handlers and background workers.
@@ -1153,11 +1209,14 @@ impl AppState {
         let name = normalize_name(name, "playlist name")?;
         let description = normalize_optional_text(description);
 
-        self.inner
+        let playlist = self
+            .inner
             .repository
             .create_playlist(account_id, &name, description.as_deref(), scope)
             .await
-            .map_err(api_storage_error)
+            .map_err(api_storage_error)?;
+        self.publish_event("playlist_added", "playlist", "added", Some(playlist.id));
+        Ok(playlist)
     }
 
     /// Handles playlists visible to for application state facade used by HTTP handlers and background workers.
@@ -1231,12 +1290,15 @@ impl AppState {
         let name = normalize_name(name, "playlist name")?;
         let description = normalize_optional_text(description);
 
-        self.inner
+        let playlist = self
+            .inner
             .repository
             .update_visible_playlist(account_id, playlist_id, &name, description.as_deref())
             .await
             .map_err(api_storage_error)?
-            .ok_or_else(|| ApiError::NotFound(format!("playlist {playlist_id} was not found")))
+            .ok_or_else(|| ApiError::NotFound(format!("playlist {playlist_id} was not found")))?;
+        self.publish_event("playlist_updated", "playlist", "updated", Some(playlist.id));
+        Ok(playlist)
     }
 
     /// Deletes or removes a resource from application state facade used by HTTP handlers and background workers.
@@ -1256,12 +1318,15 @@ impl AppState {
         account_id: Uuid,
         playlist_id: Uuid,
     ) -> Result<Playlist, ApiError> {
-        self.inner
+        let playlist = self
+            .inner
             .repository
             .delete_visible_playlist(account_id, playlist_id)
             .await
             .map_err(api_storage_error)?
-            .ok_or_else(|| ApiError::NotFound(format!("playlist {playlist_id} was not found")))
+            .ok_or_else(|| ApiError::NotFound(format!("playlist {playlist_id} was not found")))?;
+        self.publish_event("playlist_deleted", "playlist", "deleted", Some(playlist.id));
+        Ok(playlist)
     }
 
     /// Lists resources for application state facade used by HTTP handlers and background workers.
@@ -1325,7 +1390,15 @@ impl AppState {
             .await
             .map_err(api_storage_error)?
         {
-            PlaylistItemAddResult::Added(item) => Ok(item),
+            PlaylistItemAddResult::Added(item) => {
+                self.publish_event(
+                    "playlist_items_updated",
+                    "playlist",
+                    "items_updated",
+                    Some(playlist_id),
+                );
+                Ok(item)
+            }
             PlaylistItemAddResult::PlaylistNotFound => {
                 Err(ApiError::NotFound(format!("playlist {playlist_id} was not found")))
             }
@@ -1364,7 +1437,15 @@ impl AppState {
             .await
             .map_err(api_storage_error)?
         {
-            PlaylistItemRemoveResult::Removed => Ok(()),
+            PlaylistItemRemoveResult::Removed => {
+                self.publish_event(
+                    "playlist_items_updated",
+                    "playlist",
+                    "items_updated",
+                    Some(playlist_id),
+                );
+                Ok(())
+            }
             PlaylistItemRemoveResult::PlaylistNotFound => Err(ApiError::NotFound(format!(
                 "playlist item {playlist_item_id} was not found"
             ))),
@@ -1404,7 +1485,15 @@ impl AppState {
             .await
             .map_err(api_storage_error)?
         {
-            PlaylistItemReorderResult::Reordered(items) => Ok(items),
+            PlaylistItemReorderResult::Reordered(items) => {
+                self.publish_event(
+                    "playlist_items_updated",
+                    "playlist",
+                    "items_updated",
+                    Some(playlist_id),
+                );
+                Ok(items)
+            }
             PlaylistItemReorderResult::PlaylistNotFound => {
                 Err(ApiError::NotFound(format!("playlist {playlist_id} was not found")))
             }
@@ -1764,11 +1853,14 @@ impl AppState {
         account_id: Uuid,
         item_type: PlaybackItemType,
         item_id: Uuid,
+        context_type: Option<PlaybackContextType>,
+        context_id: Option<Uuid>,
         position_seconds: u32,
         duration_seconds: Option<u32>,
         completed: bool,
     ) -> Result<PlaybackProgress, ApiError> {
         validate_progress_seconds(position_seconds, duration_seconds)?;
+        validate_playback_context(context_type, context_id)?;
 
         self.inner
             .repository
@@ -1776,6 +1868,8 @@ impl AppState {
                 account_id,
                 item_type,
                 item_id,
+                context_type,
+                context_id,
                 position_seconds,
                 duration_seconds,
                 completed,
@@ -1882,24 +1976,37 @@ impl AppState {
         account_id: Uuid,
         item_type: PlaybackItemType,
         item_id: Uuid,
+        context_type: Option<PlaybackContextType>,
+        context_id: Option<Uuid>,
         position_seconds: u32,
         duration_seconds: Option<u32>,
         completed: bool,
     ) -> Result<PlaybackHistoryEvent, ApiError> {
         validate_progress_seconds(position_seconds, duration_seconds)?;
+        validate_playback_context(context_type, context_id)?;
 
-        self.inner
+        let event = self
+            .inner
             .repository
             .insert_playback_history_event(
                 account_id,
                 item_type,
                 item_id,
+                context_type,
+                context_id,
                 position_seconds,
                 duration_seconds,
                 completed,
             )
             .await
-            .map_err(api_storage_error)
+            .map_err(api_storage_error)?;
+        self.publish_event(
+            "playback_history_updated",
+            "playback_history",
+            "updated",
+            Some(item_id),
+        );
+        Ok(event)
     }
 
     /// Handles playback history for account for application state facade used by HTTP handlers and background workers.
@@ -2117,10 +2224,14 @@ impl AppState {
             self.system_config(),
             provider_health,
         );
-        pipeline
+        let summary = pipeline
             .run_job(job_id)
             .await
-            .map_err(api_import_pipeline_error)
+            .map_err(api_import_pipeline_error)?;
+        if summary.scanned_files > 0 || summary.published_files > 0 {
+            self.publish_library_updated();
+        }
+        Ok(summary)
     }
 
     /// Runs the operation for application state facade used by HTTP handlers and background workers.
@@ -2150,11 +2261,14 @@ impl AppState {
             return Ok(None);
         };
 
-        pipeline
+        let summary = pipeline
             .run_claimed(job)
             .await
-            .map(Some)
-            .map_err(api_import_pipeline_error)
+            .map_err(api_import_pipeline_error)?;
+        if summary.scanned_files > 0 || summary.published_files > 0 {
+            self.publish_library_updated();
+        }
+        Ok(Some(summary))
     }
 
     /// Handles import jobs for application state facade used by HTTP handlers and background workers.
@@ -3659,6 +3773,18 @@ fn validate_progress_seconds(
     }
 
     Ok(())
+}
+
+fn validate_playback_context(
+    context_type: Option<PlaybackContextType>,
+    context_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    if context_type.is_some() == context_id.is_some() {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(
+        "context_type and context_id must be supplied together".into(),
+    ))
 }
 
 #[cfg(test)]
