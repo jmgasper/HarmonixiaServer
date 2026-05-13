@@ -26,7 +26,8 @@ use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
     transcode::{
-        generate_hls_aac_transcode, spawn_direct_aac_transcode, DirectTranscodeError,
+        generate_downloadable_aac_transcode, generate_hls_aac_transcode,
+        spawn_direct_aac_transcode, DirectTranscodeError, DownloadTranscodeError,
         HlsGenerationLease, HlsTranscodeError,
     },
 };
@@ -51,6 +52,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/:item_type/:item_id/transcode/:profile",
             get(stream_direct_transcode),
+        )
+        .route(
+            "/:item_type/:item_id/transcode/:profile/download",
+            get(download_transcode),
         )
         .route(
             "/:item_type/:item_id/hls/:profile/manifest.m3u8",
@@ -167,6 +172,96 @@ pub async fn download_original(
         ContentDisposition::Attachment,
     )
     .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/media/{item_type}/{item_id}/transcode/{profile}/download",
+    tag = "media",
+    security(("basicAuth" = [])),
+    params(
+        ("item_type" = String, Path, description = "Catalog item type: track or episode"),
+        ("item_id" = Uuid, Path, description = "Published catalog item id"),
+        ("profile" = AacTranscodeProfile, Path, description = "Server-owned downloadable AAC profile: mobile, standard, or high"),
+        ("Range" = Option<String>, Header, description = "Optional byte range, for resumable downloads")
+    ),
+    responses(
+        (status = 200, description = "Authenticated downloadable AAC transcode. Includes Accept-Ranges, Content-Length, Content-Type, and attachment Content-Disposition headers.", content_type = "audio/mp4"),
+        (status = 206, description = "Authenticated partial downloadable AAC transcode. Includes Accept-Ranges, Content-Length, Content-Range, Content-Type, and attachment Content-Disposition headers.", content_type = "audio/mp4"),
+        (status = 400, description = "Invalid item type or AAC profile", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Catalog item is not published, not visible, not backed by a published canonical media file, or the generated transcode is unavailable", body = ErrorResponse),
+        (status = 416, description = "Requested byte range is not satisfiable"),
+        (status = 503, description = "Transcode capacity is exhausted; downloadable generation was rejected immediately without queueing or falling back to original media", body = ErrorResponse)
+    )
+)]
+/// Builds a downloadable AAC transcode response for media streaming and transcoding.
+///
+/// Inputs:
+/// - `State(state)`: `State<AppState>`; expected to be Axum application state with a live repository and runtime configuration.
+/// - `AuthenticatedUser(_account)`: `AuthenticatedUser`; expected to be a value satisfying the type contract shown in the function signature.
+/// - `Path((item_type, item_id, profile))`: `Path<(String, Uuid, String)>`; expected to be a route or domain identifier that must parse to the expected type.
+/// - `headers`: `HeaderMap`; expected to be HTTP headers supplied by the caller.
+///
+/// Output:
+/// - Returns `Response` on success or `ApiError` when the operation cannot be completed.
+///
+/// Errors:
+/// - Returns `ApiError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
+pub async fn download_transcode(
+    State(state): State<AppState>,
+    AuthenticatedUser(_account): AuthenticatedUser,
+    Path((item_type, item_id, profile)): Path<(String, Uuid, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let item_type = parse_media_item_type(&item_type)?;
+    let profile = parse_aac_transcode_profile(&profile)?;
+    let media_file = state.visible_original_media_file(item_type, item_id).await?;
+    let original = resolve_original_file(&state, &media_file)?;
+    let output_path = downloadable_transcode_path(&media_file, profile);
+    let output_dir = output_path
+        .parent()
+        .unwrap_or_else(|| FsPath::new("."))
+        .to_path_buf();
+    let filename = filename_for_downloadable_transcode(&media_file, profile);
+
+    loop {
+        if path_is_file(&output_path).await? {
+            return serve_downloadable_transcode_file(&output_path, headers, &filename).await;
+        }
+
+        match state.join_or_start_hls_generation(output_dir.clone()) {
+            HlsGenerationLease::Start(generation) => {
+                if path_is_file(&output_path).await? {
+                    drop(generation);
+                    return serve_downloadable_transcode_file(&output_path, headers, &filename)
+                        .await;
+                }
+
+                let slot = state.try_acquire_transcode_slot().map_err(|_| {
+                    ApiError::ServiceUnavailable(
+                        "transcode capacity is exhausted; retry later or request original media"
+                            .into(),
+                    )
+                })?;
+                let result = generate_downloadable_aac_transcode(
+                    &state.config().ffmpeg_path,
+                    &original,
+                    profile,
+                    &output_path,
+                    slot,
+                )
+                .await;
+                drop(generation);
+                result.map_err(map_download_transcode_error)?;
+
+                return serve_downloadable_transcode_file(&output_path, headers, &filename).await;
+            }
+            HlsGenerationLease::Wait(generation) => {
+                generation.wait().await;
+            }
+        }
+    }
 }
 
 #[utoipa::path(
@@ -479,6 +574,75 @@ pub(crate) async fn serve_original_media_file(
     }
 }
 
+/// Serves a cached downloadable AAC transcode with byte-range support.
+///
+/// Inputs:
+/// - `path`: `&FsPath`; expected to be the stable generated M4A cache file.
+/// - `headers`: `HeaderMap`; expected to include an optional Range header.
+/// - `filename`: `&str`; expected to be the sanitized attachment filename.
+///
+/// Output:
+/// - Returns `Response` on success or `ApiError` when the operation cannot be completed.
+///
+/// Errors:
+/// - Returns `ApiError` when the cache file cannot be accessed.
+async fn serve_downloadable_transcode_file(
+    path: &FsPath,
+    headers: HeaderMap,
+    filename: &str,
+) -> Result<Response, ApiError> {
+    let mut file = File::open(path)
+        .await
+        .map_err(map_download_transcode_file_error)?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(map_download_transcode_file_error)?;
+    if !metadata.is_file() {
+        return Err(download_transcode_file_not_found());
+    }
+    let file_size = metadata.len();
+
+    let selection = match headers.get(header::RANGE) {
+        Some(value) => {
+            let Ok(value) = value.to_str() else {
+                return Ok(range_not_satisfiable_response(file_size));
+            };
+            match parse_range_header(value, file_size) {
+                Ok(selection) => selection,
+                Err(RangeNotSatisfiable) => {
+                    return Ok(range_not_satisfiable_response(file_size));
+                }
+            }
+        }
+        None => RangeSelection::Full,
+    };
+
+    match selection {
+        RangeSelection::Full => Ok(downloadable_transcode_response(
+            StatusCode::OK,
+            ReaderStream::new(file),
+            filename,
+            file_size,
+            None,
+        )),
+        RangeSelection::Partial { start, end } => {
+            file.seek(SeekFrom::Start(start))
+                .await
+                .map_err(map_download_transcode_file_error)?;
+            let content_length = end - start + 1;
+            let content_range = format!("bytes {start}-{end}/{file_size}");
+            Ok(downloadable_transcode_response(
+                StatusCode::PARTIAL_CONTENT,
+                ReaderStream::new(file.take(content_length)),
+                filename,
+                content_length,
+                Some(content_range),
+            ))
+        }
+    }
+}
+
 /// Handles media response for media streaming and transcoding.
 ///
 /// Inputs:
@@ -527,6 +691,56 @@ where
     headers.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&content_disposition(disposition, filename))
+            .expect("sanitized content disposition should be a valid header"),
+    );
+    if let Some(content_range) = content_range {
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&content_range)
+                .expect("content range should be a valid header"),
+        );
+    }
+
+    response
+}
+
+/// Handles downloadable transcode response for media streaming and transcoding.
+///
+/// Inputs:
+/// - `status`: `StatusCode`; expected to be a value satisfying the type contract shown in the function signature.
+/// - `stream`: `ReaderStream<R>`; expected to stream M4A bytes.
+/// - `filename`: `&str`; expected to be text input suitable for a Content-Disposition filename.
+/// - `content_length`: `u64`; expected to be the response body length in bytes.
+/// - `content_range`: `Option<String>`; expected to be set for partial responses.
+///
+/// Output:
+/// - Returns `Response` as produced by the operation.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+fn downloadable_transcode_response<R>(
+    status: StatusCode,
+    stream: ReaderStream<R>,
+    filename: &str,
+    content_length: u64,
+    content_range: Option<String>,
+) -> Response
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string())
+            .expect("numeric content length should be a valid header"),
+    );
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/mp4"));
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition(ContentDisposition::Attachment, filename))
             .expect("sanitized content disposition should be a valid header"),
     );
     if let Some(content_range) = content_range {
@@ -756,6 +970,20 @@ fn hls_file_not_found() -> ApiError {
     ApiError::NotFound("HLS output was not found".into())
 }
 
+/// Handles download transcode file not found for media streaming and transcoding.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns `ApiError` as produced by the operation.
+///
+/// Errors:
+/// - Does not return recoverable errors.
+fn download_transcode_file_not_found() -> ApiError {
+    ApiError::NotFound("downloadable transcode was not found".into())
+}
+
 /// Parses and validates input for media streaming and transcoding.
 ///
 /// Inputs:
@@ -870,6 +1098,63 @@ pub(crate) fn filename_for_transcode(path: &FsPath, profile: AacTranscodeProfile
     format!("{stem}-{}.aac", profile.api_name())
 }
 
+/// Handles filename for downloadable transcode for media streaming and transcoding.
+///
+/// Inputs:
+/// - `media_file`: `&MediaFile`; expected to be a media domain value that has already passed upstream validation.
+/// - `profile`: `AacTranscodeProfile`; expected to be a value satisfying the type contract shown in the function signature.
+///
+/// Output:
+/// - Returns `String` as produced by the operation.
+///
+/// Errors:
+/// - Does not return recoverable errors.
+pub(crate) fn filename_for_downloadable_transcode(
+    media_file: &MediaFile,
+    profile: AacTranscodeProfile,
+) -> String {
+    let stem = media_file_path(media_file)
+        .file_stem()
+        .and_then(|filename| filename.to_str())
+        .filter(|filename| !filename.trim().is_empty())
+        .unwrap_or("transcode")
+        .to_string();
+    format!("{stem}-{}.m4a", profile.api_name())
+}
+
+/// Handles filename for original media file for media streaming and transcoding.
+///
+/// Inputs:
+/// - `media_file`: `&MediaFile`; expected to be a media domain value that has already passed upstream validation.
+///
+/// Output:
+/// - Returns `String` as produced by the operation.
+///
+/// Errors:
+/// - Does not return recoverable errors.
+pub(crate) fn filename_for_original_media_file(media_file: &MediaFile) -> String {
+    filename_for_path(&media_file_path(media_file))
+}
+
+/// Handles media file path for media streaming and transcoding.
+///
+/// Inputs:
+/// - `media_file`: `&MediaFile`; expected to be a media domain value that has already passed upstream validation.
+///
+/// Output:
+/// - Returns `PathBuf` as produced by the operation.
+///
+/// Errors:
+/// - Does not return recoverable errors.
+fn media_file_path(media_file: &MediaFile) -> PathBuf {
+    PathBuf::from(
+        media_file
+            .managed_path
+            .as_deref()
+            .unwrap_or(media_file.source_path.as_str()),
+    )
+}
+
 /// Handles hls manifest path for media streaming and transcoding.
 ///
 /// Inputs:
@@ -902,6 +1187,26 @@ fn hls_output_dir(media_file: &MediaFile, profile: AacTranscodeProfile) -> PathB
         .join(media_file.id.to_string())
         .join(safe_hls_path_fragment(&media_file.file_hash))
         .join(profile.api_name())
+}
+
+/// Handles downloadable transcode path for media streaming and transcoding.
+///
+/// Inputs:
+/// - `media_file`: `&MediaFile`; expected to be a media domain value that has already passed upstream validation.
+/// - `profile`: `AacTranscodeProfile`; expected to be a value satisfying the type contract shown in the function signature.
+///
+/// Output:
+/// - Returns `PathBuf` as produced by the operation.
+///
+/// Errors:
+/// - Does not return recoverable errors.
+fn downloadable_transcode_path(media_file: &MediaFile, profile: AacTranscodeProfile) -> PathBuf {
+    std::env::temp_dir()
+        .join("harmonixia-dl")
+        .join(media_file.id.to_string())
+        .join(safe_hls_path_fragment(&media_file.file_hash))
+        .join(profile.api_name())
+        .join("track.m4a")
 }
 
 /// Handles safe hls path fragment for media streaming and transcoding.
@@ -1093,6 +1398,40 @@ fn map_direct_transcode_error(error: DirectTranscodeError) -> ApiError {
     ApiError::Internal
 }
 
+/// Maps an internal value for media streaming and transcoding.
+///
+/// Inputs:
+/// - `error`: `DownloadTranscodeError`; expected to be a value satisfying the type contract shown in the function signature.
+///
+/// Output:
+/// - Returns `ApiError` as produced by the operation.
+///
+/// Errors:
+/// - Does not return recoverable errors.
+fn map_download_transcode_error(error: DownloadTranscodeError) -> ApiError {
+    tracing::error!(%error, "failed to generate downloadable AAC transcode");
+    ApiError::Internal
+}
+
+/// Maps an internal value for media streaming and transcoding.
+///
+/// Inputs:
+/// - `error`: `io:Error`; expected to be a value satisfying the type contract shown in the function signature.
+///
+/// Output:
+/// - Returns `ApiError` as produced by the operation.
+///
+/// Errors:
+/// - Does not return recoverable errors.
+fn map_download_transcode_file_error(error: io::Error) -> ApiError {
+    if error.kind() == io::ErrorKind::NotFound {
+        download_transcode_file_not_found()
+    } else {
+        tracing::error!(%error, "failed to access downloadable transcode file");
+        ApiError::Internal
+    }
+}
+
 /// Handles path is file for media streaming and transcoding.
 ///
 /// Inputs:
@@ -1147,7 +1486,14 @@ fn map_hls_transcode_error(error: HlsTranscodeError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_range_header, RangeSelection};
+    use chrono::{TimeZone, Utc};
+
+    use crate::domain::{MediaFileStatus, MediaKind};
+
+    use super::{
+        downloadable_transcode_path, filename_for_downloadable_transcode, hls_output_dir,
+        parse_range_header, AacTranscodeProfile, MediaFile, RangeSelection, Uuid,
+    };
 
     #[test]
     /// Handles parses byte ranges for media streaming and transcoding.
@@ -1180,5 +1526,76 @@ mod tests {
         assert!(parse_range_header("bytes=20-21", 10).is_err());
         assert!(parse_range_header("bytes=5-2", 10).is_err());
         assert!(parse_range_header("bytes=0-0,2-2", 10).is_err());
+    }
+
+    #[test]
+    fn downloadable_transcode_path_is_stable_and_distinct_from_hls_output() {
+        let media_file = test_media_file();
+        let path = downloadable_transcode_path(&media_file, AacTranscodeProfile::Mobile);
+
+        assert_eq!(
+            path,
+            std::env::temp_dir()
+                .join("harmonixia-dl")
+                .join(media_file.id.to_string())
+                .join("abc_def")
+                .join("mobile")
+                .join("track.m4a")
+        );
+        assert_eq!(
+            path,
+            downloadable_transcode_path(&media_file, AacTranscodeProfile::Mobile)
+        );
+        assert_ne!(
+            path,
+            hls_output_dir(&media_file, AacTranscodeProfile::Mobile)
+        );
+    }
+
+    #[test]
+    fn downloadable_transcode_filename_uses_profile_names() {
+        let media_file = test_media_file();
+
+        assert_eq!(
+            filename_for_downloadable_transcode(&media_file, AacTranscodeProfile::Mobile),
+            "Track-mobile.m4a"
+        );
+        assert_eq!(
+            filename_for_downloadable_transcode(&media_file, AacTranscodeProfile::Standard),
+            "Track-standard.m4a"
+        );
+        assert_eq!(
+            filename_for_downloadable_transcode(&media_file, AacTranscodeProfile::High),
+            "Track-high.m4a"
+        );
+    }
+
+    fn test_media_file() -> MediaFile {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        MediaFile {
+            id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            media_kind: MediaKind::Music,
+            status: MediaFileStatus::Published,
+            source_path: "/library/Track.flac".to_string(),
+            managed_path: Some("/library/Track.flac".to_string()),
+            file_hash: "abc/def".to_string(),
+            file_size: 1024,
+            mime_type: Some("audio/flac".to_string()),
+            container: Some("flac".to_string()),
+            audio_codec: Some("flac".to_string()),
+            duration_seconds: Some(180),
+            bitrate: None,
+            sample_rate: Some(44_100),
+            channels: Some(2),
+            genres: Vec::new(),
+            format_keys: Vec::new(),
+            track_id: Some(Uuid::new_v4()),
+            episode_id: None,
+            duplicate_of_media_file_id: None,
+            import_job_id: None,
+            discovered_at: now,
+            published_at: Some(now),
+            updated_at: now,
+        }
     }
 }

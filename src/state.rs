@@ -1532,6 +1532,46 @@ impl AppState {
             .map_err(api_catalog_browse_error)
     }
 
+    /// Handles visible artist for application state facade used by HTTP handlers and background workers.
+    ///
+    /// Inputs:
+    /// - the current instance; expected to have been initialized with its documented invariants.
+    /// - `artist_id`: `Uuid`; expected to be a route or domain identifier that must parse to the expected type.
+    ///
+    /// Output:
+    /// - Returns `Artist` on success or `ApiError` when the operation cannot be completed.
+    ///
+    /// Errors:
+    /// - Returns `ApiError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
+    pub async fn visible_artist(&self, artist_id: Uuid) -> Result<Artist, ApiError> {
+        self.inner
+            .repository
+            .visible_artist(artist_id)
+            .await
+            .map_err(api_storage_error)?
+            .ok_or_else(|| ApiError::NotFound(format!("artist {artist_id} was not found")))
+    }
+
+    /// Handles visible album for application state facade used by HTTP handlers and background workers.
+    ///
+    /// Inputs:
+    /// - the current instance; expected to have been initialized with its documented invariants.
+    /// - `album_id`: `Uuid`; expected to be a route or domain identifier that must parse to the expected type.
+    ///
+    /// Output:
+    /// - Returns `Album` on success or `ApiError` when the operation cannot be completed.
+    ///
+    /// Errors:
+    /// - Returns `ApiError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
+    pub async fn visible_album(&self, album_id: Uuid) -> Result<Album, ApiError> {
+        self.inner
+            .repository
+            .visible_album(album_id)
+            .await
+            .map_err(api_storage_error)?
+            .ok_or_else(|| ApiError::NotFound(format!("album {album_id} was not found")))
+    }
+
     /// Returns a paginated browse view for application state facade used by HTTP handlers and background workers.
     ///
     /// Inputs:
@@ -1559,6 +1599,48 @@ impl AppState {
             .browse_albums(limit, cursor, sort)
             .await
             .map_err(api_catalog_browse_error)
+    }
+
+    /// Handles visible track for application state facade used by HTTP handlers and background workers.
+    ///
+    /// Inputs:
+    /// - the current instance; expected to have been initialized with its documented invariants.
+    /// - `track_id`: `Uuid`; expected to be a route or domain identifier that must parse to the expected type.
+    ///
+    /// Output:
+    /// - Returns `Track` on success or `ApiError` when the operation cannot be completed.
+    ///
+    /// Errors:
+    /// - Returns `ApiError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
+    pub async fn visible_track(&self, track_id: Uuid) -> Result<Track, ApiError> {
+        self.inner
+            .repository
+            .visible_track(track_id)
+            .await
+            .map_err(api_storage_error)?
+            .ok_or_else(|| ApiError::NotFound(format!("track {track_id} was not found")))
+    }
+
+    /// Handles visible tracks for album for application state facade used by HTTP handlers and background workers.
+    ///
+    /// Inputs:
+    /// - the current instance; expected to have been initialized with its documented invariants.
+    /// - `album_id`: `Uuid`; expected to be a route or domain identifier that must parse to the expected type.
+    ///
+    /// Output:
+    /// - Returns `Vec<Track>` on success or `ApiError` when the operation cannot be completed.
+    ///
+    /// Errors:
+    /// - Returns `ApiError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
+    pub async fn visible_tracks_for_album(
+        &self,
+        album_id: Uuid,
+    ) -> Result<Vec<Track>, ApiError> {
+        self.inner
+            .repository
+            .visible_tracks_for_album(album_id)
+            .await
+            .map_err(api_storage_error)
     }
 
     /// Returns a paginated browse view for application state facade used by HTTP handlers and background workers.

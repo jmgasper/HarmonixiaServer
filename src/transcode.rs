@@ -142,6 +142,23 @@ pub enum HlsTranscodeError {
     MissingManifest,
 }
 
+#[derive(Debug, Error)]
+/// Represents downloadable transcode error in the ffmpeg-backed direct AAC and HLS transcoding runtime.
+///
+/// Functionality: Enumerates `Prepare`, `Spawn`, `Wait`, `Unsuccessful` states or choices for ffmpeg-backed direct AAC and HLS transcoding runtime.
+/// Dependencies: depends on the enum variants plus any derive macros or trait bounds declared on the type.
+/// Used by: referenced from `src/api/media.rs`, `src/transcode.rs`.
+pub enum DownloadTranscodeError {
+    #[error("failed to prepare downloadable AAC output: {0}")]
+    Prepare(io::Error),
+    #[error("failed to start ffmpeg: {0}")]
+    Spawn(io::Error),
+    #[error("failed to wait for ffmpeg: {0}")]
+    Wait(io::Error),
+    #[error("ffmpeg downloadable AAC transcode exited unsuccessfully: {0}")]
+    Unsuccessful(ExitStatus),
+}
+
 #[derive(Debug)]
 /// Represents direct aac transcode stream in the ffmpeg-backed direct AAC and HLS transcoding runtime.
 ///
@@ -657,6 +674,95 @@ pub async fn generate_hls_aac_transcode(
     Ok(initial_manifest)
 }
 
+/// Generates a completed M4A AAC file for resumable authenticated downloads.
+///
+/// Inputs:
+/// - `ffmpeg_path`: `&Path`; expected to point to an executable ffmpeg binary.
+/// - `input_path`: `&Path`; expected to be the original media file.
+/// - `profile`: `AacTranscodeProfile`; expected to select the server-owned bitrate.
+/// - `output_path`: `&Path`; expected to be the stable cache file path to publish.
+/// - `slot`: `TranscodeSlot`; expected to reserve transcode capacity until generation completes.
+///
+/// Output:
+/// - Returns `()` on success or `DownloadTranscodeError` when generation cannot complete.
+///
+/// Errors:
+/// - Returns `DownloadTranscodeError` when preparing output, spawning ffmpeg, waiting for ffmpeg, or ffmpeg completion fails.
+pub async fn generate_downloadable_aac_transcode(
+    ffmpeg_path: &Path,
+    input_path: &Path,
+    profile: AacTranscodeProfile,
+    output_path: &Path,
+    slot: TranscodeSlot,
+) -> Result<(), DownloadTranscodeError> {
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .await
+        .map_err(DownloadTranscodeError::Prepare)?;
+
+    let output_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("track.m4a");
+    let temp_path = parent.join(format!(
+        ".{output_name}-{}.tmp",
+        Uuid::new_v4().simple()
+    ));
+
+    let mut child = Command::new(ffmpeg_path)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+        ])
+        .arg(input_path)
+        .args([
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            profile.bitrate(),
+            "-f",
+            "mp4",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(&temp_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(DownloadTranscodeError::Spawn)?;
+
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(error) => {
+            drop(slot);
+            cleanup_download_temp_file(&temp_path).await;
+            return Err(DownloadTranscodeError::Wait(error));
+        }
+    };
+    drop(slot);
+
+    if !status.success() {
+        cleanup_download_temp_file(&temp_path).await;
+        return Err(DownloadTranscodeError::Unsuccessful(status));
+    }
+
+    if let Err(error) = fs::rename(&temp_path, output_path).await {
+        cleanup_download_temp_file(&temp_path).await;
+        return Err(DownloadTranscodeError::Prepare(error));
+    }
+
+    Ok(())
+}
+
 /// Waits for asynchronous completion for ffmpeg-backed direct AAC and HLS transcoding runtime.
 ///
 /// Inputs:
@@ -793,6 +899,28 @@ async fn cleanup_hls_temp_dir(path: &Path) {
     }
 }
 
+/// Handles cleanup download temp file for ffmpeg-backed direct AAC and HLS transcoding runtime.
+///
+/// Inputs:
+/// - `path`: `&Path`; expected to be the temporary output file to remove.
+///
+/// Output:
+/// - Returns a future that resolves to `()` after the operation completes.
+///
+/// Errors:
+/// - Does not return recoverable errors.
+async fn cleanup_download_temp_file(path: &Path) {
+    if let Err(error) = fs::remove_file(path).await {
+        if error.kind() != io::ErrorKind::NotFound {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "failed to clean up temporary downloadable AAC output file"
+            );
+        }
+    }
+}
+
 /// Waits for asynchronous completion for ffmpeg-backed direct AAC and HLS transcoding runtime.
 ///
 /// Inputs:
@@ -896,6 +1024,8 @@ async fn log_hls_transcode_status(status: io::Result<ExitStatus>, output_dir: &P
 #[cfg(test)]
 mod tests {
     use std::{
+        io,
+        os::unix::process::ExitStatusExt,
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU32, Ordering},
@@ -941,6 +1071,32 @@ mod tests {
             Ok(AacTranscodeProfile::High)
         );
         assert!(AacTranscodeProfile::from_str("lossless").is_err());
+    }
+
+    #[test]
+    /// Handles downloadable transcode error variants for ffmpeg-backed direct AAC and HLS transcoding runtime.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Returns `()` after completing the side effects described above.
+    ///
+    /// Errors:
+    /// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+    fn downloadable_transcode_error_variants_have_messages() {
+        assert!(DownloadTranscodeError::Prepare(io::Error::from(io::ErrorKind::Other))
+            .to_string()
+            .contains("prepare"));
+        assert!(DownloadTranscodeError::Spawn(io::Error::from(io::ErrorKind::Other))
+            .to_string()
+            .contains("start"));
+        assert!(DownloadTranscodeError::Wait(io::Error::from(io::ErrorKind::Other))
+            .to_string()
+            .contains("wait"));
+        assert!(DownloadTranscodeError::Unsuccessful(ExitStatus::from_raw(1))
+            .to_string()
+            .contains("unsuccessfully"));
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub mod openapi;
 pub mod playback;
 pub mod playlists;
 pub mod sonos;
+pub mod sync;
 
 /// Builds the Axum router for top-level API routing.
 ///
@@ -52,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1/events", events::router())
         .nest("/api/v1/artwork", artwork::router())
         .nest("/api/v1/media", media::router())
+        .nest("/api/v1/sync", sync::router())
         .nest("/api/v1/sonos", sonos::router())
         .route(
             "/api/v1/playlists",

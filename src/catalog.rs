@@ -1008,6 +1008,203 @@ impl PgMaintenanceRepository {
         row.as_ref().map(media_file_from_row).transpose()
     }
 
+    /// Handles visible artist for catalog persistence, browsing, search, import upsert, and normalization logic.
+    ///
+    /// Inputs:
+    /// - the current instance; expected to have been initialized with its documented invariants.
+    /// - `artist_id`: `Uuid`; expected to be a route or domain identifier that must parse to the expected type.
+    ///
+    /// Output:
+    /// - Returns `Option<Artist>` on success or `StorageError` when the operation cannot be completed.
+    ///
+    /// Errors:
+    /// - Returns `StorageError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
+    pub async fn visible_artist(
+        &self,
+        artist_id: Uuid,
+    ) -> Result<Option<Artist>, StorageError> {
+        let sql = format!(
+            r#"
+            SELECT {ARTIST_SELECT}
+            FROM artists
+            WHERE id = $1
+              AND published_at IS NOT NULL
+              AND stable_grouping
+            LIMIT 1
+            "#
+        );
+        let row = sqlx::query(&sql)
+            .bind(artist_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(artist_from_row).transpose()
+    }
+
+    /// Handles visible album for catalog persistence, browsing, search, import upsert, and normalization logic.
+    ///
+    /// Inputs:
+    /// - the current instance; expected to have been initialized with its documented invariants.
+    /// - `album_id`: `Uuid`; expected to be a route or domain identifier that must parse to the expected type.
+    ///
+    /// Output:
+    /// - Returns `Option<Album>` on success or `StorageError` when the operation cannot be completed.
+    ///
+    /// Errors:
+    /// - Returns `StorageError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
+    pub async fn visible_album(
+        &self,
+        album_id: Uuid,
+    ) -> Result<Option<Album>, StorageError> {
+        let sql = format!(
+            r#"
+            SELECT {ALBUM_SELECT}
+            FROM albums
+            WHERE id = $1
+              AND published_at IS NOT NULL
+              AND stable_grouping
+              AND EXISTS (
+                SELECT 1
+                FROM artists album_artist
+                WHERE album_artist.id = albums.artist_id
+                  AND album_artist.published_at IS NOT NULL
+                  AND album_artist.stable_grouping
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM tracks t
+                JOIN artists track_artist ON track_artist.id = t.artist_id
+                JOIN media_files mf ON mf.id = t.canonical_media_file_id
+                  AND mf.track_id = t.id
+                WHERE t.album_id = albums.id
+                  AND t.published_at IS NOT NULL
+                  AND t.stable_grouping
+                  AND track_artist.published_at IS NOT NULL
+                  AND track_artist.stable_grouping
+                  AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
+              )
+            LIMIT 1
+            "#
+        );
+        let row = sqlx::query(&sql)
+            .bind(album_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(album_from_row).transpose()
+    }
+
+    /// Handles visible track for catalog persistence, browsing, search, import upsert, and normalization logic.
+    ///
+    /// Inputs:
+    /// - the current instance; expected to have been initialized with its documented invariants.
+    /// - `track_id`: `Uuid`; expected to be a route or domain identifier that must parse to the expected type.
+    ///
+    /// Output:
+    /// - Returns `Option<Track>` on success or `StorageError` when the operation cannot be completed.
+    ///
+    /// Errors:
+    /// - Returns `StorageError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
+    pub async fn visible_track(
+        &self,
+        track_id: Uuid,
+    ) -> Result<Option<Track>, StorageError> {
+        let sql = format!(
+            r#"
+            SELECT
+              t.id,
+              t.album_id,
+              t.artist_id,
+              t.title,
+              t.normalized_title,
+              t.disc_number,
+              t.track_number,
+              t.duration_seconds,
+              t.stable_grouping,
+              t.published_at,
+              t.created_at,
+              t.updated_at
+            FROM tracks t
+            JOIN albums al ON al.id = t.album_id
+            JOIN artists album_artist ON album_artist.id = al.artist_id
+            JOIN artists track_artist ON track_artist.id = t.artist_id
+            JOIN media_files mf ON mf.id = t.canonical_media_file_id
+              AND mf.track_id = t.id
+            WHERE t.id = $1
+              AND t.published_at IS NOT NULL
+              AND t.stable_grouping
+              AND al.published_at IS NOT NULL
+              AND al.stable_grouping
+              AND album_artist.published_at IS NOT NULL
+              AND album_artist.stable_grouping
+              AND track_artist.published_at IS NOT NULL
+              AND track_artist.stable_grouping
+              AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
+            LIMIT 1
+            "#
+        );
+        let row = sqlx::query(&sql)
+            .bind(track_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(track_from_row).transpose()
+    }
+
+    /// Handles visible tracks for album for catalog persistence, browsing, search, import upsert, and normalization logic.
+    ///
+    /// Inputs:
+    /// - the current instance; expected to have been initialized with its documented invariants.
+    /// - `album_id`: `Uuid`; expected to be a route or domain identifier that must parse to the expected type.
+    ///
+    /// Output:
+    /// - Returns `Vec<Track>` on success or `StorageError` when the operation cannot be completed.
+    ///
+    /// Errors:
+    /// - Returns `StorageError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
+    pub async fn visible_tracks_for_album(
+        &self,
+        album_id: Uuid,
+    ) -> Result<Vec<Track>, StorageError> {
+        let sql = format!(
+            r#"
+            SELECT
+              t.id,
+              t.album_id,
+              t.artist_id,
+              t.title,
+              t.normalized_title,
+              t.disc_number,
+              t.track_number,
+              t.duration_seconds,
+              t.stable_grouping,
+              t.published_at,
+              t.created_at,
+              t.updated_at
+            FROM tracks t
+            JOIN albums al ON al.id = t.album_id
+            JOIN artists album_artist ON album_artist.id = al.artist_id
+            JOIN artists track_artist ON track_artist.id = t.artist_id
+            JOIN media_files mf ON mf.id = t.canonical_media_file_id
+              AND mf.track_id = t.id
+            WHERE t.album_id = $1
+              AND t.published_at IS NOT NULL
+              AND t.stable_grouping
+              AND al.published_at IS NOT NULL
+              AND al.stable_grouping
+              AND album_artist.published_at IS NOT NULL
+              AND album_artist.stable_grouping
+              AND track_artist.published_at IS NOT NULL
+              AND track_artist.stable_grouping
+              AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
+            ORDER BY
+              COALESCE(t.disc_number, 0) ASC,
+              COALESCE(t.track_number, 0) ASC,
+              lower(t.title) ASC,
+              t.id ASC
+            "#
+        );
+        let rows = sqlx::query(&sql).bind(album_id).fetch_all(&self.pool).await?;
+        rows.iter().map(track_from_row).collect()
+    }
+
     /// Handles visible original media file for track for catalog persistence, browsing, search, import upsert, and normalization logic.
     ///
     /// Inputs:
@@ -1292,7 +1489,17 @@ impl PgMaintenanceRepository {
                 )
                 "#
             ),
-            CatalogEntityType::MediaFile | CatalogEntityType::Playlist => {
+            CatalogEntityType::Playlist => {
+                r#"
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM playlists p
+                  WHERE p.id = $1
+                )
+                "#
+                .to_string()
+            }
+            CatalogEntityType::MediaFile => {
                 return Ok(false);
             }
         };
