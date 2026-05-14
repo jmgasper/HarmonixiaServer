@@ -88,14 +88,14 @@ pub struct SyncPlaylistItemEntry {
 )]
 pub async fn album_sync_snapshot(
     State(state): State<AppState>,
-    AuthenticatedUser(_account): AuthenticatedUser,
+    AuthenticatedUser(account): AuthenticatedUser,
     Path(album_id): Path<Uuid>,
 ) -> Result<Json<AlbumSyncSnapshot>, ApiError> {
     let album = state.visible_album(album_id).await?;
     let artist = state.visible_artist(album.artist_id).await?;
     let tracks = state.visible_tracks_for_album(album.id).await?;
     let artwork = state
-        .visible_artwork_assets(CatalogEntityType::Album, album.id, None)
+        .visible_artwork_assets(account.id, CatalogEntityType::Album, album.id, None)
         .await?;
 
     let mut entries = Vec::with_capacity(tracks.len());
@@ -147,7 +147,7 @@ pub async fn playlist_sync_snapshot(
         .list_visible_playlist_items(account.id, playlist_id)
         .await?;
     let artwork = state
-        .visible_artwork_assets(CatalogEntityType::Playlist, playlist.id, None)
+        .visible_artwork_assets(account.id, CatalogEntityType::Playlist, playlist.id, None)
         .await?;
 
     let mut entries = Vec::with_capacity(items.len());

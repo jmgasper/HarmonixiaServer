@@ -1092,6 +1092,50 @@ impl PgMaintenanceRepository {
         row.as_ref().map(album_from_row).transpose()
     }
 
+    pub async fn visible_albums_for_artist(
+        &self,
+        artist_id: Uuid,
+    ) -> Result<Vec<Album>, StorageError> {
+        let sql = format!(
+            r#"
+            SELECT
+              al.id,
+              al.artist_id,
+              al.title,
+              al.normalized_title,
+              al.album_kind::text AS album_kind,
+              al.release_year,
+              al.stable_grouping,
+              al.published_at,
+              al.created_at,
+              al.updated_at
+            FROM albums al
+            JOIN artists ar ON ar.id = al.artist_id
+            WHERE al.artist_id = $1
+              AND al.published_at IS NOT NULL
+              AND al.stable_grouping
+              AND ar.published_at IS NOT NULL
+              AND ar.stable_grouping
+              AND EXISTS (
+                SELECT 1
+                FROM tracks t
+                JOIN media_files mf ON mf.id = t.canonical_media_file_id
+                  AND mf.track_id = t.id
+                WHERE t.album_id = al.id
+                  AND t.published_at IS NOT NULL
+                  AND t.stable_grouping
+                  AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
+              )
+            ORDER BY
+              al.release_year DESC NULLS LAST,
+              lower(al.title) ASC,
+              al.id ASC
+            "#
+        );
+        let rows = sqlx::query(&sql).bind(artist_id).fetch_all(&self.pool).await?;
+        rows.iter().map(album_from_row).collect()
+    }
+
     /// Handles visible track for catalog persistence, browsing, search, import upsert, and normalization logic.
     ///
     /// Inputs:
@@ -1205,6 +1249,53 @@ impl PgMaintenanceRepository {
         rows.iter().map(track_from_row).collect()
     }
 
+    pub async fn visible_tracks_for_artist(
+        &self,
+        artist_id: Uuid,
+    ) -> Result<Vec<Track>, StorageError> {
+        let sql = format!(
+            r#"
+            SELECT
+              t.id,
+              t.album_id,
+              t.artist_id,
+              t.title,
+              t.normalized_title,
+              t.disc_number,
+              t.track_number,
+              t.duration_seconds,
+              t.stable_grouping,
+              t.published_at,
+              t.created_at,
+              t.updated_at
+            FROM tracks t
+            JOIN albums al ON al.id = t.album_id
+            JOIN artists album_artist ON album_artist.id = al.artist_id
+            JOIN artists track_artist ON track_artist.id = t.artist_id
+            JOIN media_files mf ON mf.id = t.canonical_media_file_id
+              AND mf.track_id = t.id
+            WHERE (al.artist_id = $1 OR t.artist_id = $1)
+              AND t.published_at IS NOT NULL
+              AND t.stable_grouping
+              AND al.published_at IS NOT NULL
+              AND al.stable_grouping
+              AND album_artist.published_at IS NOT NULL
+              AND album_artist.stable_grouping
+              AND track_artist.published_at IS NOT NULL
+              AND track_artist.stable_grouping
+              AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
+            ORDER BY
+              lower(al.title) ASC,
+              COALESCE(t.disc_number, 0) ASC,
+              COALESCE(t.track_number, 0) ASC,
+              lower(t.title) ASC,
+              t.id ASC
+            "#
+        );
+        let rows = sqlx::query(&sql).bind(artist_id).fetch_all(&self.pool).await?;
+        rows.iter().map(track_from_row).collect()
+    }
+
     /// Handles visible original media file for track for catalog persistence, browsing, search, import upsert, and normalization logic.
     ///
     /// Inputs:
@@ -1293,12 +1384,13 @@ impl PgMaintenanceRepository {
 
     pub async fn visible_artwork_assets(
         &self,
+        account_id: Uuid,
         entity_type: CatalogEntityType,
         entity_id: Uuid,
         artwork_kind: Option<ArtworkKind>,
     ) -> Result<Option<Vec<ArtworkAsset>>, StorageError> {
         if !self
-            .visible_artwork_entity_exists(entity_type, entity_id)
+            .visible_artwork_entity_exists(account_id, entity_type, entity_id)
             .await?
         {
             return Ok(None);
@@ -1330,6 +1422,7 @@ impl PgMaintenanceRepository {
 
     pub async fn visible_artwork_asset(
         &self,
+        account_id: Uuid,
         artwork_asset_id: Uuid,
     ) -> Result<Option<ArtworkAsset>, StorageError> {
         let sql = format!(
@@ -1350,7 +1443,7 @@ impl PgMaintenanceRepository {
         };
         let artwork = artwork_asset_from_row(&row)?;
         if self
-            .visible_artwork_entity_exists(artwork.entity_type, artwork.entity_id)
+            .visible_artwork_entity_exists(account_id, artwork.entity_type, artwork.entity_id)
             .await?
         {
             Ok(Some(artwork))
@@ -1361,6 +1454,7 @@ impl PgMaintenanceRepository {
 
     async fn visible_artwork_entity_exists(
         &self,
+        account_id: Uuid,
         entity_type: CatalogEntityType,
         entity_id: Uuid,
     ) -> Result<bool, StorageError> {
@@ -1495,6 +1589,7 @@ impl PgMaintenanceRepository {
                   SELECT 1
                   FROM playlists p
                   WHERE p.id = $1
+                    AND (p.scope = 'shared' OR p.owner_account_id = $2)
                 )
                 "#
                 .to_string()
@@ -1504,10 +1599,11 @@ impl PgMaintenanceRepository {
             }
         };
 
-        let exists: bool = sqlx::query_scalar(&sql)
-            .bind(entity_id)
-            .fetch_one(&self.pool)
-            .await?;
+        let mut query = sqlx::query_scalar(&sql).bind(entity_id);
+        if entity_type == CatalogEntityType::Playlist {
+            query = query.bind(account_id);
+        }
+        let exists: bool = query.fetch_one(&self.pool).await?;
         Ok(exists)
     }
 
@@ -1901,6 +1997,58 @@ impl PgMaintenanceRepository {
         })
     }
 
+    /// Returns the latest visible albums ordered by album release time.
+    pub async fn latest_albums(&self, limit: u32) -> Result<Vec<Album>, CatalogBrowseError> {
+        let sql = format!(
+            r#"
+            SELECT
+              al.id,
+              al.artist_id,
+              al.title,
+              al.normalized_title,
+              al.album_kind::text AS album_kind,
+              al.release_year,
+              al.stable_grouping,
+              al.published_at,
+              al.created_at,
+              al.updated_at
+            FROM albums al
+            JOIN artists ar ON ar.id = al.artist_id
+            WHERE al.published_at IS NOT NULL
+              AND al.stable_grouping
+              AND ar.published_at IS NOT NULL
+              AND ar.stable_grouping
+              AND EXISTS (
+                SELECT 1
+                FROM tracks t
+                JOIN media_files mf ON mf.id = t.canonical_media_file_id
+                WHERE t.album_id = al.id
+                  AND t.published_at IS NOT NULL
+                  AND t.stable_grouping
+                  AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
+              )
+            ORDER BY
+              al.published_at DESC,
+              al.updated_at DESC,
+              lower(COALESCE(ar.sort_name, ar.name)) ASC,
+              lower(al.title) ASC,
+              al.id ASC
+            LIMIT $1
+            "#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+
+        let items = rows
+            .iter()
+            .map(album_from_row)
+            .collect::<Result<Vec<_>, StorageError>>()?;
+
+        Ok(items)
+    }
+
     /// Returns a paginated browse view for catalog persistence, browsing, search, import upsert, and normalization logic.
     ///
     /// Inputs:
@@ -2282,6 +2430,68 @@ impl PgMaintenanceRepository {
             next_cursor,
             sort: sort.api_name().to_string(),
         })
+    }
+
+    /// Returns the latest visible podcast episodes ordered by episode release time.
+    pub async fn latest_podcast_episodes(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<CatalogPodcastEpisode>, CatalogBrowseError> {
+        let sql = format!(
+            r#"
+            SELECT
+              e.id,
+              e.podcast_id,
+              e.title,
+              e.normalized_title,
+              e.season_number,
+              e.episode_number,
+              e.duration_seconds,
+              e.stable_grouping,
+              e.published_at,
+              e.created_at,
+              e.updated_at,
+              p.id AS read_podcast_id,
+              p.title AS read_podcast_title,
+              p.normalized_title AS read_podcast_normalized_title,
+              p.stable_grouping AS read_podcast_stable_grouping,
+              p.published_at AS read_podcast_published_at,
+              p.created_at AS read_podcast_created_at,
+              p.updated_at AS read_podcast_updated_at
+            FROM episodes e
+            JOIN podcasts p ON p.id = e.podcast_id
+            JOIN media_files mf ON mf.id = e.canonical_media_file_id
+              AND mf.episode_id = e.id
+            WHERE e.published_at IS NOT NULL
+              AND e.stable_grouping
+              AND p.published_at IS NOT NULL
+              AND p.stable_grouping
+              AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
+            ORDER BY
+              e.published_at DESC,
+              e.updated_at DESC,
+              lower(p.title) ASC,
+              lower(e.title) ASC,
+              e.id ASC
+            LIMIT $1
+            "#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+
+        let items = rows
+            .iter()
+            .map(|row| {
+                Ok(CatalogPodcastEpisode {
+                    podcast: podcast_from_episode_read_row(row)?,
+                    episode: episode_from_row(row)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+
+        Ok(items)
     }
 
     /// Returns a paginated browse view for catalog persistence, browsing, search, import upsert, and normalization logic.

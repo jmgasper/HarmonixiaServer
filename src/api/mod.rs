@@ -16,6 +16,7 @@ pub mod artwork;
 pub mod catalog;
 pub mod config;
 pub mod events;
+pub mod home;
 pub mod maintenance;
 pub mod media;
 pub mod openapi;
@@ -55,6 +56,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1/media", media::router())
         .nest("/api/v1/sync", sync::router())
         .nest("/api/v1/sonos", sonos::router())
+        .nest("/api/v1/me/home", home::router())
         .route(
             "/api/v1/playlists",
             get(playlists::list_playlists).post(playlists::create_playlist),

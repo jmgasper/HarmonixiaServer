@@ -6,14 +6,17 @@ use axum::{
     routing::get,
     Router,
 };
+use chrono::Utc;
 use tokio_stream::{
     wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
     Stream, StreamExt,
 };
+use uuid::Uuid;
 
 use crate::{
     auth::AuthenticatedUser,
-    state::{AppEvent, AppState},
+    error::ErrorResponse,
+    state::{AppEvent, AppEventAudience, AppState, HomeScreenPatch, ScreenPatch, ScreenSurface},
 };
 
 /// Builds the router for authenticated runtime event streaming.
@@ -21,19 +24,29 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/", get(stream_events))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/events",
+    tag = "events",
+    security(("basicAuth" = [])),
+    responses(
+        (status = 200, description = "Server-Sent Event stream. Each data frame is one account-scoped screen patch envelope with surface, revision, snapshot_at, and typed patch payload metadata.", content_type = "text/event-stream", body = AppEvent),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
 /// Streams server events as Server-Sent Events for clients that need live refreshes.
 pub async fn stream_events(
     State(state): State<AppState>,
-    AuthenticatedUser(_account): AuthenticatedUser,
+    AuthenticatedUser(account): AuthenticatedUser,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(state.subscribe_events()).map(|message| {
+    let account_id = account.id;
+    let stream = BroadcastStream::new(state.subscribe_events()).filter_map(move |message| {
         let event = match message {
-            Ok(event) => sse_event(event),
-            Err(BroadcastStreamRecvError::Lagged(_skipped)) => Event::default()
-                .event("library_updated")
-                .data(r#"{"event":"library_updated","resource":"library","action":"updated"}"#),
+            Ok(event) if event.visible_to(account_id) => Some(sse_event(event)),
+            Ok(_) => None,
+            Err(BroadcastStreamRecvError::Lagged(_skipped)) => Some(sse_event(lagged_event())),
         };
-        Ok::<Event, Infallible>(event)
+        event.map(Ok::<Event, Infallible>)
     });
 
     Sse::new(stream).keep_alive(
@@ -47,7 +60,28 @@ fn sse_event(event: AppEvent) -> Event {
     let event_name = event.event.clone();
     let event_id = event.sequence.to_string();
     let data = serde_json::to_string(&event).unwrap_or_else(|_| {
-        r#"{"event":"library_updated","resource":"library","action":"updated"}"#.to_string()
+        serde_json::to_string(&lagged_event()).unwrap_or_else(|_| "{}".to_string())
     });
     Event::default().event(event_name).id(event_id).data(data)
+}
+
+fn lagged_event() -> AppEvent {
+    let timestamp = Utc::now();
+    AppEvent {
+        sequence: 0,
+        surface: ScreenSurface::Home,
+        revision: 0,
+        snapshot_at: timestamp,
+        patch: ScreenPatch::HomeRefresh(HomeScreenPatch {
+            action: "refresh".to_string(),
+            account_id: None,
+            reason: "stream_lagged".to_string(),
+        }),
+        event: "library_updated".to_string(),
+        resource: "library".to_string(),
+        action: "updated".to_string(),
+        entity_id: Option::<Uuid>::None,
+        timestamp,
+        audience: AppEventAudience::All,
+    }
 }

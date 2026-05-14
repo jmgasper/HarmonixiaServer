@@ -15,6 +15,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::broadcast;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
@@ -175,19 +176,106 @@ pub struct AdminDashboardActiveImportJob {
     pub last_progress_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-/// Represents a lightweight server event delivered to connected clients.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+/// Represents one screen patch delivered to connected clients.
 ///
-/// Functionality: Carries fields `sequence`, `event`, `resource`, `action`, `entity_id`, and `timestamp` for client-side cache invalidation and view refreshes.
-/// Dependencies: depends on `u64`, `String`, `Option<Uuid>`, `DateTime<Utc>`, and serde serialization.
-/// Used by: referenced from `src/api/events.rs`, `src/state.rs`, and background services.
+/// Functionality: Carries legacy invalidation metadata plus a stable screen
+/// patch envelope for Home, playlist, or playback surfaces.
 pub struct AppEvent {
     pub sequence: u64,
+    pub surface: ScreenSurface,
+    pub revision: u64,
+    pub snapshot_at: DateTime<Utc>,
+    pub patch: ScreenPatch,
     pub event: String,
     pub resource: String,
     pub action: String,
     pub entity_id: Option<Uuid>,
     pub timestamp: DateTime<Utc>,
+    pub audience: AppEventAudience,
+}
+
+impl AppEvent {
+    pub fn visible_to(&self, account_id: Uuid) -> bool {
+        self.audience.visible_to(account_id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AppEventAudience {
+    All,
+    Account { account_id: Uuid },
+}
+
+impl AppEventAudience {
+    fn visible_to(&self, account_id: Uuid) -> bool {
+        match self {
+            Self::All => true,
+            Self::Account {
+                account_id: target_account_id,
+            } => *target_account_id == account_id,
+        }
+    }
+}
+
+fn playlist_event_audience(playlist: &Playlist) -> AppEventAudience {
+    match playlist.scope {
+        PlaylistScope::Shared => AppEventAudience::All,
+        PlaylistScope::Personal => AppEventAudience::Account {
+            account_id: playlist.owner_account_id.unwrap_or_else(Uuid::nil),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenSurface {
+    Home,
+    Playlist,
+    Playback,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScreenPatch {
+    HomeRefresh(HomeScreenPatch),
+    PlaylistChanged(PlaylistScreenPatch),
+    PlaybackProgressUpdated(PlaybackProgressScreenPatch),
+    PlaybackHistoryUpdated(PlaybackHistoryScreenPatch),
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HomeScreenPatch {
+    pub action: String,
+    pub account_id: Option<Uuid>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlaylistScreenPatch {
+    pub playlist_id: Uuid,
+    pub action: String,
+    pub scope: PlaylistScope,
+    pub owner_account_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlaybackProgressScreenPatch {
+    pub action: String,
+    pub account_id: Uuid,
+    pub item_type: PlaybackItemType,
+    pub item_id: Uuid,
+    pub progress: PlaybackProgress,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlaybackHistoryScreenPatch {
+    pub action: String,
+    pub account_id: Uuid,
+    pub item_type: PlaybackItemType,
+    pub item_id: Uuid,
+    pub history_event: PlaybackHistoryEvent,
 }
 
 #[derive(Debug, Error)]
@@ -481,6 +569,11 @@ impl AppState {
         self.inner.event_tx.subscribe()
     }
 
+    /// Returns the latest published screen revision.
+    pub fn current_revision(&self) -> u64 {
+        self.inner.event_sequence.load(Ordering::Relaxed)
+    }
+
     /// Publishes an event to connected clients. Slow or disconnected receivers are ignored.
     pub fn publish_event(
         &self,
@@ -489,14 +582,45 @@ impl AppState {
         action: &str,
         entity_id: Option<Uuid>,
     ) {
+        self.publish_screen_event(
+            event,
+            resource,
+            action,
+            entity_id,
+            AppEventAudience::All,
+            ScreenSurface::Home,
+            ScreenPatch::HomeRefresh(HomeScreenPatch {
+                action: "refresh".to_string(),
+                account_id: None,
+                reason: format!("{resource}_{action}"),
+            }),
+        );
+    }
+
+    fn publish_screen_event(
+        &self,
+        event: &str,
+        resource: &str,
+        action: &str,
+        entity_id: Option<Uuid>,
+        audience: AppEventAudience,
+        surface: ScreenSurface,
+        patch: ScreenPatch,
+    ) {
         let sequence = self.inner.event_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let timestamp = Utc::now();
         let event = AppEvent {
             sequence,
+            surface,
+            revision: sequence,
+            snapshot_at: timestamp,
+            patch,
             event: event.to_string(),
             resource: resource.to_string(),
             action: action.to_string(),
             entity_id,
-            timestamp: Utc::now(),
+            timestamp,
+            audience,
         };
         let _ = self.inner.event_tx.send(event);
     }
@@ -504,6 +628,117 @@ impl AppState {
     /// Publishes a catalog/library invalidation event for connected clients.
     pub fn publish_library_updated(&self) {
         self.publish_event("library_updated", "library", "updated", None);
+    }
+
+    fn publish_playlist_event(&self, event: &str, action: &str, playlist: &Playlist) {
+        let audience = playlist_event_audience(playlist);
+        let home_account_id = match playlist.scope {
+            PlaylistScope::Personal => playlist.owner_account_id,
+            PlaylistScope::Shared => None,
+        };
+        self.publish_screen_event(
+            event,
+            "playlist",
+            action,
+            Some(playlist.id),
+            audience.clone(),
+            ScreenSurface::Home,
+            ScreenPatch::HomeRefresh(HomeScreenPatch {
+                action: "refresh".to_string(),
+                account_id: home_account_id,
+                reason: "playlist_changed".to_string(),
+            }),
+        );
+        self.publish_screen_event(
+            event,
+            "playlist",
+            action,
+            Some(playlist.id),
+            audience,
+            ScreenSurface::Playlist,
+            ScreenPatch::PlaylistChanged(PlaylistScreenPatch {
+                playlist_id: playlist.id,
+                action: action.to_string(),
+                scope: playlist.scope,
+                owner_account_id: playlist.owner_account_id,
+            }),
+        );
+    }
+
+    async fn publish_playlist_items_updated(&self, account_id: Uuid, playlist_id: Uuid) {
+        if let Ok(playlist) = self.visible_playlist(account_id, playlist_id).await {
+            self.publish_playlist_event("playlist_items_updated", "items_updated", &playlist);
+        }
+    }
+
+    fn publish_playback_progress_updated(
+        &self,
+        account_id: Uuid,
+        progress: PlaybackProgress,
+    ) {
+        self.publish_screen_event(
+            "playback_progress_updated",
+            "playback_progress",
+            "updated",
+            Some(progress.item_id),
+            AppEventAudience::Account { account_id },
+            ScreenSurface::Home,
+            ScreenPatch::HomeRefresh(HomeScreenPatch {
+                action: "refresh".to_string(),
+                account_id: Some(account_id),
+                reason: "playback_progress_changed".to_string(),
+            }),
+        );
+        self.publish_screen_event(
+            "playback_progress_updated",
+            "playback_progress",
+            "updated",
+            Some(progress.item_id),
+            AppEventAudience::Account { account_id },
+            ScreenSurface::Playback,
+            ScreenPatch::PlaybackProgressUpdated(PlaybackProgressScreenPatch {
+                action: "progress_updated".to_string(),
+                account_id,
+                item_type: progress.item_type,
+                item_id: progress.item_id,
+                progress,
+            }),
+        );
+    }
+
+    fn publish_playback_history_updated(
+        &self,
+        account_id: Uuid,
+        history_event: PlaybackHistoryEvent,
+    ) {
+        self.publish_screen_event(
+            "playback_history_updated",
+            "playback_history",
+            "updated",
+            Some(history_event.item_id),
+            AppEventAudience::Account { account_id },
+            ScreenSurface::Home,
+            ScreenPatch::HomeRefresh(HomeScreenPatch {
+                action: "refresh".to_string(),
+                account_id: Some(account_id),
+                reason: "playback_history_changed".to_string(),
+            }),
+        );
+        self.publish_screen_event(
+            "playback_history_updated",
+            "playback_history",
+            "updated",
+            Some(history_event.item_id),
+            AppEventAudience::Account { account_id },
+            ScreenSurface::Playback,
+            ScreenPatch::PlaybackHistoryUpdated(PlaybackHistoryScreenPatch {
+                action: "history_updated".to_string(),
+                account_id,
+                item_type: history_event.item_type,
+                item_id: history_event.item_id,
+                history_event,
+            }),
+        );
     }
 
     /// Handles system config for application state facade used by HTTP handlers and background workers.
@@ -1215,7 +1450,7 @@ impl AppState {
             .create_playlist(account_id, &name, description.as_deref(), scope)
             .await
             .map_err(api_storage_error)?;
-        self.publish_event("playlist_added", "playlist", "added", Some(playlist.id));
+        self.publish_playlist_event("playlist_added", "added", &playlist);
         Ok(playlist)
     }
 
@@ -1297,7 +1532,7 @@ impl AppState {
             .await
             .map_err(api_storage_error)?
             .ok_or_else(|| ApiError::NotFound(format!("playlist {playlist_id} was not found")))?;
-        self.publish_event("playlist_updated", "playlist", "updated", Some(playlist.id));
+        self.publish_playlist_event("playlist_updated", "updated", &playlist);
         Ok(playlist)
     }
 
@@ -1325,7 +1560,7 @@ impl AppState {
             .await
             .map_err(api_storage_error)?
             .ok_or_else(|| ApiError::NotFound(format!("playlist {playlist_id} was not found")))?;
-        self.publish_event("playlist_deleted", "playlist", "deleted", Some(playlist.id));
+        self.publish_playlist_event("playlist_deleted", "deleted", &playlist);
         Ok(playlist)
     }
 
@@ -1391,12 +1626,7 @@ impl AppState {
             .map_err(api_storage_error)?
         {
             PlaylistItemAddResult::Added(item) => {
-                self.publish_event(
-                    "playlist_items_updated",
-                    "playlist",
-                    "items_updated",
-                    Some(playlist_id),
-                );
+                self.publish_playlist_items_updated(account_id, playlist_id).await;
                 Ok(item)
             }
             PlaylistItemAddResult::PlaylistNotFound => {
@@ -1438,12 +1668,7 @@ impl AppState {
             .map_err(api_storage_error)?
         {
             PlaylistItemRemoveResult::Removed => {
-                self.publish_event(
-                    "playlist_items_updated",
-                    "playlist",
-                    "items_updated",
-                    Some(playlist_id),
-                );
+                self.publish_playlist_items_updated(account_id, playlist_id).await;
                 Ok(())
             }
             PlaylistItemRemoveResult::PlaylistNotFound => Err(ApiError::NotFound(format!(
@@ -1486,12 +1711,7 @@ impl AppState {
             .map_err(api_storage_error)?
         {
             PlaylistItemReorderResult::Reordered(items) => {
-                self.publish_event(
-                    "playlist_items_updated",
-                    "playlist",
-                    "items_updated",
-                    Some(playlist_id),
-                );
+                self.publish_playlist_items_updated(account_id, playlist_id).await;
                 Ok(items)
             }
             PlaylistItemReorderResult::PlaylistNotFound => {
@@ -1572,6 +1792,17 @@ impl AppState {
             .ok_or_else(|| ApiError::NotFound(format!("album {album_id} was not found")))
     }
 
+    pub async fn visible_albums_for_artist(
+        &self,
+        artist_id: Uuid,
+    ) -> Result<Vec<Album>, ApiError> {
+        self.inner
+            .repository
+            .visible_albums_for_artist(artist_id)
+            .await
+            .map_err(api_storage_error)
+    }
+
     /// Returns a paginated browse view for application state facade used by HTTP handlers and background workers.
     ///
     /// Inputs:
@@ -1597,6 +1828,27 @@ impl AppState {
         self.inner
             .repository
             .browse_albums(limit, cursor, sort)
+            .await
+            .map_err(api_catalog_browse_error)
+    }
+
+    /// Returns latest visible albums for application state facade used by HTTP handlers and background workers.
+    ///
+    /// Inputs:
+    /// - the current instance; expected to have been initialized with its documented invariants.
+    /// - `limit`: `Option<u32>`; expected to be an optional value; `None` asks the function to use its default.
+    ///
+    /// Output:
+    /// - Returns `Vec<Album>` on success or `ApiError` when the operation cannot be completed.
+    ///
+    /// Errors:
+    /// - Returns `ApiError` when validation fails, persistence or I/O fails, or a downstream operation returns that error.
+    pub async fn latest_albums(&self, limit: Option<u32>) -> Result<Vec<Album>, ApiError> {
+        let limit = normalize_browse_limit(limit).map_err(api_catalog_browse_error)?;
+
+        self.inner
+            .repository
+            .latest_albums(limit)
             .await
             .map_err(api_catalog_browse_error)
     }
@@ -1639,6 +1891,17 @@ impl AppState {
         self.inner
             .repository
             .visible_tracks_for_album(album_id)
+            .await
+            .map_err(api_storage_error)
+    }
+
+    pub async fn visible_tracks_for_artist(
+        &self,
+        artist_id: Uuid,
+    ) -> Result<Vec<Track>, ApiError> {
+        self.inner
+            .repository
+            .visible_tracks_for_artist(artist_id)
             .await
             .map_err(api_storage_error)
     }
@@ -1746,6 +2009,30 @@ impl AppState {
         self.inner
             .repository
             .browse_episodes(limit, cursor, sort)
+            .await
+            .map_err(api_catalog_browse_error)
+    }
+
+    /// Returns latest visible podcast episodes for application state facade used by HTTP handlers and background workers.
+    ///
+    /// Inputs:
+    /// - the current instance; expected to have been initialized with its documented invariants.
+    /// - `limit`: `Option<u32>`; expected to be an optional value; `None` asks the function to use its default.
+    ///
+    /// Output:
+    /// - Returns `Vec<CatalogPodcastEpisode>` on success or `ApiError` when the operation cannot be completed.
+    ///
+    /// Errors:
+    /// - Returns `ApiError` when validation fails, persistence or I/O fails, or a downstream operation returns that error.
+    pub async fn latest_podcast_episodes(
+        &self,
+        limit: Option<u32>,
+    ) -> Result<Vec<CatalogPodcastEpisode>, ApiError> {
+        let limit = normalize_browse_limit(limit).map_err(api_catalog_browse_error)?;
+
+        self.inner
+            .repository
+            .latest_podcast_episodes(limit)
             .await
             .map_err(api_catalog_browse_error)
     }
@@ -1883,13 +2170,14 @@ impl AppState {
 
     pub async fn visible_artwork_assets(
         &self,
+        account_id: Uuid,
         entity_type: CatalogEntityType,
         entity_id: Uuid,
         artwork_kind: Option<ArtworkKind>,
     ) -> Result<Vec<ArtworkAsset>, ApiError> {
         self.inner
             .repository
-            .visible_artwork_assets(entity_type, entity_id, artwork_kind)
+            .visible_artwork_assets(account_id, entity_type, entity_id, artwork_kind)
             .await
             .map_err(api_storage_error)?
             .ok_or_else(|| {
@@ -1902,11 +2190,12 @@ impl AppState {
 
     pub async fn visible_artwork_asset(
         &self,
+        account_id: Uuid,
         artwork_asset_id: Uuid,
     ) -> Result<ArtworkAsset, ApiError> {
         self.inner
             .repository
-            .visible_artwork_asset(artwork_asset_id)
+            .visible_artwork_asset(account_id, artwork_asset_id)
             .await
             .map_err(api_storage_error)?
             .ok_or_else(|| {
@@ -1944,7 +2233,8 @@ impl AppState {
         validate_progress_seconds(position_seconds, duration_seconds)?;
         validate_playback_context(context_type, context_id)?;
 
-        self.inner
+        let progress = self
+            .inner
             .repository
             .upsert_playback_progress(
                 account_id,
@@ -1957,7 +2247,9 @@ impl AppState {
                 completed,
             )
             .await
-            .map_err(api_storage_error)
+            .map_err(api_storage_error)?;
+        self.publish_playback_progress_updated(account_id, progress.clone());
+        Ok(progress)
     }
 
     /// Handles playback progress for account for application state facade used by HTTP handlers and background workers.
@@ -2082,12 +2374,7 @@ impl AppState {
             )
             .await
             .map_err(api_storage_error)?;
-        self.publish_event(
-            "playback_history_updated",
-            "playback_history",
-            "updated",
-            Some(item_id),
-        );
+        self.publish_playback_history_updated(account_id, event.clone());
         Ok(event)
     }
 

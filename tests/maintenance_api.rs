@@ -11,7 +11,7 @@ use harmonixia_server::{
         ImportJobKind, ImportJobSource, ImportJobStatus, MaintenanceScope, MediaFileStatus,
         MediaProbeFacts, MetadataProvenanceDraft, MusicCatalogGrouping, PodcastCatalogGrouping,
         PlaybackItemType, ProviderHealth, ProviderKind, ProviderStatus, QuarantineItem,
-        QuarantineStatus, RepairPlan, SonosDeliveryKind, SonosSessionStatus,
+        QuarantineStatus, RepairPlan, PlaylistScope, SonosDeliveryKind, SonosSessionStatus,
     },
     pipeline::ImportWorkRequest,
     providers::{ProviderCredential, ProviderRegistry},
@@ -593,6 +593,46 @@ async fn get_bytes(
     let headers = response.headers().clone();
     let bytes = response.into_body().collect().await.unwrap().to_bytes().to_vec();
     (status, headers, bytes)
+}
+
+async fn open_sse_stream(app: axum::Router, auth: TestAuth) -> (StatusCode, Body) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/events")
+                .header("authorization", auth_header(auth))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, response.into_body())
+}
+
+async fn next_sse_json(body: &mut Body) -> Value {
+    let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("SSE stream should yield an event")
+        .expect("SSE body should stay open")
+        .expect("SSE frame should be readable");
+    let bytes = frame.into_data().expect("SSE frame should contain data");
+    let text = std::str::from_utf8(&bytes).expect("SSE frame should be UTF-8");
+    let data = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("SSE frame should contain a data line");
+    serde_json::from_str(data).expect("SSE data should be JSON")
+}
+
+async fn assert_no_sse_event(body: &mut Body) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), body.frame())
+            .await
+            .is_err(),
+        "SSE stream unexpectedly yielded an event"
+    );
 }
 
 async fn configure_public_base_url(
@@ -2520,6 +2560,131 @@ async fn playlist_crud_enforces_personal_and_shared_visibility() {
 }
 
 #[tokio::test]
+/// Verifies that events stream filters account-scoped events and emits screen patch envelopes.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns a future that resolves to `()` after the operation completes.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+async fn events_stream_filters_account_scoped_events_and_emits_screen_patch_envelopes() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let imported = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/event-progress.flac",
+            "event-progress-hash",
+            "Event Artist",
+            "Event Album",
+            "Event Track",
+            Some(1),
+        ))
+        .await
+        .unwrap();
+    let track_id = imported.track.as_ref().unwrap().id;
+    let admin = state
+        .authenticate_local_account(ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .unwrap()
+        .unwrap();
+    let app = router(state.clone());
+
+    let (admin_status, mut admin_body) = open_sse_stream(app.clone(), TestAuth::Admin).await;
+    assert_eq!(admin_status, StatusCode::OK);
+    let (user_status, mut user_body) = open_sse_stream(app, TestAuth::User).await;
+    assert_eq!(user_status, StatusCode::OK);
+
+    let personal = state
+        .create_playlist(
+            admin.id,
+            "Admin Event Personal",
+            None,
+            PlaylistScope::Personal,
+        )
+        .await
+        .unwrap();
+    let personal_home_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(personal_home_event["event"], "playlist_added");
+    assert_eq!(personal_home_event["resource"], "playlist");
+    assert_eq!(personal_home_event["action"], "added");
+    assert_eq!(personal_home_event["entity_id"], json!(personal.id));
+    assert_eq!(personal_home_event["audience"]["type"], "account");
+    assert_eq!(personal_home_event["audience"]["account_id"], json!(admin.id));
+    assert_eq!(personal_home_event["surface"], "home");
+    assert!(personal_home_event["revision"].as_u64().unwrap() > 0);
+    assert!(personal_home_event["snapshot_at"].as_str().is_some());
+    assert_eq!(personal_home_event["patch"]["type"], "home_refresh");
+    assert_eq!(personal_home_event["patch"]["action"], "refresh");
+    assert_eq!(personal_home_event["patch"]["reason"], "playlist_changed");
+
+    let personal_playlist_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(personal_playlist_event["event"], "playlist_added");
+    assert_eq!(personal_playlist_event["entity_id"], json!(personal.id));
+    assert_eq!(personal_playlist_event["surface"], "playlist");
+    assert_eq!(
+        personal_playlist_event["patch"]["type"],
+        "playlist_changed"
+    );
+    assert_eq!(personal_playlist_event["patch"]["playlist_id"], json!(personal.id));
+    assert_eq!(personal_playlist_event["patch"]["scope"], "personal");
+    assert_no_sse_event(&mut user_body).await;
+
+    state
+        .upsert_playback_progress(
+            admin.id,
+            PlaybackItemType::Track,
+            track_id,
+            None,
+            None,
+            12,
+            Some(180),
+            false,
+        )
+        .await
+        .unwrap();
+    let progress_home_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(progress_home_event["surface"], "home");
+    assert_eq!(
+        progress_home_event["patch"]["reason"],
+        "playback_progress_changed"
+    );
+    let progress_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(progress_event["event"], "playback_progress_updated");
+    assert_eq!(progress_event["surface"], "playback");
+    assert_eq!(
+        progress_event["patch"]["type"],
+        "playback_progress_updated"
+    );
+    assert_eq!(progress_event["patch"]["item_type"], "track");
+    assert_eq!(progress_event["patch"]["item_id"], json!(track_id));
+    assert_eq!(progress_event["patch"]["progress"]["position_seconds"], 12);
+    assert_no_sse_event(&mut user_body).await;
+
+    let shared = state
+        .create_playlist(admin.id, "Shared Event Playlist", None, PlaylistScope::Shared)
+        .await
+        .unwrap();
+    let shared_home_event = next_sse_json(&mut user_body).await;
+    assert_eq!(shared_home_event["event"], "playlist_added");
+    assert_eq!(shared_home_event["entity_id"], json!(shared.id));
+    assert_eq!(shared_home_event["audience"]["type"], "all");
+    assert_eq!(shared_home_event["surface"], "home");
+    assert_eq!(shared_home_event["patch"]["type"], "home_refresh");
+    let shared_playlist_event = next_sse_json(&mut user_body).await;
+    assert_eq!(shared_playlist_event["event"], "playlist_added");
+    assert_eq!(shared_playlist_event["entity_id"], json!(shared.id));
+    assert_eq!(shared_playlist_event["audience"]["type"], "all");
+    assert_eq!(shared_playlist_event["surface"], "playlist");
+    assert_eq!(shared_playlist_event["patch"]["playlist_id"], json!(shared.id));
+    assert_eq!(shared_playlist_event["patch"]["scope"], "shared");
+}
+
+#[tokio::test]
 /// Verifies that playlist items support append insert reorder and remove.
 ///
 /// Inputs:
@@ -3452,6 +3617,404 @@ async fn catalog_browse_returns_only_published_stable_items_with_cursor_paging()
     assert_eq!(episodes["page"]["sort"], "podcast_position");
     assert_eq!(episodes["episodes"].as_array().unwrap().len(), 1);
     assert_eq!(episodes["episodes"][0]["title"], "Moon Landing");
+}
+
+#[tokio::test]
+/// Verifies that Home and catalog detail contracts expose ordered read models.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns a future that resolves to `()` after the operation completes.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+async fn home_and_catalog_detail_contracts_expose_ordered_read_models() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+
+    let first = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/home-first.flac",
+            "home-first-hash",
+            "Home Artist",
+            "Home Album",
+            "First Home Track",
+            Some(1),
+        ))
+        .await
+        .unwrap();
+    let second = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/home-second.flac",
+            "home-second-hash",
+            "Home Artist",
+            "Home Album",
+            "Second Home Track",
+            Some(2),
+        ))
+        .await
+        .unwrap();
+    let artist_id = first.artist.as_ref().unwrap().id;
+    let album_id = first.album.as_ref().unwrap().id;
+    let first_track_id = first.track.as_ref().unwrap().id;
+    let second_track_id = second.track.as_ref().unwrap().id;
+    let older_podcast_episode = state
+        .repository()
+        .import_catalog_file(podcast_import_request(
+            "/dropbox/home-podcast-older.mp3",
+            "home-podcast-older-hash",
+            "Home Podcast",
+            "Older Home Episode",
+            Some(1),
+        ))
+        .await
+        .unwrap();
+    let latest_podcast_episode = state
+        .repository()
+        .import_catalog_file(podcast_import_request(
+            "/dropbox/home-podcast-latest.mp3",
+            "home-podcast-latest-hash",
+            "Home Podcast",
+            "Latest Home Episode",
+            Some(2),
+        ))
+        .await
+        .unwrap();
+    let podcast_id = latest_podcast_episode.podcast.as_ref().unwrap().id;
+    let older_episode_id = older_podcast_episode.episode.as_ref().unwrap().id;
+    let latest_episode_id = latest_podcast_episode.episode.as_ref().unwrap().id;
+    let older_episode_published_at = Utc::now() - ChronoDuration::days(2);
+    let latest_episode_published_at = Utc::now() - ChronoDuration::days(1);
+    sqlx::query("UPDATE episodes SET published_at = $2, updated_at = $2 WHERE id = $1")
+        .bind(older_episode_id)
+        .bind(older_episode_published_at)
+        .execute(state.repository().pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE episodes SET published_at = $2, updated_at = $2 WHERE id = $1")
+        .bind(latest_episode_id)
+        .bind(latest_episode_published_at)
+        .execute(state.repository().pool())
+        .await
+        .unwrap();
+
+    let app = router(state);
+    let (_, user_me) = get_json(app.clone(), "/api/v1/auth/me", Some(TestAuth::User)).await;
+    let user_account_id = Uuid::parse_str(user_me["id"].as_str().unwrap()).unwrap();
+
+    let (user_playlist_status, user_playlist) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/playlists",
+        json!({ "name": "Home Personal", "scope": "personal" }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(user_playlist_status, StatusCode::CREATED);
+    let (admin_playlist_status, admin_playlist) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/playlists",
+        json!({ "name": "Hidden Admin Personal", "scope": "personal" }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(admin_playlist_status, StatusCode::CREATED);
+    let (shared_playlist_status, shared_playlist) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/playlists",
+        json!({ "name": "Home Shared", "scope": "shared" }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(shared_playlist_status, StatusCode::CREATED);
+
+    let (progress_status, progress) = request_json(
+        app.clone(),
+        "PUT",
+        &format!("/api/v1/me/playback/progress/track/{first_track_id}"),
+        json!({
+            "position_seconds": 30,
+            "duration_seconds": 180,
+            "completed": false
+        }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(progress_status, StatusCode::OK);
+    assert_eq!(progress["progress"]["item_id"], json!(first_track_id));
+
+    let (home_status, home) =
+        get_json(app.clone(), "/api/v1/me/home", Some(TestAuth::User)).await;
+    assert_eq!(home_status, StatusCode::OK);
+    let section_ids = home["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|section| section["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        section_ids,
+        vec![
+            "continue_listening",
+            "recently_played",
+            "new_releases",
+            "latest_podcasts"
+        ]
+    );
+    assert!(home["revision"].as_u64().is_some());
+    assert!(home["snapshot_at"].as_str().is_some());
+    assert_eq!(
+        home["sections"][0]["items"][0]["item_id"],
+        json!(first_track_id)
+    );
+    assert_eq!(
+        home["sections"][0]["items"][0]["progress"]["position_seconds"],
+        30
+    );
+    let release_items = home["sections"][2]["items"].as_array().unwrap();
+    assert!(release_items
+        .iter()
+        .any(|item| item["item_type"] == "album" && item["item_id"] == json!(album_id)));
+    let podcast_items = home["sections"][3]["items"].as_array().unwrap();
+    assert!(podcast_items
+        .iter()
+        .all(|item| item["item_type"] == "episode"));
+    assert_eq!(podcast_items[0]["item_id"], json!(latest_episode_id));
+    assert_eq!(podcast_items[0]["title"], "Latest Home Episode");
+    assert_eq!(podcast_items[0]["subtitle"], "Home Podcast");
+    assert_eq!(
+        podcast_items[0]["context"]["entity_type"],
+        json!("podcast")
+    );
+    assert_eq!(podcast_items[0]["context"]["entity_id"], json!(podcast_id));
+    assert_eq!(
+        podcast_items[0]["released_at"],
+        json!(latest_episode_published_at)
+    );
+    let podcast_actions = podcast_items[0]["actions"].as_array().unwrap();
+    let latest_episode_media_href = format!("/api/v1/media/episode/{latest_episode_id}/original");
+    let latest_episode_open_href = format!("/api/v1/catalog/episodes/{latest_episode_id}");
+    assert!(podcast_actions.iter().any(|action| {
+        action["action"] == "play"
+            && action["href"].as_str() == Some(latest_episode_media_href.as_str())
+    }));
+    assert!(podcast_actions.iter().any(|action| {
+        action["action"] == "open"
+            && action["href"].as_str() == Some(latest_episode_open_href.as_str())
+    }));
+    let podcast_series_href = format!("/api/v1/catalog/podcasts/{podcast_id}");
+    assert!(!podcast_items.iter().any(|item| {
+        item["item_type"] == "podcast"
+            || item["item_id"] == json!(podcast_id)
+            || item["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| {
+                    action["href"].as_str() == Some(podcast_series_href.as_str())
+                })
+    }));
+    assert!(!home["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|section| section["id"] == "playlists"));
+    assert_eq!(user_playlist["owner_account_id"], json!(user_account_id));
+    assert_ne!(admin_playlist["id"], shared_playlist["id"]);
+
+    let (artist_status, artist_detail) = get_json(
+        app.clone(),
+        &format!("/api/v1/catalog/artists/{artist_id}/detail"),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(artist_status, StatusCode::OK);
+    assert_eq!(artist_detail["artist"]["name"], "Home Artist");
+    assert!(artist_detail["primary_artwork"].is_null());
+    assert_eq!(artist_detail["summary"]["album_count"], 1);
+    assert_eq!(artist_detail["summary"]["track_count"], 2);
+    assert_eq!(artist_detail["album_groups"][0]["id"], json!(album_id));
+    assert_eq!(artist_detail["album_groups"][0]["track_count"], 2);
+    assert!(artist_detail.get("albums").is_none());
+    assert!(artist_detail.get("tracks").is_none());
+    let detail_track_ids = artist_detail["track_groups"][0]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|track| track["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        detail_track_ids,
+        vec![first_track_id.to_string(), second_track_id.to_string()]
+    );
+
+    let (album_status, album_detail) = get_json(
+        app.clone(),
+        &format!("/api/v1/catalog/albums/{album_id}/detail"),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(album_status, StatusCode::OK);
+    assert_eq!(album_detail["album"]["title"], "Home Album");
+    assert_eq!(album_detail["artist"]["id"], json!(artist_id));
+    assert!(album_detail["primary_artwork"].is_null());
+    assert_eq!(album_detail["summary"]["track_count"], 2);
+    assert_eq!(
+        album_detail["track_groups"][0]["items"][0]["id"],
+        json!(first_track_id)
+    );
+    assert_eq!(
+        album_detail["track_groups"][0]["items"][1]["id"],
+        json!(second_track_id)
+    );
+    assert!(album_detail.get("tracks").is_none());
+
+    let (missing_status, missing_body) = get_json(
+        app,
+        &format!("/api/v1/catalog/albums/{}/detail", Uuid::new_v4()),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    assert_eq!(missing_body["code"], "not_found");
+}
+
+#[tokio::test]
+/// Verifies that Home new releases are selected from the globally newest visible albums.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns a future that resolves to `()` after the operation completes.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+async fn home_new_releases_use_globally_latest_visible_albums() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+
+    let older_album_base = Utc::now() - ChronoDuration::days(90);
+    for index in 0..55_u32 {
+        let imported = state
+            .repository()
+            .import_catalog_file(music_import_request(
+                &format!("/dropbox/home-global-old-{index:02}.flac"),
+                &format!("home-global-old-hash-{index:02}"),
+                "A Global Rail Artist",
+                &format!("A Global Rail Album {index:02}"),
+                &format!("A Global Rail Track {index:02}"),
+                Some(1),
+            ))
+            .await
+            .unwrap();
+        let album_id = imported.album.as_ref().unwrap().id;
+        let published_at = older_album_base + ChronoDuration::seconds(i64::from(index));
+        sqlx::query("UPDATE albums SET published_at = $2, updated_at = $2 WHERE id = $1")
+            .bind(album_id)
+            .bind(published_at)
+            .execute(state.repository().pool())
+            .await
+            .unwrap();
+    }
+
+    let hidden_newest = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/home-global-hidden.flac",
+            "home-global-hidden-hash",
+            "Z Hidden Rail Artist",
+            "Z Hidden Rail Album",
+            "Z Hidden Rail Track",
+            Some(1),
+        ))
+        .await
+        .unwrap();
+    let hidden_album_id = hidden_newest.album.as_ref().unwrap().id;
+    let hidden_track_id = hidden_newest.track.as_ref().unwrap().id;
+    let newest_published_at = Utc::now() - ChronoDuration::days(1);
+    sqlx::query("UPDATE albums SET published_at = $2, updated_at = $2 WHERE id = $1")
+        .bind(hidden_album_id)
+        .bind(newest_published_at + ChronoDuration::minutes(1))
+        .execute(state.repository().pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tracks SET published_at = NULL WHERE id = $1")
+        .bind(hidden_track_id)
+        .execute(state.repository().pool())
+        .await
+        .unwrap();
+
+    let second_latest = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/home-global-second.flac",
+            "home-global-second-hash",
+            "Z Global Rail Artist",
+            "Z Global Rail Second Album",
+            "Z Global Rail Second Track",
+            Some(1),
+        ))
+        .await
+        .unwrap();
+    let second_latest_album_id = second_latest.album.as_ref().unwrap().id;
+    sqlx::query("UPDATE albums SET published_at = $2, updated_at = $3 WHERE id = $1")
+        .bind(second_latest_album_id)
+        .bind(newest_published_at)
+        .bind(newest_published_at + ChronoDuration::minutes(5))
+        .execute(state.repository().pool())
+        .await
+        .unwrap();
+
+    let latest = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/home-global-latest.flac",
+            "home-global-latest-hash",
+            "Z Global Rail Artist",
+            "Z Global Rail Latest Album",
+            "Z Global Rail Latest Track",
+            Some(1),
+        ))
+        .await
+        .unwrap();
+    let latest_album_id = latest.album.as_ref().unwrap().id;
+    sqlx::query("UPDATE albums SET published_at = $2, updated_at = $3 WHERE id = $1")
+        .bind(latest_album_id)
+        .bind(newest_published_at)
+        .bind(newest_published_at + ChronoDuration::minutes(10))
+        .execute(state.repository().pool())
+        .await
+        .unwrap();
+
+    let app = router(state);
+    let (home_status, home) = get_json(app, "/api/v1/me/home", Some(TestAuth::User)).await;
+    assert_eq!(home_status, StatusCode::OK);
+    let new_releases = home["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["id"] == "new_releases")
+        .unwrap()["items"]
+        .as_array()
+        .unwrap();
+
+    assert_eq!(new_releases.len(), 12);
+    assert_eq!(new_releases[0]["item_type"], "album");
+    assert_eq!(new_releases[0]["item_id"], json!(latest_album_id));
+    assert_eq!(new_releases[0]["released_at"], json!(newest_published_at));
+    assert_eq!(new_releases[1]["item_id"], json!(second_latest_album_id));
+    assert!(!new_releases
+        .iter()
+        .any(|item| item["item_id"] == json!(hidden_album_id)));
 }
 
 #[tokio::test]
@@ -4629,6 +5192,103 @@ async fn artwork_routes_expose_metadata_and_resized_images_for_visible_entities(
     assert_eq!(artwork.len(), 1);
     assert_eq!(artwork[0]["entity_type"], "artist");
     assert_eq!(artwork[0]["artwork_kind"], "artist");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+/// Verifies that personal playlist artwork images are visible only to the owner account.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns a future that resolves to `()` after the operation completes.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+async fn artwork_image_route_enforces_personal_playlist_owner_visibility() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-playlist-artwork-auth-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("playlists")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+    let artwork_path = library_root.join("playlists/private-playlist.png");
+    let image_body = test_png_bytes();
+    fs::write(&artwork_path, &image_body).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root, dropbox_root).await else {
+        return;
+    };
+    let admin = state
+        .authenticate_local_account(ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .unwrap()
+        .unwrap();
+    let playlist = state
+        .create_playlist(
+            admin.id,
+            "Private Artwork Playlist",
+            None,
+            PlaylistScope::Personal,
+        )
+        .await
+        .unwrap();
+    let artwork_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO artwork_assets (
+            id,
+            entity_type,
+            entity_id,
+            provider,
+            artwork_kind,
+            source_uri,
+            file_path,
+            mime_type,
+            width,
+            height,
+            confidence,
+            created_at
+        )
+        VALUES (
+            $1,
+            'playlist'::catalog_entity_type,
+            $2,
+            'local_sidecars'::provider_kind,
+            'cover'::artwork_kind,
+            $3,
+            $4,
+            'image/png',
+            1,
+            1,
+            1.0,
+            $5
+        )
+        "#,
+    )
+    .bind(artwork_id)
+    .bind(playlist.id)
+    .bind("file:///private/source/playlist.png")
+    .bind(artwork_path.to_string_lossy().to_string())
+    .bind(Utc::now())
+    .execute(state.repository().pool())
+    .await
+    .unwrap();
+
+    let app = router(state);
+    let artwork_url = format!("/api/v1/artwork/{artwork_id}");
+    let (owner_status, _, owner_bytes) =
+        get_bytes(app.clone(), &artwork_url, Some(TestAuth::Admin), &[]).await;
+    assert_eq!(owner_status, StatusCode::OK);
+    assert_eq!(owner_bytes, image_body);
+
+    let (other_status, _, _) =
+        get_bytes(app, &artwork_url, Some(TestAuth::User), &[]).await;
+    assert_eq!(other_status, StatusCode::NOT_FOUND);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -10682,7 +11342,13 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
     assert!(paths.contains_key("/api/v1/admin/quarantine/retry"));
     assert!(paths.contains_key("/api/v1/catalog/search"));
     assert!(paths.contains_key("/api/v1/catalog/artists"));
+    assert!(paths.contains_key(
+        "/api/v1/catalog/artists/{artist_id}/detail"
+    ));
     assert!(paths.contains_key("/api/v1/catalog/albums"));
+    assert!(paths.contains_key(
+        "/api/v1/catalog/albums/{album_id}/detail"
+    ));
     assert!(paths.contains_key("/api/v1/catalog/tracks"));
     assert!(paths.contains_key("/api/v1/catalog/podcasts"));
     assert!(paths.contains_key("/api/v1/catalog/podcasts/{podcast_id}"));
@@ -10721,6 +11387,8 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
     ));
     assert!(paths.contains_key("/api/v1/me/playback/progress"));
     assert!(paths.contains_key("/api/v1/me/playback/history"));
+    assert!(paths.contains_key("/api/v1/me/home"));
+    assert!(paths.contains_key("/api/v1/events"));
     assert!(paths.contains_key("/api/v1/sonos/targets"));
     for route in ["play", "pause", "resume", "stop", "seek", "next", "previous"] {
         assert!(paths.contains_key(&format!(
@@ -10809,6 +11477,16 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         .unwrap()
         .iter()
         .any(|tag| tag["name"].as_str() == Some("sonos")));
+    assert!(body["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tag| tag["name"].as_str() == Some("home")));
+    assert!(body["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tag| tag["name"].as_str() == Some("events")));
 
     let search_parameters = paths["/api/v1/catalog/search"]["get"]["parameters"]
         .as_array()
@@ -10830,6 +11508,18 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
 
     let schemas = body["components"]["schemas"].as_object().unwrap();
     for schema in [
+        "AlbumDetailHeader",
+        "AlbumDetailResponse",
+        "AlbumDetailSummary",
+        "AlbumTrackGroup",
+        "ArtistAlbumGroup",
+        "ArtistDetailHeader",
+        "ArtistDetailLink",
+        "ArtistDetailResponse",
+        "ArtistDetailSummary",
+        "ArtistTrackGroup",
+        "AppEvent",
+        "AppEventAudience",
         "Podcast",
         "PodcastResponse",
         "BrowsePodcastsResponse",
@@ -10837,9 +11527,25 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         "EpisodeResponse",
         "BrowseEpisodesResponse",
         "EpisodeResumeResponse",
+        "DetailTrackItem",
+        "HomeCard",
+        "HomeCardItemType",
+        "HomeResponse",
+        "HomeSection",
+        "HomeSectionId",
+        "HomeScreenPatch",
         "PlaybackProgress",
+        "PlaybackHistoryScreenPatch",
+        "PlaybackPositionHint",
+        "PlaybackProgressScreenPatch",
         "PlaybackProgressWriteRequest",
         "PlaybackProgressWriteResponse",
+        "PlaylistScreenPatch",
+        "ScreenActionHint",
+        "ScreenArtwork",
+        "ScreenContextHint",
+        "ScreenPatch",
+        "ScreenSurface",
         "DashboardSummaryResponse",
         "ErrorResponseDetails",
         "SonosDeliveryKind",
@@ -10965,6 +11671,36 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
     ));
 
     assert_eq!(
+        paths["/api/v1/me/home"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"]
+            .as_str(),
+        Some("#/components/schemas/HomeResponse")
+    );
+    assert_eq!(
+        paths["/api/v1/catalog/artists/{artist_id}/detail"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["$ref"]
+            .as_str(),
+        Some("#/components/schemas/ArtistDetailResponse")
+    );
+    assert_eq!(
+        paths["/api/v1/catalog/albums/{album_id}/detail"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["$ref"]
+            .as_str(),
+        Some("#/components/schemas/AlbumDetailResponse")
+    );
+    assert!(paths["/api/v1/events"]["get"]["responses"]["200"]["content"]
+        .as_object()
+        .unwrap()
+        .contains_key("text/event-stream"));
+    let event_schema = &schemas["AppEvent"]["properties"];
+    assert!(event_schema.get("audience").is_some());
+    assert!(event_schema.get("surface").is_some());
+    assert!(event_schema.get("revision").is_some());
+    assert!(event_schema.get("snapshot_at").is_some());
+    assert!(event_schema.get("patch").is_some());
+    assert!(event_schema.get("patches").is_none());
+
+    assert_eq!(
         paths["/api/v1/catalog/podcasts"]["get"]["responses"]["200"]["content"]
             ["application/json"]["schema"]["$ref"]
             .as_str(),
@@ -11049,7 +11785,9 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         ("/api/v1/admin/quarantine/{item_id}/retry", "post"),
         ("/api/v1/catalog/search", "get"),
         ("/api/v1/catalog/artists", "get"),
+        ("/api/v1/catalog/artists/{artist_id}/detail", "get"),
         ("/api/v1/catalog/albums", "get"),
+        ("/api/v1/catalog/albums/{album_id}/detail", "get"),
         ("/api/v1/catalog/tracks", "get"),
         ("/api/v1/catalog/podcasts", "get"),
         ("/api/v1/catalog/podcasts/{podcast_id}", "get"),
@@ -11102,6 +11840,8 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         ("/api/v1/me/playback/progress", "get"),
         ("/api/v1/me/playback/history", "get"),
         ("/api/v1/me/playback/history", "post"),
+        ("/api/v1/me/home", "get"),
+        ("/api/v1/events", "get"),
     ];
 
     for (path, method) in protected_operations.iter().copied() {

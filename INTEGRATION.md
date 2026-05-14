@@ -251,6 +251,104 @@ Episode:
 }
 ```
 
+## Home
+
+Desktop and mobile clients can hydrate their first screen with one ordered
+account-scoped read model:
+
+```text
+GET /api/v1/me/home
+```
+
+Response:
+
+```json
+{
+  "revision": 42,
+  "snapshot_at": "2026-05-09T10:00:00Z",
+  "sections": [
+    {
+      "id": "continue_listening",
+      "title": "Continue listening",
+      "position": 0,
+      "items": [
+        {
+          "id": "continue_listening:track:track-uuid",
+          "item_type": "track",
+          "item_id": "track-uuid",
+          "title": "Song title",
+          "subtitle": "Artist name",
+          "detail": "Album title",
+          "artwork": {
+            "id": "artwork-uuid",
+            "entity_type": "album",
+            "entity_id": "album-uuid",
+            "artwork_kind": "cover",
+            "mime_type": "image/jpeg",
+            "width": 1200,
+            "height": 1200,
+            "url": "/api/v1/artwork/artwork-uuid"
+          },
+          "context": {
+            "entity_type": "album",
+            "entity_id": "album-uuid",
+            "title": "Album title"
+          },
+          "progress": {
+            "position_seconds": 30,
+            "duration_seconds": 180,
+            "completed": false,
+            "updated_at": "2026-05-09T09:59:00Z"
+          },
+          "played_at": null,
+          "released_at": "2026-05-09T09:00:00Z",
+          "actions": [
+            {
+              "action": "resume",
+              "method": "GET",
+              "href": "/api/v1/media/track/track-uuid/original"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "recently_played",
+      "title": "Recently played",
+      "position": 1,
+      "items": []
+    }
+  ]
+}
+```
+
+Section order is stable:
+
+```text
+continue_listening
+recently_played
+new_releases
+latest_podcasts
+```
+
+Items are card-ready and do not expose raw domain objects. Each item includes a
+stable `item_type`, `item_id`, display text, optional artwork metadata, optional
+context, optional progress or played/release timestamps, and action hints. The
+Home snapshot is account-scoped where playback state is involved.
+
+`new_releases` is a global latest visible album rail. It contains visible album
+cards ordered by album `published_at` newest-first, then `updated_at`
+newest-first with deterministic tie-breakers, and is not derived from catalog
+browse endpoint ordering.
+
+`latest_podcasts` is a latest podcast episode rail. It contains visible
+episode cards ordered by episode `published_at` newest-first. Each card uses
+`item_type: "episode"`, the episode id as `item_id`, podcast artwork and
+context, the episode release timestamp in `released_at`, a playback action for
+`/api/v1/media/episode/{episode_id}/original`, and an open action for
+`/api/v1/catalog/episodes/{episode_id}`; it does not contain podcast series
+cards.
+
 ## Browsing Music
 
 Browse endpoints are paginated with an opaque cursor.
@@ -306,9 +404,98 @@ For a full offline catalog cache, page through artists, albums, and tracks until
 `page.next_cursor` is `null`, then join objects locally by `artist_id` and
 `album_id`.
 
-There are no individual `GET /artists/{id}`, `GET /albums/{id}`, or
-`GET /tracks/{id}` routes yet. Use browse/search results as the source of truth
-for those entities.
+Artist detail:
+
+```text
+GET /api/v1/catalog/artists/{artist_id}/detail
+```
+
+Response:
+
+```json
+{
+  "revision": 42,
+  "snapshot_at": "2026-05-09T10:00:00Z",
+  "artist": {
+    "id": "artist-uuid",
+    "name": "Artist name",
+    "sort_name": "Artist name"
+  },
+  "primary_artwork": null,
+  "summary": {
+    "album_count": 1,
+    "track_count": 10,
+    "duration_seconds": 2400
+  },
+  "album_groups": [
+    {
+      "id": "album-uuid",
+      "title": "Album title",
+      "subtitle": "Artist name",
+      "release_year": 2026,
+      "album_kind": "album",
+      "primary_artwork": null,
+      "track_count": 10,
+      "duration_seconds": 2400,
+      "tracks": [],
+      "actions": []
+    }
+  ],
+  "track_groups": [
+    {
+      "id": "all_tracks",
+      "title": "Songs",
+      "items": []
+    }
+  ],
+  "actions": []
+}
+```
+
+Album detail:
+
+```text
+GET /api/v1/catalog/albums/{album_id}/detail
+```
+
+Response:
+
+```json
+{
+  "revision": 42,
+  "snapshot_at": "2026-05-09T10:00:00Z",
+  "album": {
+    "id": "album-uuid",
+    "title": "Album title",
+    "release_year": 2026,
+    "album_kind": "album"
+  },
+  "artist": {
+    "id": "artist-uuid",
+    "name": "Artist name"
+  },
+  "primary_artwork": null,
+  "summary": {
+    "track_count": 10,
+    "duration_seconds": 2400
+  },
+  "track_groups": [
+    {
+      "id": "disc_1",
+      "title": "Tracks",
+      "disc_number": 1,
+      "items": []
+    }
+  ],
+  "actions": []
+}
+```
+
+Detail routes return only published, stable, playable catalog content. They are
+screen-ready read models with primary artwork slots, summaries, grouped track
+items, and action/context hints. Album tracks are grouped by disc and ordered by
+disc and track number; artist detail includes album groups plus an all-track
+group ordered by album title, disc, and track number.
 
 ## Searching
 
@@ -839,9 +1026,11 @@ GET /api/v1/catalog/{entity_type}/{entity_id}/artwork?kind=cover
 ```
 
 Supported `entity_type` values are `artist`, `band`, `album`, `track`,
-`podcast`, and `episode`. `band` is an alias for `artist`. The entity must be
-published and visible through the public catalog. Supported `kind` values are
-`cover`, `artist`, `fanart`, `thumbnail`, and `other`.
+`podcast`, `episode`, and `playlist`. `band` is an alias for `artist`. Catalog
+entities must be published and visible through the public catalog. Personal
+playlist artwork is visible only to the owner; shared playlist artwork is
+household-visible. Supported `kind` values are `cover`, `artist`, `fanart`,
+`thumbnail`, and `other`.
 
 Response:
 
@@ -883,7 +1072,8 @@ preserving aspect ratio. Each requested dimension must be between `1` and
 `4096` pixels.
 
 The image endpoint requires the same Basic authentication as the catalog
-endpoints. The asset must still belong to a published visible catalog entity.
+endpoints. The asset must still belong to a visible entity. Personal playlist
+artwork asset IDs do not bypass owner visibility.
 
 ## Suggested App Data Flow
 
@@ -891,19 +1081,88 @@ For a streaming-app style client:
 
 ```text
 1. GET /api/v1/auth/me to validate credentials and identify the account.
-2. Page through /catalog/artists, /catalog/albums, and /catalog/tracks.
-3. Page through /catalog/podcasts and /catalog/episodes if podcast UI is enabled.
-4. GET /api/v1/playlists and then /playlists/{id}/items for each visible playlist.
-5. GET /api/v1/me/playback/progress to hydrate resume state.
-6. Use /catalog/search for interactive search rather than local-only matching.
-7. For playback, prefer original media when supported, HLS for mobile/seeking,
+2. GET /api/v1/me/home to hydrate the initial ordered Home screen.
+3. Page through /catalog/artists, /catalog/albums, and /catalog/tracks.
+4. Page through /catalog/podcasts and /catalog/episodes if podcast UI is enabled.
+5. GET /api/v1/playlists and then /playlists/{id}/items for each visible playlist.
+6. GET /api/v1/me/playback/progress to hydrate resume state.
+7. Connect to /api/v1/events for live Home, playlist, and playback screen patches.
+8. Use /catalog/search for interactive search rather than local-only matching.
+9. For playback, prefer original media when supported, HLS for mobile/seeking,
    and direct AAC for simple transcoded playback.
-8. Write playback progress during and after playback.
+10. Write playback progress during and after playback.
 ```
 
-For cache invalidation, use the `updated_at` fields on returned objects and
-periodically repage the catalog. There is not yet a delta-sync or event stream
-endpoint.
+For live updates, use the authenticated SSE stream:
+
+```text
+GET /api/v1/events
+```
+
+Each Server-Sent Event `data` frame is one screen patch envelope. Legacy
+invalidation fields remain available as compatibility metadata, but clients
+should consume `surface`, `revision`, `snapshot_at`, and `patch` directly:
+
+```json
+{
+  "sequence": 42,
+  "surface": "playlist",
+  "revision": 42,
+  "snapshot_at": "2026-05-09T10:00:00Z",
+  "patch": {
+    "type": "playlist_changed",
+    "playlist_id": "playlist-uuid",
+    "action": "items_updated",
+    "scope": "personal",
+    "owner_account_id": "account-uuid"
+  },
+  "event": "playlist_updated",
+  "resource": "playlist",
+  "action": "updated",
+  "entity_id": "playlist-uuid",
+  "timestamp": "2026-05-09T10:00:00Z",
+  "audience": {
+    "type": "account",
+    "account_id": "account-uuid"
+  }
+}
+```
+
+`audience.type` is `all` for generic library invalidations and shared-playlist
+updates, or `account` for personal playlist and playback updates. The server
+filters delivery before writing to the stream, so one account does not receive
+another account's personal playlist or playback events.
+
+The `patch` object is typed by `patch.type`. Common patch payloads are:
+
+```json
+[
+  {
+    "type": "home_refresh",
+    "action": "refresh",
+    "account_id": "account-uuid",
+    "reason": "playback_history_changed"
+  },
+  {
+    "type": "playlist_changed",
+    "playlist_id": "playlist-uuid",
+    "action": "items_updated",
+    "scope": "personal",
+    "owner_account_id": "account-uuid"
+  },
+  {
+    "type": "playback_history_updated",
+    "action": "history_updated",
+    "account_id": "account-uuid",
+    "item_type": "track",
+    "item_id": "track-uuid",
+    "history_event": {}
+  }
+]
+```
+
+Clients that do not consume `patch` can still repage the affected resource
+based on `event`, `resource`, `action`, and `entity_id`.
 
 ## Admin-Only Endpoints Useful During Setup
 
@@ -943,14 +1202,14 @@ Admin endpoints return `403 Forbidden` for non-admin accounts.
 These are important for Spotify/Tidal-like clients:
 
 ```text
-Artist, album, and track detail-by-ID endpoints are not available yet.
+Track detail-by-ID endpoints are not available yet.
 Track responses do not include album or artist display objects inline.
 Media-file technical metadata is not exposed through a public client endpoint.
 Raw provider metadata and matching provenance are not exposed through public
 client endpoints.
 There is no token-based auth, device authorization, or OAuth-like flow.
-There is no delta sync, websocket event stream, favorites, ratings, follows,
-or library collection endpoint yet.
+There is no websocket event stream, favorites, ratings, follows, or library
+collection endpoint yet.
 ```
 
 Design clients so these can be added as capabilities without breaking the

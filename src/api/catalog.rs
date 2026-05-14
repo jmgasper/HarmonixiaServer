@@ -1,19 +1,25 @@
+use std::collections::BTreeMap;
+
 use axum::{
     extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::{
+    api::home::{
+        action_hint, primary_artwork, ScreenActionHint, ScreenArtwork, ScreenContextHint,
+    },
     api::playback::{PlaybackProgressWriteRequest, PlaybackProgressWriteResponse},
     auth::AuthenticatedUser,
     catalog::CatalogBrowsePage,
     domain::{
-        Album, Artist, Episode, PlaybackItemType, PlaybackProgress, Playlist, Podcast,
-        Track,
+        Album, AlbumKind, Artist, ArtworkKind, CatalogEntityType, Episode, PlaybackItemType,
+        PlaybackProgress, Playlist, Podcast, Track,
     },
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -33,7 +39,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/search", get(search_catalog))
         .route("/artists", get(browse_artists))
+        .route("/artists/:artist_id/detail", get(get_artist_detail))
         .route("/albums", get(browse_albums))
+        .route("/albums/:album_id/detail", get(get_album_detail))
         .route("/tracks", get(browse_tracks))
         .route("/podcasts", get(browse_podcasts))
         .route("/podcasts/:podcast_id", get(get_podcast))
@@ -128,6 +136,107 @@ pub struct BrowseAlbumsResponse {
 pub struct BrowseTracksResponse {
     pub tracks: Vec<Track>,
     pub page: CatalogBrowsePageMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ArtistDetailResponse {
+    pub revision: u64,
+    pub snapshot_at: DateTime<Utc>,
+    pub artist: ArtistDetailHeader,
+    pub primary_artwork: Option<ScreenArtwork>,
+    pub summary: ArtistDetailSummary,
+    pub album_groups: Vec<ArtistAlbumGroup>,
+    pub track_groups: Vec<ArtistTrackGroup>,
+    pub actions: Vec<ScreenActionHint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AlbumDetailResponse {
+    pub revision: u64,
+    pub snapshot_at: DateTime<Utc>,
+    pub album: AlbumDetailHeader,
+    pub artist: ArtistDetailLink,
+    pub primary_artwork: Option<ScreenArtwork>,
+    pub summary: AlbumDetailSummary,
+    pub track_groups: Vec<AlbumTrackGroup>,
+    pub actions: Vec<ScreenActionHint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ArtistDetailHeader {
+    pub id: Uuid,
+    pub name: String,
+    pub sort_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ArtistDetailSummary {
+    pub album_count: usize,
+    pub track_count: usize,
+    pub duration_seconds: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ArtistAlbumGroup {
+    pub id: Uuid,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub release_year: Option<i32>,
+    pub album_kind: AlbumKind,
+    pub primary_artwork: Option<ScreenArtwork>,
+    pub track_count: usize,
+    pub duration_seconds: Option<i32>,
+    pub tracks: Vec<DetailTrackItem>,
+    pub actions: Vec<ScreenActionHint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ArtistTrackGroup {
+    pub id: String,
+    pub title: String,
+    pub items: Vec<DetailTrackItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AlbumDetailHeader {
+    pub id: Uuid,
+    pub title: String,
+    pub release_year: Option<i32>,
+    pub album_kind: AlbumKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ArtistDetailLink {
+    pub id: Uuid,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AlbumDetailSummary {
+    pub track_count: usize,
+    pub duration_seconds: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AlbumTrackGroup {
+    pub id: String,
+    pub title: String,
+    pub disc_number: Option<i32>,
+    pub items: Vec<DetailTrackItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DetailTrackItem {
+    pub id: Uuid,
+    pub item_type: PlaybackItemType,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub disc_number: Option<i32>,
+    pub track_number: Option<i32>,
+    pub duration_seconds: Option<i32>,
+    pub artwork: Option<ScreenArtwork>,
+    pub context: ScreenContextHint,
+    pub actions: Vec<ScreenActionHint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -302,6 +411,72 @@ pub async fn browse_artists(
 
 #[utoipa::path(
     get,
+    path = "/api/v1/catalog/artists/{artist_id}/detail",
+    tag = "catalog",
+    security(("basicAuth" = [])),
+    params(("artist_id" = Uuid, Path, description = "Published artist id")),
+    responses(
+        (status = 200, description = "Screen-ready artist detail with primary artwork, album groupings, all-track grouping, and action/context hints", body = ArtistDetailResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Artist is not published, not visible, or not found", body = ErrorResponse)
+    )
+)]
+/// Retrieves an artist detail read model for catalog clients.
+pub async fn get_artist_detail(
+    State(state): State<AppState>,
+    AuthenticatedUser(account): AuthenticatedUser,
+    Path(artist_id): Path<Uuid>,
+) -> Result<Json<ArtistDetailResponse>, ApiError> {
+    let artist = state.visible_artist(artist_id).await?;
+    let albums = state.visible_albums_for_artist(artist.id).await?;
+    let tracks = state.visible_tracks_for_artist(artist.id).await?;
+    if albums.is_empty() && tracks.is_empty() {
+        return Err(ApiError::NotFound(format!("artist {artist_id} was not found")));
+    }
+
+    let snapshot_at = Utc::now();
+    let primary_artwork = primary_artwork(
+        &state,
+        account.id,
+        CatalogEntityType::Artist,
+        artist.id,
+        ArtworkKind::Artist,
+    )
+    .await?;
+    let album_groups = artist_album_groups(&state, account.id, &artist, albums).await?;
+    let all_track_items =
+        detail_track_items(&state, account.id, &artist, None, tracks.clone()).await?;
+
+    Ok(Json(ArtistDetailResponse {
+        revision: state.current_revision(),
+        snapshot_at,
+        artist: ArtistDetailHeader {
+            id: artist.id,
+            name: artist.name.clone(),
+            sort_name: artist.sort_name,
+        },
+        primary_artwork,
+        summary: ArtistDetailSummary {
+            album_count: album_groups.len(),
+            track_count: all_track_items.len(),
+            duration_seconds: sum_track_duration(&tracks),
+        },
+        album_groups,
+        track_groups: vec![ArtistTrackGroup {
+            id: "all_tracks".to_string(),
+            title: "Songs".to_string(),
+            items: all_track_items,
+        }],
+        actions: vec![action_hint(
+            "open",
+            "GET",
+            format!("/api/v1/catalog/artists/{artist_id}/detail"),
+        )],
+    }))
+}
+
+#[utoipa::path(
+    get,
     path = "/api/v1/catalog/albums",
     tag = "catalog",
     security(("basicAuth" = [])),
@@ -340,6 +515,65 @@ pub async fn browse_albums(
     Ok(Json(BrowseAlbumsResponse {
         page: page_metadata(&page),
         albums: page.items,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/catalog/albums/{album_id}/detail",
+    tag = "catalog",
+    security(("basicAuth" = [])),
+    params(("album_id" = Uuid, Path, description = "Published album id")),
+    responses(
+        (status = 200, description = "Screen-ready album detail with primary artwork, artist link, disc track groupings, and action/context hints", body = AlbumDetailResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 404, description = "Album is not published, not visible, or not found", body = ErrorResponse)
+    )
+)]
+/// Retrieves an album detail read model for catalog clients.
+pub async fn get_album_detail(
+    State(state): State<AppState>,
+    AuthenticatedUser(account): AuthenticatedUser,
+    Path(album_id): Path<Uuid>,
+) -> Result<Json<AlbumDetailResponse>, ApiError> {
+    let album = state.visible_album(album_id).await?;
+    let artist = state.visible_artist(album.artist_id).await?;
+    let tracks = state.visible_tracks_for_album(album.id).await?;
+    let snapshot_at = Utc::now();
+    let primary_artwork = primary_artwork(
+        &state,
+        account.id,
+        CatalogEntityType::Album,
+        album.id,
+        ArtworkKind::Cover,
+    )
+    .await?;
+    let track_groups = album_track_groups(&state, account.id, &artist, &album, tracks.clone()).await?;
+
+    Ok(Json(AlbumDetailResponse {
+        revision: state.current_revision(),
+        snapshot_at,
+        album: AlbumDetailHeader {
+            id: album.id,
+            title: album.title.clone(),
+            release_year: album.release_year,
+            album_kind: album.album_kind,
+        },
+        artist: ArtistDetailLink {
+            id: artist.id,
+            name: artist.name,
+        },
+        primary_artwork,
+        summary: AlbumDetailSummary {
+            track_count: tracks.len(),
+            duration_seconds: sum_track_duration(&tracks),
+        },
+        track_groups,
+        actions: vec![action_hint(
+            "open",
+            "GET",
+            format!("/api/v1/catalog/albums/{album_id}/detail"),
+        )],
     }))
 }
 
@@ -697,6 +931,136 @@ pub async fn write_episode_resume(
         progress,
         history_event,
     }))
+}
+
+async fn artist_album_groups(
+    state: &AppState,
+    account_id: Uuid,
+    artist: &Artist,
+    albums: Vec<Album>,
+) -> Result<Vec<ArtistAlbumGroup>, ApiError> {
+    let mut groups = Vec::new();
+    for album in albums {
+        let tracks = state.visible_tracks_for_album(album.id).await?;
+        let primary_artwork = primary_artwork(
+            state,
+            account_id,
+            CatalogEntityType::Album,
+            album.id,
+            ArtworkKind::Cover,
+        )
+        .await?;
+        let track_items =
+            detail_track_items(state, account_id, artist, Some(&album), tracks.clone()).await?;
+        groups.push(ArtistAlbumGroup {
+            id: album.id,
+            title: album.title.clone(),
+            subtitle: Some(artist.name.clone()),
+            release_year: album.release_year,
+            album_kind: album.album_kind,
+            primary_artwork,
+            track_count: tracks.len(),
+            duration_seconds: sum_track_duration(&tracks),
+            tracks: track_items,
+            actions: vec![action_hint(
+                "open",
+                "GET",
+                format!("/api/v1/catalog/albums/{}/detail", album.id),
+            )],
+        });
+    }
+    Ok(groups)
+}
+
+async fn album_track_groups(
+    state: &AppState,
+    account_id: Uuid,
+    artist: &Artist,
+    album: &Album,
+    tracks: Vec<Track>,
+) -> Result<Vec<AlbumTrackGroup>, ApiError> {
+    let mut grouped: BTreeMap<Option<i32>, Vec<Track>> = BTreeMap::new();
+    for track in tracks {
+        grouped.entry(track.disc_number).or_default().push(track);
+    }
+
+    let multi_disc = grouped.len() > 1
+        || grouped
+            .keys()
+            .any(|disc| matches!(disc, Some(n) if *n > 1));
+    let mut groups = Vec::new();
+    for (disc_number, tracks) in grouped {
+        groups.push(AlbumTrackGroup {
+            id: disc_number
+                .map(|number| format!("disc_{number}"))
+                .unwrap_or_else(|| "main".to_string()),
+            title: match (multi_disc, disc_number) {
+                (true, Some(number)) => format!("Disc {number}"),
+                _ => "Tracks".to_string(),
+            },
+            disc_number,
+            items: detail_track_items(state, account_id, artist, Some(album), tracks).await?,
+        });
+    }
+    Ok(groups)
+}
+
+async fn detail_track_items(
+    state: &AppState,
+    account_id: Uuid,
+    artist: &Artist,
+    album: Option<&Album>,
+    tracks: Vec<Track>,
+) -> Result<Vec<DetailTrackItem>, ApiError> {
+    let mut items = Vec::new();
+    for track in tracks {
+        let track_album = match album {
+            Some(album) => album.clone(),
+            None => match state.visible_album(track.album_id).await {
+                Ok(album) => album,
+                Err(ApiError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            },
+        };
+        let artwork = primary_artwork(
+            state,
+            account_id,
+            CatalogEntityType::Album,
+            track_album.id,
+            ArtworkKind::Cover,
+        )
+        .await?;
+        items.push(DetailTrackItem {
+            id: track.id,
+            item_type: PlaybackItemType::Track,
+            title: track.title,
+            subtitle: Some(format!("{} - {}", artist.name, track_album.title)),
+            disc_number: track.disc_number,
+            track_number: track.track_number,
+            duration_seconds: track.duration_seconds,
+            artwork,
+            context: ScreenContextHint {
+                entity_type: CatalogEntityType::Album,
+                entity_id: track_album.id,
+                title: track_album.title,
+            },
+            actions: vec![action_hint(
+                "play",
+                "GET",
+                format!("/api/v1/media/track/{}/original", track.id),
+            )],
+        });
+    }
+    Ok(items)
+}
+
+fn sum_track_duration(tracks: &[Track]) -> Option<i32> {
+    let total = tracks
+        .iter()
+        .filter_map(|track| track.duration_seconds)
+        .filter(|duration| *duration > 0)
+        .sum::<i32>();
+    (total > 0).then_some(total)
 }
 
 /// Handles page metadata for catalog browsing and search.

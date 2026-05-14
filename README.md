@@ -13,6 +13,13 @@ This foundation slice implements the Postgres-backed core API surface:
 - Quarantine retry handoff back into the shared import pipeline.
 - Personal and household-shared playlist CRUD foundations.
 - User-scoped playback progress and history persistence.
+- Account-scoped Home screen read model with fixed v1 sections, card-ready
+  artwork/action/context hints, latest podcast episode cards, and refresh
+  metadata.
+- Server-Sent Events with account-scoped screen patch envelopes for Home,
+  playlist, and playback surfaces.
+- Artist and album detail read APIs with primary artwork slots, summaries,
+  grouped tracks, and action/context hints for desktop clients.
 - Podcast-specific series, episode, and episode resume read APIs.
 - Authenticated original media delivery, direct AAC transcode endpoints, and
   HLS manifests/segments with hard transcode slot admission control.
@@ -67,8 +74,13 @@ incoming requests.
 - `GET /api/v1/admin/providers/settings`
 - `PATCH /api/v1/admin/providers/{provider}/settings`
 
-Podcast series and episodes are browsable separately from music browse APIs:
+Client-facing read APIs include Home, live events, music detail, and podcast
+browse surfaces:
 
+- `GET /api/v1/me/home`
+- `GET /api/v1/events`
+- `GET /api/v1/catalog/artists/{artist_id}/detail`
+- `GET /api/v1/catalog/albums/{album_id}/detail`
 - `GET /api/v1/catalog/podcasts`
 - `GET /api/v1/catalog/podcasts/{podcast_id}`
 - `GET /api/v1/catalog/podcasts/{podcast_id}/episodes`

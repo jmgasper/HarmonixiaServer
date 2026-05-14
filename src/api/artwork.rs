@@ -76,7 +76,7 @@ pub struct ArtworkAssetsResponse {
     tag = "catalog",
     security(("basicAuth" = [])),
     params(
-        ("entity_type" = String, Path, description = "Catalog entity type with artwork: artist, band, album, track, podcast, or episode"),
+        ("entity_type" = String, Path, description = "Catalog entity type with artwork: artist, band, album, track, podcast, episode, or playlist"),
         ("entity_id" = Uuid, Path, description = "Published visible catalog entity id"),
         ArtworkLookupQuery
     ),
@@ -89,14 +89,14 @@ pub struct ArtworkAssetsResponse {
 )]
 pub async fn get_catalog_entity_artwork(
     State(state): State<AppState>,
-    AuthenticatedUser(_account): AuthenticatedUser,
+    AuthenticatedUser(account): AuthenticatedUser,
     Path((entity_type, entity_id)): Path<(String, Uuid)>,
     Query(query): Query<ArtworkLookupQuery>,
 ) -> Result<Json<ArtworkAssetsResponse>, ApiError> {
     let entity_type = parse_artwork_entity_type(&entity_type)?;
     let artwork_kind = parse_optional_artwork_kind(query.kind.as_deref())?;
     let artwork = state
-        .visible_artwork_assets(entity_type, entity_id, artwork_kind)
+        .visible_artwork_assets(account.id, entity_type, entity_id, artwork_kind)
         .await?;
 
     Ok(Json(ArtworkAssetsResponse {
@@ -122,12 +122,14 @@ pub async fn get_catalog_entity_artwork(
 )]
 pub async fn get_artwork_image(
     State(state): State<AppState>,
-    AuthenticatedUser(_account): AuthenticatedUser,
+    AuthenticatedUser(account): AuthenticatedUser,
     Path(artwork_asset_id): Path<Uuid>,
     Query(query): Query<ArtworkImageQuery>,
 ) -> Result<Response, ApiError> {
     let resize = validate_resize_request(&query)?;
-    let artwork = state.visible_artwork_asset(artwork_asset_id).await?;
+    let artwork = state
+        .visible_artwork_asset(account.id, artwork_asset_id)
+        .await?;
     let path = resolve_artwork_file(&state, &artwork)?;
     let file = File::open(&path).await.map_err(map_artwork_file_error)?;
     let metadata = file.metadata().await.map_err(map_artwork_file_error)?;
@@ -271,8 +273,9 @@ fn parse_artwork_entity_type(value: &str) -> Result<CatalogEntityType, ApiError>
         "track" | "tracks" => Ok(CatalogEntityType::Track),
         "podcast" | "podcasts" => Ok(CatalogEntityType::Podcast),
         "episode" | "episodes" => Ok(CatalogEntityType::Episode),
+        "playlist" | "playlists" => Ok(CatalogEntityType::Playlist),
         _ => Err(ApiError::BadRequest(format!(
-            "unknown artwork entity type: {value}; expected artist, band, album, track, podcast, or episode"
+            "unknown artwork entity type: {value}; expected artist, band, album, track, podcast, episode, or playlist"
         ))),
     }
 }
