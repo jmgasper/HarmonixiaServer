@@ -40,11 +40,14 @@ pub async fn stream_events(
     AuthenticatedUser(account): AuthenticatedUser,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let account_id = account.id;
+    let stream_epoch = state.event_stream_epoch();
     let stream = BroadcastStream::new(state.subscribe_events()).filter_map(move |message| {
         let event = match message {
             Ok(event) if event.visible_to(account_id) => Some(sse_event(event)),
             Ok(_) => None,
-            Err(BroadcastStreamRecvError::Lagged(_skipped)) => Some(sse_event(lagged_event())),
+            Err(BroadcastStreamRecvError::Lagged(_skipped)) => {
+                Some(sse_event(lagged_event(stream_epoch)))
+            }
         };
         event.map(Ok::<Event, Infallible>)
     });
@@ -58,16 +61,18 @@ pub async fn stream_events(
 
 fn sse_event(event: AppEvent) -> Event {
     let event_name = event.event.clone();
-    let event_id = event.sequence.to_string();
+    let stream_epoch = event.stream_epoch;
+    let event_id = format!("{stream_epoch}:{}", event.sequence);
     let data = serde_json::to_string(&event).unwrap_or_else(|_| {
-        serde_json::to_string(&lagged_event()).unwrap_or_else(|_| "{}".to_string())
+        serde_json::to_string(&lagged_event(stream_epoch)).unwrap_or_else(|_| "{}".to_string())
     });
     Event::default().event(event_name).id(event_id).data(data)
 }
 
-fn lagged_event() -> AppEvent {
+fn lagged_event(stream_epoch: Uuid) -> AppEvent {
     let timestamp = Utc::now();
     AppEvent {
+        stream_epoch,
         sequence: 0,
         surface: ScreenSurface::Recovery,
         revision: 0,

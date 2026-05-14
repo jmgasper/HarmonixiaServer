@@ -1136,7 +1136,7 @@ payload:
 }
 ```
 
-`audience.type` is `all` for generic library invalidations and shared-playlist
+`audience.type` is `all` for catalog recovery signals and shared-playlist
 updates, or `account` for personal playlist and playback updates. The server
 filters delivery before writing to the stream, so one account does not receive
 another account's personal playlist or playback events.

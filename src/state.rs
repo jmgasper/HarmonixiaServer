@@ -183,9 +183,11 @@ pub struct AdminDashboardActiveImportJob {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 /// Represents one screen patch delivered to connected clients.
 ///
-/// Functionality: Carries legacy invalidation metadata plus a stable screen
-/// patch envelope for Home, playlist, or playback surfaces.
+/// Functionality: Carries the stable flat live-event envelope with typed direct
+/// screen patches for Home, playlist, playback, catalog recovery, or stream
+/// recovery surfaces.
 pub struct AppEvent {
+    pub stream_epoch: Uuid,
     pub sequence: u64,
     pub surface: ScreenSurface,
     pub revision: u64,
@@ -483,6 +485,7 @@ pub struct AppState {
 struct AppStateInner {
     config: ServerConfig,
     system_config: RwLock<SystemConfig>,
+    event_stream_epoch: Uuid,
     event_sequence: AtomicU64,
     event_tx: broadcast::Sender<AppEvent>,
     sonos_snapshot: RwLock<SonosSnapshot>,
@@ -559,6 +562,7 @@ impl AppState {
                 ),
                 hls_generation_coordinator: HlsGenerationCoordinator::new(),
                 system_config: RwLock::new(system_config),
+                event_stream_epoch: Uuid::new_v4(),
                 event_sequence: AtomicU64::new(0),
                 event_tx,
                 sonos_snapshot: RwLock::new(SonosSnapshot::empty()),
@@ -602,6 +606,11 @@ impl AppState {
         self.inner.event_tx.subscribe()
     }
 
+    /// Returns the boot-unique live event stream epoch.
+    pub fn event_stream_epoch(&self) -> Uuid {
+        self.inner.event_stream_epoch
+    }
+
     /// Returns the latest published screen revision.
     pub fn current_revision(&self) -> u64 {
         self.inner.event_sequence.load(Ordering::Relaxed)
@@ -641,6 +650,7 @@ impl AppState {
         let sequence = self.inner.event_sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let timestamp = Utc::now();
         let event = AppEvent {
+            stream_epoch: self.inner.event_stream_epoch,
             sequence,
             surface,
             revision: sequence,
