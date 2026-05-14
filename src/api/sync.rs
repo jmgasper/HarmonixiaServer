@@ -142,12 +142,22 @@ pub async fn playlist_sync_snapshot(
     AuthenticatedUser(account): AuthenticatedUser,
     Path(playlist_id): Path<Uuid>,
 ) -> Result<Json<PlaylistSyncSnapshot>, ApiError> {
-    let playlist = state.visible_playlist(account.id, playlist_id).await?;
+    Ok(Json(
+        playlist_sync_snapshot_for_account(&state, account.id, playlist_id).await?,
+    ))
+}
+
+pub async fn playlist_sync_snapshot_for_account(
+    state: &AppState,
+    account_id: Uuid,
+    playlist_id: Uuid,
+) -> Result<PlaylistSyncSnapshot, ApiError> {
+    let playlist = state.visible_playlist(account_id, playlist_id).await?;
     let items = state
-        .list_visible_playlist_items(account.id, playlist_id)
+        .list_visible_playlist_items(account_id, playlist_id)
         .await?;
     let artwork = state
-        .visible_artwork_assets(account.id, CatalogEntityType::Playlist, playlist.id, None)
+        .visible_artwork_assets(account_id, CatalogEntityType::Playlist, playlist.id, None)
         .await?;
 
     let mut entries = Vec::with_capacity(items.len());
@@ -174,13 +184,13 @@ pub async fn playlist_sync_snapshot(
         });
     }
 
-    Ok(Json(PlaylistSyncSnapshot {
+    Ok(PlaylistSyncSnapshot {
         revision: playlist_revision(&playlist),
         playlist,
         items: entries,
         artwork: artwork.iter().map(artwork_asset_response).collect(),
         snapshot_at: Utc::now(),
-    }))
+    })
 }
 
 fn album_revision(album: &Album, tracks: &[Track]) -> String {

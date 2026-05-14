@@ -5,6 +5,7 @@ use axum::{
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{Duration as ChronoDuration, Utc};
 use harmonixia_server::{
+    api::home::HomeSectionId,
     domain::{
         AacTranscodeProfile, AccountRole, AlbumKind, ArtworkAssetDraft, ArtworkKind,
         CatalogEntityType, CatalogGrouping, CatalogImportDecision, CatalogImportRequest,
@@ -15,13 +16,15 @@ use harmonixia_server::{
     },
     pipeline::ImportWorkRequest,
     providers::{ProviderCredential, ProviderRegistry},
-    router, AppState, ServerConfig,
     services::{
         BackgroundServiceConfig, BackgroundServices, DropboxWatcherConfig, ImportWorkerConfig,
     },
     sonos::{SonosGroupSnapshot, SonosLiveState, SonosSnapshot, SonosSpeakerSnapshot},
-    state::{ProviderConfig, ServerConfigError, SonosMediaAuthorizationRequest},
+    state::{
+        AppEvent, ProviderConfig, ScreenPatch, ServerConfigError, SonosMediaAuthorizationRequest,
+    },
     storage::{DatabaseConfig, StorageError},
+    router, AppState, ServerConfig,
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -40,7 +43,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::Notify,
+    sync::{broadcast, Notify},
     task::JoinHandle,
 };
 use tower::ServiceExt;
@@ -633,6 +636,38 @@ async fn assert_no_sse_event(body: &mut Body) {
             .is_err(),
         "SSE stream unexpectedly yielded an event"
     );
+}
+
+async fn next_continue_listening_home_patch(
+    events: &mut broadcast::Receiver<AppEvent>,
+    track_id: Uuid,
+) -> (u64, u32) {
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("event stream should emit a Home patch")
+            .expect("event stream should stay open");
+        if event.event != "playback_progress_updated" {
+            continue;
+        }
+        let ScreenPatch::HomeSectionsReplaced(patch) = &event.patch else {
+            continue;
+        };
+        let Some(section) = patch
+            .sections
+            .iter()
+            .find(|section| section.id == HomeSectionId::ContinueListening)
+        else {
+            continue;
+        };
+        let Some(card) = section.items.iter().find(|card| card.item_id == track_id) else {
+            continue;
+        };
+        let Some(progress) = &card.progress else {
+            continue;
+        };
+        return (event.sequence, progress.position_seconds);
+    }
 }
 
 async fn configure_public_base_url(
@@ -2608,30 +2643,44 @@ async fn events_stream_filters_account_scoped_events_and_emits_screen_patch_enve
         )
         .await
         .unwrap();
-    let personal_home_event = next_sse_json(&mut admin_body).await;
-    assert_eq!(personal_home_event["event"], "playlist_added");
-    assert_eq!(personal_home_event["resource"], "playlist");
-    assert_eq!(personal_home_event["action"], "added");
-    assert_eq!(personal_home_event["entity_id"], json!(personal.id));
-    assert_eq!(personal_home_event["audience"]["type"], "account");
-    assert_eq!(personal_home_event["audience"]["account_id"], json!(admin.id));
-    assert_eq!(personal_home_event["surface"], "home");
-    assert!(personal_home_event["revision"].as_u64().unwrap() > 0);
-    assert!(personal_home_event["snapshot_at"].as_str().is_some());
-    assert_eq!(personal_home_event["patch"]["type"], "home_refresh");
-    assert_eq!(personal_home_event["patch"]["action"], "refresh");
-    assert_eq!(personal_home_event["patch"]["reason"], "playlist_changed");
-
-    let personal_playlist_event = next_sse_json(&mut admin_body).await;
-    assert_eq!(personal_playlist_event["event"], "playlist_added");
-    assert_eq!(personal_playlist_event["entity_id"], json!(personal.id));
-    assert_eq!(personal_playlist_event["surface"], "playlist");
+    let personal_playlist_list_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(personal_playlist_list_event["event"], "playlist_added");
+    assert_eq!(personal_playlist_list_event["resource"], "playlist");
+    assert_eq!(personal_playlist_list_event["action"], "added");
+    assert_eq!(personal_playlist_list_event["entity_id"], json!(personal.id));
+    assert_eq!(personal_playlist_list_event["audience"]["type"], "account");
     assert_eq!(
-        personal_playlist_event["patch"]["type"],
-        "playlist_changed"
+        personal_playlist_list_event["audience"]["account_id"],
+        json!(admin.id)
     );
-    assert_eq!(personal_playlist_event["patch"]["playlist_id"], json!(personal.id));
-    assert_eq!(personal_playlist_event["patch"]["scope"], "personal");
+    assert_eq!(personal_playlist_list_event["surface"], "playlist_list");
+    assert!(personal_playlist_list_event["revision"].as_u64().unwrap() > 0);
+    assert!(personal_playlist_list_event["snapshot_at"].as_str().is_some());
+    assert_eq!(
+        personal_playlist_list_event["patch"]["type"],
+        "playlist_list_upserted"
+    );
+    assert_eq!(
+        personal_playlist_list_event["patch"]["playlist_id"],
+        json!(personal.id)
+    );
+    assert_eq!(
+        personal_playlist_list_event["patch"]["playlist"]["scope"],
+        "personal"
+    );
+
+    let personal_playlist_detail_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(personal_playlist_detail_event["event"], "playlist_added");
+    assert_eq!(personal_playlist_detail_event["entity_id"], json!(personal.id));
+    assert_eq!(personal_playlist_detail_event["surface"], "playlist_detail");
+    assert_eq!(
+        personal_playlist_detail_event["patch"]["type"],
+        "playlist_detail_replaced"
+    );
+    assert_eq!(
+        personal_playlist_detail_event["patch"]["playlist_id"],
+        json!(personal.id)
+    );
     assert_no_sse_event(&mut user_body).await;
 
     state
@@ -2650,8 +2699,17 @@ async fn events_stream_filters_account_scoped_events_and_emits_screen_patch_enve
     let progress_home_event = next_sse_json(&mut admin_body).await;
     assert_eq!(progress_home_event["surface"], "home");
     assert_eq!(
-        progress_home_event["patch"]["reason"],
-        "playback_progress_changed"
+        progress_home_event["patch"]["type"],
+        "home_sections_replaced"
+    );
+    assert_eq!(progress_home_event["patch"]["sections"][0]["id"], "continue_listening");
+    assert_eq!(
+        progress_home_event["patch"]["sections"][0]["items"][0]["item_id"],
+        json!(track_id)
+    );
+    assert_eq!(
+        progress_home_event["patch"]["sections"][0]["items"][0]["progress"]["position_seconds"],
+        12
     );
     let progress_event = next_sse_json(&mut admin_body).await;
     assert_eq!(progress_event["event"], "playback_progress_updated");
@@ -2669,19 +2727,111 @@ async fn events_stream_filters_account_scoped_events_and_emits_screen_patch_enve
         .create_playlist(admin.id, "Shared Event Playlist", None, PlaylistScope::Shared)
         .await
         .unwrap();
-    let shared_home_event = next_sse_json(&mut user_body).await;
-    assert_eq!(shared_home_event["event"], "playlist_added");
-    assert_eq!(shared_home_event["entity_id"], json!(shared.id));
-    assert_eq!(shared_home_event["audience"]["type"], "all");
-    assert_eq!(shared_home_event["surface"], "home");
-    assert_eq!(shared_home_event["patch"]["type"], "home_refresh");
-    let shared_playlist_event = next_sse_json(&mut user_body).await;
-    assert_eq!(shared_playlist_event["event"], "playlist_added");
-    assert_eq!(shared_playlist_event["entity_id"], json!(shared.id));
-    assert_eq!(shared_playlist_event["audience"]["type"], "all");
-    assert_eq!(shared_playlist_event["surface"], "playlist");
-    assert_eq!(shared_playlist_event["patch"]["playlist_id"], json!(shared.id));
-    assert_eq!(shared_playlist_event["patch"]["scope"], "shared");
+    let shared_playlist_list_event = next_sse_json(&mut user_body).await;
+    assert_eq!(shared_playlist_list_event["event"], "playlist_added");
+    assert_eq!(shared_playlist_list_event["entity_id"], json!(shared.id));
+    assert_eq!(shared_playlist_list_event["audience"]["type"], "all");
+    assert_eq!(shared_playlist_list_event["surface"], "playlist_list");
+    assert_eq!(
+        shared_playlist_list_event["patch"]["type"],
+        "playlist_list_upserted"
+    );
+    assert_eq!(
+        shared_playlist_list_event["patch"]["playlist_id"],
+        json!(shared.id)
+    );
+    assert_eq!(
+        shared_playlist_list_event["patch"]["playlist"]["scope"],
+        "shared"
+    );
+    let shared_playlist_detail_event = next_sse_json(&mut user_body).await;
+    assert_eq!(shared_playlist_detail_event["event"], "playlist_added");
+    assert_eq!(shared_playlist_detail_event["entity_id"], json!(shared.id));
+    assert_eq!(shared_playlist_detail_event["audience"]["type"], "all");
+    assert_eq!(shared_playlist_detail_event["surface"], "playlist_detail");
+    assert_eq!(
+        shared_playlist_detail_event["patch"]["type"],
+        "playlist_detail_replaced"
+    );
+    assert_eq!(
+        shared_playlist_detail_event["patch"]["playlist_id"],
+        json!(shared.id)
+    );
+}
+
+#[tokio::test]
+/// Verifies that rapid playback writes publish Home patches in sequence order.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns a future that resolves to `()` after the operation completes.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+async fn rapid_playback_progress_home_patches_are_monotonic() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let imported = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/rapid-progress.flac",
+            "rapid-progress-hash",
+            "Rapid Progress Artist",
+            "Rapid Progress Album",
+            "Rapid Progress Track",
+            Some(1),
+        ))
+        .await
+        .unwrap();
+    let track_id = imported.track.as_ref().unwrap().id;
+    let account = state
+        .authenticate_local_account(USER_USERNAME, USER_PASSWORD)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut events = state.subscribe_events();
+
+    state
+        .upsert_playback_progress(
+            account.id,
+            PlaybackItemType::Track,
+            track_id,
+            None,
+            None,
+            10,
+            Some(180),
+            false,
+        )
+        .await
+        .unwrap();
+    state
+        .upsert_playback_progress(
+            account.id,
+            PlaybackItemType::Track,
+            track_id,
+            None,
+            None,
+            20,
+            Some(180),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let (first_sequence, first_position) =
+        next_continue_listening_home_patch(&mut events, track_id).await;
+    let (second_sequence, second_position) =
+        next_continue_listening_home_patch(&mut events, track_id).await;
+
+    assert!(
+        first_sequence < second_sequence,
+        "Home patch sequence should increase across rapid playback writes"
+    );
+    assert_eq!(first_position, 10);
+    assert_eq!(second_position, 20);
 }
 
 #[tokio::test]

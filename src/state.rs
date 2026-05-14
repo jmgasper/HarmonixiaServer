@@ -19,6 +19,10 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
+    api::{
+        home::{self, HomeSection, HomeSectionId},
+        sync::{self, PlaylistSyncSnapshot},
+    },
     auth::{hash_password, verify_password},
     catalog::{
         normalize_browse_limit, normalize_search_limit, parse_album_browse_sort,
@@ -232,30 +236,54 @@ fn playlist_event_audience(playlist: &Playlist) -> AppEventAudience {
 #[serde(rename_all = "snake_case")]
 pub enum ScreenSurface {
     Home,
-    Playlist,
+    PlaylistList,
+    PlaylistDetail,
     Playback,
+    Catalog,
+    Recovery,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScreenPatch {
-    HomeRefresh(HomeScreenPatch),
-    PlaylistChanged(PlaylistScreenPatch),
+    HomeSectionsReplaced(HomeSectionsPatch),
+    PlaylistListUpserted(PlaylistListUpsertPatch),
+    PlaylistListRemoved(PlaylistListRemovePatch),
+    PlaylistDetailReplaced(PlaylistDetailReplacePatch),
+    PlaylistDetailRemoved(PlaylistDetailRemovePatch),
     PlaybackProgressUpdated(PlaybackProgressScreenPatch),
     PlaybackHistoryUpdated(PlaybackHistoryScreenPatch),
+    RecoveryRequested(RecoveryScreenPatch),
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct HomeScreenPatch {
-    pub action: String,
+pub struct HomeSectionsPatch {
     pub account_id: Option<Uuid>,
-    pub reason: String,
+    pub sections: Vec<HomeSection>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct PlaylistScreenPatch {
+pub struct PlaylistListUpsertPatch {
     pub playlist_id: Uuid,
-    pub action: String,
+    pub playlist: Playlist,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlaylistListRemovePatch {
+    pub playlist_id: Uuid,
+    pub scope: PlaylistScope,
+    pub owner_account_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlaylistDetailReplacePatch {
+    pub playlist_id: Uuid,
+    pub snapshot: PlaylistSyncSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlaylistDetailRemovePatch {
+    pub playlist_id: Uuid,
     pub scope: PlaylistScope,
     pub owner_account_id: Option<Uuid>,
 }
@@ -276,6 +304,11 @@ pub struct PlaybackHistoryScreenPatch {
     pub item_type: PlaybackItemType,
     pub item_id: Uuid,
     pub history_event: PlaybackHistoryEvent,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RecoveryScreenPatch {
+    pub reason: String,
 }
 
 #[derive(Debug, Error)]
@@ -588,10 +621,8 @@ impl AppState {
             action,
             entity_id,
             AppEventAudience::All,
-            ScreenSurface::Home,
-            ScreenPatch::HomeRefresh(HomeScreenPatch {
-                action: "refresh".to_string(),
-                account_id: None,
+            ScreenSurface::Recovery,
+            ScreenPatch::RecoveryRequested(RecoveryScreenPatch {
                 reason: format!("{resource}_{action}"),
             }),
         );
@@ -625,70 +656,212 @@ impl AppState {
         let _ = self.inner.event_tx.send(event);
     }
 
-    /// Publishes a catalog/library invalidation event for connected clients.
-    pub fn publish_library_updated(&self) {
-        self.publish_event("library_updated", "library", "updated", None);
+    /// Publishes catalog-derived Home section replacements for connected clients.
+    pub async fn publish_library_updated(&self) {
+        match self.user_accounts().await {
+            Ok(accounts) => {
+                for account in accounts.into_iter().filter(|account| !account.disabled) {
+                    self.publish_home_sections_updated(
+                        account.id,
+                        &[
+                            HomeSectionId::NewReleases,
+                            HomeSectionId::LatestPodcasts,
+                        ],
+                        "library_updated",
+                        "library",
+                        "updated",
+                        None,
+                    )
+                    .await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to project library Home patches; publishing recovery marker");
+                self.publish_event("library_updated", "library", "updated", None);
+            }
+        }
+        self.publish_screen_event(
+            "library_updated",
+            "library",
+            "updated",
+            None,
+            AppEventAudience::All,
+            ScreenSurface::Catalog,
+            ScreenPatch::RecoveryRequested(RecoveryScreenPatch {
+                reason: "catalog_changed".to_string(),
+            }),
+        );
     }
 
-    fn publish_playlist_event(&self, event: &str, action: &str, playlist: &Playlist) {
+    async fn publish_playlist_event(&self, event: &str, action: &str, playlist: &Playlist) {
         let audience = playlist_event_audience(playlist);
-        let home_account_id = match playlist.scope {
-            PlaylistScope::Personal => playlist.owner_account_id,
-            PlaylistScope::Shared => None,
-        };
-        self.publish_screen_event(
-            event,
-            "playlist",
-            action,
-            Some(playlist.id),
-            audience.clone(),
-            ScreenSurface::Home,
-            ScreenPatch::HomeRefresh(HomeScreenPatch {
-                action: "refresh".to_string(),
-                account_id: home_account_id,
-                reason: "playlist_changed".to_string(),
-            }),
-        );
-        self.publish_screen_event(
-            event,
-            "playlist",
-            action,
-            Some(playlist.id),
-            audience,
-            ScreenSurface::Playlist,
-            ScreenPatch::PlaylistChanged(PlaylistScreenPatch {
-                playlist_id: playlist.id,
-                action: action.to_string(),
-                scope: playlist.scope,
-                owner_account_id: playlist.owner_account_id,
-            }),
-        );
+        match action {
+            "deleted" => {
+                self.publish_screen_event(
+                    event,
+                    "playlist",
+                    action,
+                    Some(playlist.id),
+                    audience.clone(),
+                    ScreenSurface::PlaylistList,
+                    ScreenPatch::PlaylistListRemoved(PlaylistListRemovePatch {
+                        playlist_id: playlist.id,
+                        scope: playlist.scope,
+                        owner_account_id: playlist.owner_account_id,
+                    }),
+                );
+                self.publish_screen_event(
+                    event,
+                    "playlist",
+                    action,
+                    Some(playlist.id),
+                    audience,
+                    ScreenSurface::PlaylistDetail,
+                    ScreenPatch::PlaylistDetailRemoved(PlaylistDetailRemovePatch {
+                        playlist_id: playlist.id,
+                        scope: playlist.scope,
+                        owner_account_id: playlist.owner_account_id,
+                    }),
+                );
+            }
+            _ => {
+                self.publish_screen_event(
+                    event,
+                    "playlist",
+                    action,
+                    Some(playlist.id),
+                    audience.clone(),
+                    ScreenSurface::PlaylistList,
+                    ScreenPatch::PlaylistListUpserted(PlaylistListUpsertPatch {
+                        playlist_id: playlist.id,
+                        playlist: playlist.clone(),
+                    }),
+                );
+                self.publish_playlist_detail_replaced(event, action, audience, playlist.id)
+                    .await;
+            }
+        }
     }
 
     async fn publish_playlist_items_updated(&self, account_id: Uuid, playlist_id: Uuid) {
         if let Ok(playlist) = self.visible_playlist(account_id, playlist_id).await {
-            self.publish_playlist_event("playlist_items_updated", "items_updated", &playlist);
+            let audience = playlist_event_audience(&playlist);
+            self.publish_screen_event(
+                "playlist_items_updated",
+                "playlist",
+                "items_updated",
+                Some(playlist.id),
+                audience.clone(),
+                ScreenSurface::PlaylistList,
+                ScreenPatch::PlaylistListUpserted(PlaylistListUpsertPatch {
+                    playlist_id: playlist.id,
+                    playlist: playlist.clone(),
+                }),
+            );
+            self.publish_playlist_detail_replaced(
+                "playlist_items_updated",
+                "items_updated",
+                audience,
+                playlist.id,
+            )
+            .await;
         }
     }
 
-    fn publish_playback_progress_updated(
+    async fn publish_playlist_detail_replaced(
+        &self,
+        event: &str,
+        action: &str,
+        audience: AppEventAudience,
+        playlist_id: Uuid,
+    ) {
+        let account_id = match audience {
+            AppEventAudience::Account { account_id } => account_id,
+            AppEventAudience::All => Uuid::nil(),
+        };
+        match sync::playlist_sync_snapshot_for_account(self, account_id, playlist_id).await {
+            Ok(snapshot) => self.publish_screen_event(
+                event,
+                "playlist",
+                action,
+                Some(playlist_id),
+                audience,
+                ScreenSurface::PlaylistDetail,
+                ScreenPatch::PlaylistDetailReplaced(PlaylistDetailReplacePatch {
+                    playlist_id,
+                    snapshot,
+                }),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, %playlist_id, "failed to project playlist detail patch; publishing recovery marker");
+                self.publish_screen_event(
+                    event,
+                    "playlist",
+                    action,
+                    Some(playlist_id),
+                    audience,
+                    ScreenSurface::PlaylistDetail,
+                    ScreenPatch::RecoveryRequested(RecoveryScreenPatch {
+                        reason: "playlist_detail_projection_failed".to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    async fn publish_home_sections_updated(
+        &self,
+        account_id: Uuid,
+        section_ids: &[HomeSectionId],
+        event: &str,
+        resource: &str,
+        action: &str,
+        entity_id: Option<Uuid>,
+    ) {
+        match home::home_sections(self, account_id, Some(section_ids)).await {
+            Ok(sections) => self.publish_screen_event(
+                event,
+                resource,
+                action,
+                entity_id,
+                AppEventAudience::Account { account_id },
+                ScreenSurface::Home,
+                ScreenPatch::HomeSectionsReplaced(HomeSectionsPatch {
+                    account_id: Some(account_id),
+                    sections,
+                }),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, %account_id, "failed to project Home patch; publishing recovery marker");
+                self.publish_screen_event(
+                    event,
+                    resource,
+                    action,
+                    entity_id,
+                    AppEventAudience::Account { account_id },
+                    ScreenSurface::Home,
+                    ScreenPatch::RecoveryRequested(RecoveryScreenPatch {
+                        reason: "home_projection_failed".to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    async fn publish_playback_progress_updated(
         &self,
         account_id: Uuid,
         progress: PlaybackProgress,
     ) {
-        self.publish_screen_event(
+        self.publish_home_sections_updated(
+            account_id,
+            &[HomeSectionId::ContinueListening],
             "playback_progress_updated",
             "playback_progress",
             "updated",
             Some(progress.item_id),
-            AppEventAudience::Account { account_id },
-            ScreenSurface::Home,
-            ScreenPatch::HomeRefresh(HomeScreenPatch {
-                action: "refresh".to_string(),
-                account_id: Some(account_id),
-                reason: "playback_progress_changed".to_string(),
-            }),
-        );
+        )
+        .await;
         self.publish_screen_event(
             "playback_progress_updated",
             "playback_progress",
@@ -706,24 +879,20 @@ impl AppState {
         );
     }
 
-    fn publish_playback_history_updated(
+    async fn publish_playback_history_updated(
         &self,
         account_id: Uuid,
         history_event: PlaybackHistoryEvent,
     ) {
-        self.publish_screen_event(
+        self.publish_home_sections_updated(
+            account_id,
+            &[HomeSectionId::RecentlyPlayed],
             "playback_history_updated",
             "playback_history",
             "updated",
             Some(history_event.item_id),
-            AppEventAudience::Account { account_id },
-            ScreenSurface::Home,
-            ScreenPatch::HomeRefresh(HomeScreenPatch {
-                action: "refresh".to_string(),
-                account_id: Some(account_id),
-                reason: "playback_history_changed".to_string(),
-            }),
-        );
+        )
+        .await;
         self.publish_screen_event(
             "playback_history_updated",
             "playback_history",
@@ -1450,7 +1619,7 @@ impl AppState {
             .create_playlist(account_id, &name, description.as_deref(), scope)
             .await
             .map_err(api_storage_error)?;
-        self.publish_playlist_event("playlist_added", "added", &playlist);
+        self.publish_playlist_event("playlist_added", "added", &playlist).await;
         Ok(playlist)
     }
 
@@ -1532,7 +1701,7 @@ impl AppState {
             .await
             .map_err(api_storage_error)?
             .ok_or_else(|| ApiError::NotFound(format!("playlist {playlist_id} was not found")))?;
-        self.publish_playlist_event("playlist_updated", "updated", &playlist);
+        self.publish_playlist_event("playlist_updated", "updated", &playlist).await;
         Ok(playlist)
     }
 
@@ -1560,7 +1729,7 @@ impl AppState {
             .await
             .map_err(api_storage_error)?
             .ok_or_else(|| ApiError::NotFound(format!("playlist {playlist_id} was not found")))?;
-        self.publish_playlist_event("playlist_deleted", "deleted", &playlist);
+        self.publish_playlist_event("playlist_deleted", "deleted", &playlist).await;
         Ok(playlist)
     }
 
@@ -2248,7 +2417,8 @@ impl AppState {
             )
             .await
             .map_err(api_storage_error)?;
-        self.publish_playback_progress_updated(account_id, progress.clone());
+        self.publish_playback_progress_updated(account_id, progress.clone())
+            .await;
         Ok(progress)
     }
 
@@ -2374,7 +2544,8 @@ impl AppState {
             )
             .await
             .map_err(api_storage_error)?;
-        self.publish_playback_history_updated(account_id, event.clone());
+        self.publish_playback_history_updated(account_id, event.clone())
+            .await;
         Ok(event)
     }
 
@@ -2598,7 +2769,7 @@ impl AppState {
             .await
             .map_err(api_import_pipeline_error)?;
         if summary.scanned_files > 0 || summary.published_files > 0 {
-            self.publish_library_updated();
+            self.publish_library_updated().await;
         }
         Ok(summary)
     }
@@ -2635,7 +2806,7 @@ impl AppState {
             .await
             .map_err(api_import_pipeline_error)?;
         if summary.scanned_files > 0 || summary.published_files > 0 {
-            self.publish_library_updated();
+            self.publish_library_updated().await;
         }
         Ok(Some(summary))
     }

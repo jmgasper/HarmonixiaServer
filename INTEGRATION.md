@@ -1099,26 +1099,34 @@ For live updates, use the authenticated SSE stream:
 GET /api/v1/events
 ```
 
-Each Server-Sent Event `data` frame is one screen patch envelope. Legacy
-invalidation fields remain available as compatibility metadata, but clients
-should consume `surface`, `revision`, `snapshot_at`, and `patch` directly:
+Each Server-Sent Event `data` frame is one flat screen patch envelope. The SSE
+frame `event:` is the same string as the JSON envelope `event` field
+(`playlist_updated`, `playlist_items_updated`, `playback_progress_updated`, and
+so on). The frame `id:` is the monotonic `sequence`. Clients should consume
+`surface`, `revision`, `snapshot_at`, and `patch` directly; the legacy
+`event`/`resource`/`action` fields are routing metadata, not the happy-path
+payload:
 
 ```json
 {
   "sequence": 42,
-  "surface": "playlist",
+  "surface": "playlist_detail",
   "revision": 42,
   "snapshot_at": "2026-05-09T10:00:00Z",
   "patch": {
-    "type": "playlist_changed",
+    "type": "playlist_detail_replaced",
     "playlist_id": "playlist-uuid",
-    "action": "items_updated",
-    "scope": "personal",
-    "owner_account_id": "account-uuid"
+    "snapshot": {
+      "playlist": {},
+      "items": [],
+      "artwork": [],
+      "revision": "2026-05-09T10:00:00Z",
+      "snapshot_at": "2026-05-09T10:00:00Z"
+    }
   },
-  "event": "playlist_updated",
+  "event": "playlist_items_updated",
   "resource": "playlist",
-  "action": "updated",
+  "action": "items_updated",
   "entity_id": "playlist-uuid",
   "timestamp": "2026-05-09T10:00:00Z",
   "audience": {
@@ -1133,22 +1141,57 @@ updates, or `account` for personal playlist and playback updates. The server
 filters delivery before writing to the stream, so one account does not receive
 another account's personal playlist or playback events.
 
-The `patch` object is typed by `patch.type`. Common patch payloads are:
+The `surface` values emitted for desktop-facing screen patches are:
+
+```text
+home
+playlist_list
+playlist_detail
+playback
+catalog
+recovery
+```
+
+The `patch` object is authoritative for the happy path and is typed by
+`patch.type`. Current direct patch payloads are:
 
 ```json
 [
   {
-    "type": "home_refresh",
-    "action": "refresh",
+    "type": "home_sections_replaced",
     "account_id": "account-uuid",
-    "reason": "playback_history_changed"
+    "sections": [
+      {
+        "id": "recently_played",
+        "title": "Recently played",
+        "position": 1,
+        "items": []
+      }
+    ]
   },
   {
-    "type": "playlist_changed",
+    "type": "playlist_list_upserted",
     "playlist_id": "playlist-uuid",
-    "action": "items_updated",
-    "scope": "personal",
-    "owner_account_id": "account-uuid"
+    "playlist": {}
+  },
+  {
+    "type": "playlist_list_removed",
+    "playlist_id": "playlist-uuid"
+  },
+  {
+    "type": "playlist_detail_replaced",
+    "playlist_id": "playlist-uuid",
+    "snapshot": {
+      "playlist": {},
+      "items": [],
+      "artwork": [],
+      "revision": "2026-05-09T10:00:00Z",
+      "snapshot_at": "2026-05-09T10:00:00Z"
+    }
+  },
+  {
+    "type": "playlist_detail_removed",
+    "playlist_id": "playlist-uuid"
   },
   {
     "type": "playback_history_updated",
@@ -1161,8 +1204,33 @@ The `patch` object is typed by `patch.type`. Common patch payloads are:
 ]
 ```
 
-Clients that do not consume `patch` can still repage the affected resource
-based on `event`, `resource`, `action`, and `entity_id`.
+Home patches replace only the affected `HomeSection` values. Playback progress
+emits a `continue_listening` section replacement; playback history emits a
+`recently_played` section replacement; library/catalog publication emits
+`new_releases` and `latest_podcasts` replacements plus a catalog-only recovery
+marker for catalog browse/detail surfaces. Playlist CRUD and item mutations
+emit list upsert/remove patches plus detail replacement/removal patches and do
+not imply Home refreshes.
+
+When the server detects lag in the broadcast stream it emits a recovery marker
+instead of pretending a Home mutation occurred:
+
+```json
+{
+  "sequence": 0,
+  "surface": "recovery",
+  "revision": 0,
+  "patch": {
+    "type": "recovery_requested",
+    "reason": "stream_lagged"
+  }
+}
+```
+
+Clients must refetch targeted surfaces only for lagged streams, sequence gaps,
+out-of-order or rejected revisions, missing local base snapshots, malformed or
+incomplete patches, or local screen conflicts. A trusted direct patch should be
+applied to local cache and rendered without an HTTP refetch.
 
 ## Admin-Only Endpoints Useful During Setup
 

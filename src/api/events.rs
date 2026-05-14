@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     auth::AuthenticatedUser,
     error::ErrorResponse,
-    state::{AppEvent, AppEventAudience, AppState, HomeScreenPatch, ScreenPatch, ScreenSurface},
+    state::{AppEvent, AppEventAudience, AppState, RecoveryScreenPatch, ScreenPatch, ScreenSurface},
 };
 
 /// Builds the router for authenticated runtime event streaming.
@@ -30,7 +30,7 @@ pub fn router() -> Router<AppState> {
     tag = "events",
     security(("basicAuth" = [])),
     responses(
-        (status = 200, description = "Server-Sent Event stream. Each data frame is one account-scoped screen patch envelope with surface, revision, snapshot_at, and typed patch payload metadata.", content_type = "text/event-stream", body = AppEvent),
+        (status = 200, description = "Server-Sent Event stream. Each data frame is one flat screen patch envelope with surface, revision, snapshot_at, and an authoritative typed patch payload. Lagged streams receive a recovery marker and clients must refetch targeted surfaces.", content_type = "text/event-stream", body = AppEvent),
         (status = 401, description = "Authentication required", body = ErrorResponse)
     )
 )]
@@ -69,12 +69,10 @@ fn lagged_event() -> AppEvent {
     let timestamp = Utc::now();
     AppEvent {
         sequence: 0,
-        surface: ScreenSurface::Home,
+        surface: ScreenSurface::Recovery,
         revision: 0,
         snapshot_at: timestamp,
-        patch: ScreenPatch::HomeRefresh(HomeScreenPatch {
-            action: "refresh".to_string(),
-            account_id: None,
+        patch: ScreenPatch::RecoveryRequested(RecoveryScreenPatch {
             reason: "stream_lagged".to_string(),
         }),
         event: "library_updated".to_string(),

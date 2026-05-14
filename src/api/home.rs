@@ -35,7 +35,7 @@ pub struct HomeSection {
     pub items: Vec<HomeCard>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HomeSectionId {
     ContinueListening,
@@ -117,45 +117,97 @@ pub async fn get_home(
     State(state): State<AppState>,
     AuthenticatedUser(account): AuthenticatedUser,
 ) -> Result<Json<HomeResponse>, ApiError> {
+    Ok(Json(home_response(&state, account.id).await?))
+}
+
+pub async fn home_response(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<HomeResponse, ApiError> {
     let snapshot_at = Utc::now();
     let revision = state.current_revision();
 
-    let progress = state.playback_progress_for_account(account.id).await?;
-    let history = state.playback_history_for_account(account.id, 20).await?;
-    let albums = state.latest_albums(Some(12)).await?;
-    let latest_podcast_episodes = state.latest_podcast_episodes(Some(12)).await?;
-
-    Ok(Json(HomeResponse {
+    Ok(HomeResponse {
         revision,
         snapshot_at,
-        sections: vec![
-            HomeSection {
-                id: HomeSectionId::ContinueListening,
-                title: "Continue listening".to_string(),
-                position: 0,
-                items: continue_listening_cards(&state, account.id, progress).await?,
-            },
-            HomeSection {
-                id: HomeSectionId::RecentlyPlayed,
-                title: "Recently played".to_string(),
-                position: 1,
-                items: recently_played_cards(&state, account.id, history).await?,
-            },
-            HomeSection {
-                id: HomeSectionId::NewReleases,
-                title: "New releases".to_string(),
-                position: 2,
-                items: album_cards(&state, account.id, albums).await?,
-            },
-            HomeSection {
-                id: HomeSectionId::LatestPodcasts,
-                title: "Latest podcast episodes".to_string(),
-                position: 3,
-                items: latest_podcast_episode_cards(&state, account.id, latest_podcast_episodes)
-                    .await?,
-            },
-        ],
-    }))
+        sections: home_sections(state, account_id, None).await?,
+    })
+}
+
+pub async fn home_sections(
+    state: &AppState,
+    account_id: Uuid,
+    only: Option<&[HomeSectionId]>,
+) -> Result<Vec<HomeSection>, ApiError> {
+    let include = |id: HomeSectionId| only.map(|ids| ids.contains(&id)).unwrap_or(true);
+    let mut sections = Vec::new();
+
+    if include(HomeSectionId::ContinueListening) {
+        sections.push(continue_listening_section(state, account_id).await?);
+    }
+    if include(HomeSectionId::RecentlyPlayed) {
+        sections.push(recently_played_section(state, account_id).await?);
+    }
+    if include(HomeSectionId::NewReleases) {
+        sections.push(new_releases_section(state, account_id).await?);
+    }
+    if include(HomeSectionId::LatestPodcasts) {
+        sections.push(latest_podcasts_section(state, account_id).await?);
+    }
+
+    Ok(sections)
+}
+
+pub async fn continue_listening_section(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<HomeSection, ApiError> {
+    let progress = state.playback_progress_for_account(account_id).await?;
+    Ok(HomeSection {
+        id: HomeSectionId::ContinueListening,
+        title: "Continue listening".to_string(),
+        position: 0,
+        items: continue_listening_cards(state, account_id, progress).await?,
+    })
+}
+
+pub async fn recently_played_section(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<HomeSection, ApiError> {
+    let history = state.playback_history_for_account(account_id, 20).await?;
+    Ok(HomeSection {
+        id: HomeSectionId::RecentlyPlayed,
+        title: "Recently played".to_string(),
+        position: 1,
+        items: recently_played_cards(state, account_id, history).await?,
+    })
+}
+
+pub async fn new_releases_section(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<HomeSection, ApiError> {
+    let albums = state.latest_albums(Some(12)).await?;
+    Ok(HomeSection {
+        id: HomeSectionId::NewReleases,
+        title: "New releases".to_string(),
+        position: 2,
+        items: album_cards(state, account_id, albums).await?,
+    })
+}
+
+pub async fn latest_podcasts_section(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<HomeSection, ApiError> {
+    let latest_podcast_episodes = state.latest_podcast_episodes(Some(12)).await?;
+    Ok(HomeSection {
+        id: HomeSectionId::LatestPodcasts,
+        title: "Latest podcast episodes".to_string(),
+        position: 3,
+        items: latest_podcast_episode_cards(state, account_id, latest_podcast_episodes).await?,
+    })
 }
 
 async fn continue_listening_cards(
