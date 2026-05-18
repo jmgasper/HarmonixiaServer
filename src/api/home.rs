@@ -55,6 +55,7 @@ pub struct HomeCard {
     pub artwork: Option<ScreenArtwork>,
     pub context: Option<ScreenContextHint>,
     pub progress: Option<PlaybackPositionHint>,
+    pub is_favorite: Option<bool>,
     pub played_at: Option<DateTime<Utc>>,
     pub released_at: Option<DateTime<Utc>>,
     pub actions: Vec<ScreenActionHint>,
@@ -139,6 +140,22 @@ pub async fn home_sections(
     account_id: Uuid,
     only: Option<&[HomeSectionId]>,
 ) -> Result<Vec<HomeSection>, ApiError> {
+    if only.is_none() {
+        let (continue_listening, recently_played, new_releases, latest_podcasts) =
+            tokio::try_join!(
+                continue_listening_section(state, account_id),
+                recently_played_section(state, account_id),
+                new_releases_section(state, account_id),
+                latest_podcasts_section(state, account_id),
+            )?;
+        return Ok(vec![
+            continue_listening,
+            recently_played,
+            new_releases,
+            latest_podcasts,
+        ]);
+    }
+
     let include = |id: HomeSectionId| only.map(|ids| ids.contains(&id)).unwrap_or(true);
     let mut sections = Vec::new();
 
@@ -215,11 +232,13 @@ async fn continue_listening_cards(
     account_id: Uuid,
     progress: Vec<PlaybackProgress>,
 ) -> Result<Vec<HomeCard>, ApiError> {
+    let favorite_ids = state.track_favorite_ids_for_account(account_id).await?;
     let mut cards = Vec::new();
     for item in progress.into_iter().filter(|item| !item.completed).take(20) {
         if let Some(card) = playback_card(
             state,
             account_id,
+            &favorite_ids,
             "continue_listening",
             item.item_type,
             item.item_id,
@@ -239,11 +258,13 @@ async fn recently_played_cards(
     account_id: Uuid,
     history: Vec<PlaybackHistoryEvent>,
 ) -> Result<Vec<HomeCard>, ApiError> {
+    let favorite_ids = state.track_favorite_ids_for_account(account_id).await?;
     let mut cards = Vec::new();
     for item in history.into_iter().take(20) {
         if let Some(card) = playback_card(
             state,
             account_id,
+            &favorite_ids,
             "recently_played",
             item.item_type,
             item.item_id,
@@ -301,6 +322,7 @@ async fn latest_podcast_episode_cards(
 async fn playback_card(
     state: &AppState,
     account_id: Uuid,
+    favorite_ids: &std::collections::HashSet<Uuid>,
     section_id: &str,
     item_type: PlaybackItemType,
     item_id: Uuid,
@@ -326,7 +348,15 @@ async fn playback_card(
             };
             Ok(Some(
                 track_home_card(
-                    state, account_id, section_id, track, album, artist, progress, history,
+                    state,
+                    account_id,
+                    section_id,
+                    favorite_ids.contains(&track.id),
+                    track,
+                    album,
+                    artist,
+                    progress,
+                    history,
                 )
                 .await?,
             ))
@@ -357,6 +387,7 @@ async fn track_home_card(
     state: &AppState,
     account_id: Uuid,
     section_id: &str,
+    is_favorite: bool,
     track: Track,
     album: Album,
     artist: Artist,
@@ -385,6 +416,7 @@ async fn track_home_card(
             title: album.title,
         }),
         progress: progress.map(progress_hint),
+        is_favorite: Some(is_favorite),
         played_at: history.map(|event| event.played_at),
         released_at: album.published_at,
         actions: vec![action_hint(
@@ -428,6 +460,7 @@ async fn episode_home_card(
             title: podcast.title,
         }),
         progress: progress.map(progress_hint),
+        is_favorite: None,
         played_at: history.map(|event| event.played_at),
         released_at: episode.published_at,
         actions: vec![
@@ -473,6 +506,7 @@ async fn album_card(
             title: album.title,
         }),
         progress: None,
+        is_favorite: None,
         played_at: None,
         released_at: album.published_at,
         actions: vec![action_hint(
@@ -513,7 +547,7 @@ fn screen_artwork(artwork: ArtworkAsset) -> ScreenArtwork {
     }
 }
 
-fn progress_hint(progress: &PlaybackProgress) -> PlaybackPositionHint {
+pub fn progress_hint(progress: &PlaybackProgress) -> PlaybackPositionHint {
     PlaybackPositionHint {
         position_seconds: progress.position_seconds,
         duration_seconds: progress.duration_seconds,

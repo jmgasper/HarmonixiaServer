@@ -16,6 +16,7 @@ pub mod artwork;
 pub mod catalog;
 pub mod config;
 pub mod events;
+pub mod favorites;
 pub mod home;
 pub mod maintenance;
 pub mod media;
@@ -23,6 +24,7 @@ pub mod openapi;
 pub mod playback;
 pub mod playlists;
 pub mod sonos;
+pub mod startup;
 pub mod sync;
 
 /// Builds the Axum router for top-level API routing.
@@ -57,6 +59,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1/sync", sync::router())
         .nest("/api/v1/sonos", sonos::router())
         .nest("/api/v1/me/home", home::router())
+        .nest("/api/v1/me/favorites/tracks", favorites::router())
+        .nest("/api/v1/startup", startup::router())
         .route(
             "/api/v1/playlists",
             get(playlists::list_playlists).post(playlists::create_playlist),

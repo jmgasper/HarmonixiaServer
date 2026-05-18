@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use axum::{
     extract::{Path, Query, State},
@@ -236,6 +236,7 @@ pub struct DetailTrackItem {
     pub duration_seconds: Option<i32>,
     pub artwork: Option<ScreenArtwork>,
     pub context: ScreenContextHint,
+    pub is_favorite: bool,
     pub actions: Vec<ScreenActionHint>,
 }
 
@@ -295,10 +296,17 @@ pub struct EpisodeResumeResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SearchTrackEntry {
+    #[serde(flatten)]
+    pub track: Track,
+    pub is_favorite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 /// Represents catalog search response in the authenticated catalog search, browse, and episode resume HTTP API.
 ///
 /// Functionality: Carries fields `query`, `normalized_query`, `limit`, `artists`, `albums`, `tracks`, `podcasts`, `episodes`, and 1 more for authenticated catalog search, browse, and episode resume HTTP API.
-/// Dependencies: depends on `String`, `String`, `u32`, `Vec<Artist>`, `Vec<Album>`, `Vec<Track>`, and 3 more and any derives or trait bounds declared on the type.
+/// Dependencies: depends on `String`, `String`, `u32`, `Vec<Artist>`, `Vec<Album>`, `Vec<SearchTrackEntry>`, and 3 more and any derives or trait bounds declared on the type.
 /// Used by: referenced from `src/api/catalog.rs`, `src/api/openapi.rs`, `tests/maintenance_api.rs`.
 pub struct CatalogSearchResponse {
     pub query: String,
@@ -306,7 +314,7 @@ pub struct CatalogSearchResponse {
     pub limit: u32,
     pub artists: Vec<Artist>,
     pub albums: Vec<Album>,
-    pub tracks: Vec<Track>,
+    pub tracks: Vec<SearchTrackEntry>,
     pub podcasts: Vec<Podcast>,
     pub episodes: Vec<Episode>,
     pub playlists: Vec<Playlist>,
@@ -352,6 +360,7 @@ pub async fn search_catalog(
             query.media_type.as_deref(),
         )
         .await?;
+    let favorite_ids = state.track_favorite_ids_for_account(account.id).await?;
 
     Ok(Json(CatalogSearchResponse {
         query: results.query,
@@ -359,7 +368,14 @@ pub async fn search_catalog(
         limit: results.limit,
         artists: results.artists,
         albums: results.albums,
-        tracks: results.tracks,
+        tracks: results
+            .tracks
+            .into_iter()
+            .map(|track| SearchTrackEntry {
+                is_favorite: favorite_ids.contains(&track.id),
+                track,
+            })
+            .collect(),
         podcasts: results.podcasts,
         episodes: results.episodes,
         playlists: results.playlists,
@@ -435,6 +451,7 @@ pub async fn get_artist_detail(
     }
 
     let snapshot_at = Utc::now();
+    let favorite_ids = state.track_favorite_ids_for_account(account.id).await?;
     let primary_artwork = primary_artwork(
         &state,
         account.id,
@@ -443,9 +460,17 @@ pub async fn get_artist_detail(
         ArtworkKind::Artist,
     )
     .await?;
-    let album_groups = artist_album_groups(&state, account.id, &artist, albums).await?;
-    let all_track_items =
-        detail_track_items(&state, account.id, &artist, None, tracks.clone()).await?;
+    let album_groups =
+        artist_album_groups(&state, account.id, &favorite_ids, &artist, albums).await?;
+    let all_track_items = detail_track_items(
+        &state,
+        account.id,
+        &favorite_ids,
+        &artist,
+        None,
+        tracks.clone(),
+    )
+    .await?;
 
     Ok(Json(ArtistDetailResponse {
         revision: state.current_revision(),
@@ -540,6 +565,7 @@ pub async fn get_album_detail(
     let artist = state.visible_artist(album.artist_id).await?;
     let tracks = state.visible_tracks_for_album(album.id).await?;
     let snapshot_at = Utc::now();
+    let favorite_ids = state.track_favorite_ids_for_account(account.id).await?;
     let primary_artwork = primary_artwork(
         &state,
         account.id,
@@ -548,7 +574,9 @@ pub async fn get_album_detail(
         ArtworkKind::Cover,
     )
     .await?;
-    let track_groups = album_track_groups(&state, account.id, &artist, &album, tracks.clone()).await?;
+    let track_groups =
+        album_track_groups(&state, account.id, &favorite_ids, &artist, &album, tracks.clone())
+            .await?;
 
     Ok(Json(AlbumDetailResponse {
         revision: state.current_revision(),
@@ -936,6 +964,7 @@ pub async fn write_episode_resume(
 async fn artist_album_groups(
     state: &AppState,
     account_id: Uuid,
+    favorite_ids: &HashSet<Uuid>,
     artist: &Artist,
     albums: Vec<Album>,
 ) -> Result<Vec<ArtistAlbumGroup>, ApiError> {
@@ -950,8 +979,15 @@ async fn artist_album_groups(
             ArtworkKind::Cover,
         )
         .await?;
-        let track_items =
-            detail_track_items(state, account_id, artist, Some(&album), tracks.clone()).await?;
+        let track_items = detail_track_items(
+            state,
+            account_id,
+            favorite_ids,
+            artist,
+            Some(&album),
+            tracks.clone(),
+        )
+        .await?;
         groups.push(ArtistAlbumGroup {
             id: album.id,
             title: album.title.clone(),
@@ -975,6 +1011,7 @@ async fn artist_album_groups(
 async fn album_track_groups(
     state: &AppState,
     account_id: Uuid,
+    favorite_ids: &HashSet<Uuid>,
     artist: &Artist,
     album: &Album,
     tracks: Vec<Track>,
@@ -999,7 +1036,15 @@ async fn album_track_groups(
                 _ => "Tracks".to_string(),
             },
             disc_number,
-            items: detail_track_items(state, account_id, artist, Some(album), tracks).await?,
+            items: detail_track_items(
+                state,
+                account_id,
+                favorite_ids,
+                artist,
+                Some(album),
+                tracks,
+            )
+            .await?,
         });
     }
     Ok(groups)
@@ -1008,6 +1053,7 @@ async fn album_track_groups(
 async fn detail_track_items(
     state: &AppState,
     account_id: Uuid,
+    favorite_ids: &HashSet<Uuid>,
     artist: &Artist,
     album: Option<&Album>,
     tracks: Vec<Track>,
@@ -1044,6 +1090,7 @@ async fn detail_track_items(
                 entity_id: track_album.id,
                 title: track_album.title,
             },
+            is_favorite: favorite_ids.contains(&track.id),
             actions: vec![action_hint(
                 "play",
                 "GET",

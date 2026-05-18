@@ -44,6 +44,7 @@ pub struct AlbumSyncSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SyncTrackEntry {
     pub track: Track,
+    pub is_favorite: bool,
     pub download_variants: Vec<DownloadVariantEntry>,
 }
 
@@ -69,6 +70,7 @@ pub struct SyncPlaylistItemEntry {
     pub item: PlaylistItem,
     pub track: Option<Track>,
     pub episode: Option<Episode>,
+    pub is_favorite: Option<bool>,
     pub download_variants: Vec<DownloadVariantEntry>,
 }
 
@@ -94,6 +96,7 @@ pub async fn album_sync_snapshot(
     let album = state.visible_album(album_id).await?;
     let artist = state.visible_artist(album.artist_id).await?;
     let tracks = state.visible_tracks_for_album(album.id).await?;
+    let favorite_ids = state.track_favorite_ids_for_account(account.id).await?;
     let artwork = state
         .visible_artwork_assets(account.id, CatalogEntityType::Album, album.id, None)
         .await?;
@@ -104,6 +107,7 @@ pub async fn album_sync_snapshot(
             .visible_original_media_file(PlaybackItemType::Track, track.id)
             .await?;
         entries.push(SyncTrackEntry {
+            is_favorite: favorite_ids.contains(&track.id),
             track: track.clone(),
             download_variants: download_variant_entries(
                 PlaybackItemType::Track,
@@ -156,6 +160,7 @@ pub async fn playlist_sync_snapshot_for_account(
     let items = state
         .list_visible_playlist_items(account_id, playlist_id)
         .await?;
+    let favorite_ids = state.track_favorite_ids_for_account(account_id).await?;
     let artwork = state
         .visible_artwork_assets(account_id, CatalogEntityType::Playlist, playlist.id, None)
         .await?;
@@ -178,6 +183,10 @@ pub async fn playlist_sync_snapshot_for_account(
                 item.item_id,
                 &media_file,
             ),
+            is_favorite: match item.item_type {
+                PlaybackItemType::Track => Some(favorite_ids.contains(&item.item_id)),
+                PlaybackItemType::Episode => None,
+            },
             item,
             track,
             episode,
@@ -324,6 +333,23 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn sync_track_entry_carries_is_favorite() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let album_id = Uuid::new_v4();
+        let artist_id = Uuid::new_v4();
+
+        for expected in [true, false] {
+            let entry = SyncTrackEntry {
+                track: test_track(album_id, artist_id, now),
+                is_favorite: expected,
+                download_variants: Vec::new(),
+            };
+            let value = serde_json::to_value(entry).unwrap();
+            assert_eq!(value["is_favorite"], serde_json::Value::Bool(expected));
+        }
     }
 
     fn test_track(album_id: Uuid, artist_id: Uuid, updated_at: DateTime<Utc>) -> Track {

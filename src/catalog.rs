@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
@@ -13,11 +13,12 @@ use crate::{
     domain::{
         Album, AlbumKind, Artist, ArtworkAsset, ArtworkAssetDraft, ArtworkKind,
         CatalogEntityType, CatalogGrouping, CatalogImportDecision, CatalogImportOutcome,
-        CatalogImportRequest, CatalogSearchProjection, Episode, MediaFile, MediaFileStatus,
-        MediaKind, MediaProbeFacts, MetadataMatchKind, MetadataProviderLink,
+        CatalogImportRequest, CatalogSearchProjection, Episode, FavoriteToggleOutcome,
+        MediaFile, MediaFileStatus, MediaKind, MediaProbeFacts, MetadataMatchKind, MetadataProviderLink,
         MetadataProviderLinkDraft, MetadataProvenance, MetadataProvenanceDraft,
         MusicCatalogGrouping, Podcast, PodcastCatalogGrouping, Playlist, PlaylistScope,
         ProviderKind, QuarantineItem, QuarantineReason, QuarantineStatus, Track,
+        TrackFavorite,
     },
     storage::{
         upsert_playlist_search_projection_in_transaction, PgMaintenanceRepository,
@@ -62,6 +63,12 @@ const TRACK_SELECT: &str = r#"
     published_at,
     created_at,
     updated_at
+"#;
+
+const TRACK_FAVORITE_SELECT: &str = r#"
+    account_id,
+    track_id,
+    favorited_at
 "#;
 
 const PODCAST_SELECT: &str = r#"
@@ -1296,6 +1303,190 @@ impl PgMaintenanceRepository {
         rows.iter().map(track_from_row).collect()
     }
 
+    pub async fn toggle_track_favorite(
+        &self,
+        account_id: Uuid,
+        track_id: Uuid,
+    ) -> Result<FavoriteToggleOutcome, StorageError> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO account_track_favorites (account_id, track_id, favorited_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (account_id, track_id) DO NOTHING
+            RETURNING track_id
+            "#,
+        )
+        .bind(account_id)
+        .bind(track_id)
+        .bind(Utc::now())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if row.is_some() {
+            return Ok(FavoriteToggleOutcome::Added);
+        }
+
+        sqlx::query(
+            r#"
+            DELETE FROM account_track_favorites
+            WHERE account_id = $1
+              AND track_id = $2
+            "#,
+        )
+        .bind(account_id)
+        .bind(track_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(FavoriteToggleOutcome::Removed)
+    }
+
+    pub async fn add_track_favorite(
+        &self,
+        account_id: Uuid,
+        track_id: Uuid,
+    ) -> Result<TrackFavorite, StorageError> {
+        let sql = format!(
+            r#"
+            WITH inserted AS (
+              INSERT INTO account_track_favorites (account_id, track_id, favorited_at)
+              VALUES ($1, $2, $3)
+              ON CONFLICT (account_id, track_id) DO NOTHING
+              RETURNING {TRACK_FAVORITE_SELECT}
+            )
+            SELECT {TRACK_FAVORITE_SELECT}
+            FROM inserted
+            UNION ALL
+            SELECT {TRACK_FAVORITE_SELECT}
+            FROM account_track_favorites
+            WHERE account_id = $1
+              AND track_id = $2
+              AND NOT EXISTS (SELECT 1 FROM inserted)
+            LIMIT 1
+            "#
+        );
+        let row = sqlx::query(&sql)
+            .bind(account_id)
+            .bind(track_id)
+            .bind(Utc::now())
+            .fetch_one(&self.pool)
+            .await?;
+        track_favorite_from_row(&row)
+    }
+
+    pub async fn remove_track_favorite(
+        &self,
+        account_id: Uuid,
+        track_id: Uuid,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM account_track_favorites
+            WHERE account_id = $1
+              AND track_id = $2
+            "#,
+        )
+        .bind(account_id)
+        .bind(track_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn list_track_favorites(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<TrackFavorite>, StorageError> {
+        let sql = format!(
+            r#"
+            SELECT {TRACK_FAVORITE_SELECT}
+            FROM account_track_favorites
+            WHERE account_id = $1
+            ORDER BY favorited_at DESC, track_id ASC
+            "#
+        );
+        let rows = sqlx::query(&sql).bind(account_id).fetch_all(&self.pool).await?;
+        rows.iter().map(track_favorite_from_row).collect()
+    }
+
+    pub async fn track_favorite_ids_for_account(
+        &self,
+        account_id: Uuid,
+    ) -> Result<HashSet<Uuid>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT track_id
+            FROM account_track_favorites
+            WHERE account_id = $1
+            "#,
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| row.try_get("track_id").map_err(StorageError::from))
+            .collect()
+    }
+
+    pub async fn is_track_favorite(
+        &self,
+        account_id: Uuid,
+        track_id: Uuid,
+    ) -> Result<bool, StorageError> {
+        let row = sqlx::query(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM account_track_favorites
+                WHERE account_id = $1
+                  AND track_id = $2
+            ) AS is_favorite
+            "#,
+        )
+        .bind(account_id)
+        .bind(track_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.try_get("is_favorite")?)
+    }
+
+    pub async fn startup_browse_artists(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<Artist>, CatalogBrowseError> {
+        self.browse_artists(limit, None, CatalogBrowseSort::ArtistName)
+            .await
+            .map(|page| page.items)
+    }
+
+    pub async fn startup_browse_albums(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<Album>, CatalogBrowseError> {
+        self.browse_albums(limit, None, CatalogBrowseSort::AlbumArtistTitle)
+            .await
+            .map(|page| page.items)
+    }
+
+    pub async fn startup_browse_podcasts(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<Podcast>, CatalogBrowseError> {
+        self.browse_podcasts(limit, None, CatalogBrowseSort::PodcastTitle)
+            .await
+            .map(|page| page.items)
+    }
+
+    pub async fn playlists_for_startup_snapshot(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<Playlist>, StorageError> {
+        self.playlists_visible_to(account_id).await
+    }
+
     /// Handles visible original media file for track for catalog persistence, browsing, search, import upsert, and normalization logic.
     ///
     /// Inputs:
@@ -2312,6 +2503,83 @@ impl PgMaintenanceRepository {
             .await?;
 
         row.as_ref().map(podcast_from_row).transpose()
+    }
+
+    pub async fn podcast_detail(
+        &self,
+        podcast_id: Uuid,
+    ) -> Result<Option<(Podcast, Vec<Episode>)>, StorageError> {
+        let podcast_sql = format!(
+            r#"
+            SELECT {PODCAST_SELECT}
+            FROM podcasts p
+            WHERE p.id = $1
+              AND p.published_at IS NOT NULL
+              AND p.stable_grouping
+              AND EXISTS (
+                SELECT 1
+                FROM episodes e
+                JOIN media_files mf ON mf.id = e.canonical_media_file_id
+                  AND mf.episode_id = e.id
+                WHERE e.podcast_id = p.id
+                  AND e.published_at IS NOT NULL
+                  AND e.stable_grouping
+                  AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
+              )
+            LIMIT 1
+            "#
+        );
+        let Some(podcast_row) = sqlx::query(&podcast_sql)
+            .bind(podcast_id)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let podcast = podcast_from_row(&podcast_row)?;
+
+        let episodes_sql = format!(
+            r#"
+            SELECT
+              e.id,
+              e.podcast_id,
+              e.title,
+              e.normalized_title,
+              e.season_number,
+              e.episode_number,
+              e.duration_seconds,
+              e.stable_grouping,
+              e.published_at,
+              e.created_at,
+              e.updated_at
+            FROM episodes e
+            JOIN podcasts p ON p.id = e.podcast_id
+            JOIN media_files mf ON mf.id = e.canonical_media_file_id
+              AND mf.episode_id = e.id
+            WHERE e.podcast_id = $1
+              AND e.published_at IS NOT NULL
+              AND e.stable_grouping
+              AND p.published_at IS NOT NULL
+              AND p.stable_grouping
+              AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
+            ORDER BY
+              e.season_number ASC NULLS LAST,
+              e.episode_number ASC NULLS LAST,
+              e.published_at DESC NULLS LAST,
+              lower(e.title) ASC,
+              e.id ASC
+            "#
+        );
+        let episode_rows = sqlx::query(&episodes_sql)
+            .bind(podcast_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let episodes = episode_rows
+            .iter()
+            .map(episode_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some((podcast, episodes)))
     }
 
     /// Returns a paginated browse view for catalog persistence, browsing, search, import upsert, and normalization logic.
@@ -5861,6 +6129,14 @@ fn track_from_row(row: &PgRow) -> Result<Track, StorageError> {
         published_at: row.try_get("published_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn track_favorite_from_row(row: &PgRow) -> Result<TrackFavorite, StorageError> {
+    Ok(TrackFavorite {
+        account_id: row.try_get("account_id")?,
+        track_id: row.try_get("track_id")?,
+        favorited_at: row.try_get("favorited_at")?,
     })
 }
 

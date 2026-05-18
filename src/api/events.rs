@@ -30,7 +30,7 @@ pub fn router() -> Router<AppState> {
     tag = "events",
     security(("basicAuth" = [])),
     responses(
-        (status = 200, description = "Server-Sent Event stream. Each data frame is one flat screen patch envelope with surface, revision, snapshot_at, and an authoritative typed patch payload. Lagged streams receive a recovery marker and clients must refetch targeted surfaces.", content_type = "text/event-stream", body = AppEvent),
+        (status = 200, description = "Server-Sent Event stream. Each data frame is one flat screen patch envelope with surface, revision, snapshot_at, and an authoritative typed patch payload for account-visible surfaces including Home, Favorites, playback, playlists, and catalog recovery. Lagged streams receive a recovery marker and clients must refetch targeted surfaces.", content_type = "text/event-stream", body = AppEvent),
         (status = 401, description = "Authentication required", body = ErrorResponse)
     )
 )]

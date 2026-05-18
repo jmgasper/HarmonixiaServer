@@ -22,7 +22,7 @@ use crate::{
         BrowseEpisodesResponse, BrowsePodcastsResponse, BrowseTracksResponse,
         CatalogBrowsePageMetadata, CatalogBrowseQuery, CatalogSearchQuery,
         CatalogSearchResponse, DetailTrackItem, EpisodeResponse, EpisodeResumeResponse,
-        PodcastResponse,
+        PodcastResponse, SearchTrackEntry,
     },
     api::config::{
         ProviderSettingUpdateRequest, ProviderSettingsResponse, SystemConfigUpdateRequest,
@@ -39,6 +39,7 @@ use crate::{
         HomeCard, HomeCardItemType, HomeResponse, HomeSection, HomeSectionId,
         PlaybackPositionHint, ScreenActionHint, ScreenArtwork, ScreenContextHint,
     },
+    api::favorites::{FavoriteToggleResponse, FavoriteTrackEntry, FavoritesReadModel},
     api::playback::{
         PlaybackHistoryQuery, PlaybackHistoryResponse, PlaybackHistoryWriteRequest,
         PlaybackProgressResponse, PlaybackProgressWriteRequest, PlaybackProgressWriteResponse,
@@ -52,6 +53,10 @@ use crate::{
         SonosPlayRequest, SonosPlaySourceType, SonosSeekRequest, SonosSessionSummary,
         SonosSpeakerTarget, SonosTargetsResponse,
     },
+    api::startup::{
+        AlbumsBrowseSnapshot, ArtistsBrowseSnapshot, PlaylistListSnapshot,
+        PodcastDetailEpisode, PodcastDetailReadModel, PodcastsBrowseSnapshot,
+    },
     api::sync::{
         AlbumSyncSnapshot, DownloadVariantEntry, PlaylistSyncSnapshot,
         SyncPlaylistItemEntry, SyncTrackEntry,
@@ -61,22 +66,22 @@ use crate::{
         ArtworkKind, AuthenticatedAccount, CatalogEntityType, CatalogGrouping,
         CatalogImportDecision, CatalogImportOutcome, CatalogImportRequest,
         CatalogMutationPolicy, CatalogSearchProjection, Episode, ImportJob,
-        ImportJobKind, ImportJobSource, ImportJobStatus, MaintenanceScope, MediaFile,
-        MediaFileStatus, MediaKind, MediaProbeFacts, MetadataMatchKind,
+        FavoriteToggleOutcome, ImportJobKind, ImportJobSource, ImportJobStatus,
+        MaintenanceScope, MediaFile, MediaFileStatus, MediaKind, MediaProbeFacts, MetadataMatchKind,
         MetadataProviderLink, MetadataProviderLinkDraft, MetadataProvenance,
         MetadataProvenanceDraft, MusicCatalogGrouping, PlaybackContextType,
         PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress, Playlist, PlaylistItem,
         PlaylistScope, Podcast, PodcastCatalogGrouping, ProviderHealth, ProviderKind, ProviderSetting,
         ProviderStatus, QuarantineItem, QuarantineReason, QuarantineStatus, RepairPlan,
         SonosDeliveryKind, SonosSessionStatus, SonosSignedClaim, SonosTransportState,
-        SystemConfig, Track, TranscodeSlotUsage, UserAccount,
+        SystemConfig, Track, TrackFavorite, TranscodeSlotUsage, UserAccount,
     },
     error::{ErrorResponse, ErrorResponseDetails, SonosErrorReason},
     state::{
-        AppEvent, AppEventAudience, HomeSectionsPatch, PlaybackHistoryScreenPatch,
-        PlaybackProgressScreenPatch, PlaylistDetailRemovePatch, PlaylistDetailReplacePatch,
-        PlaylistListRemovePatch, PlaylistListUpsertPatch, RecoveryScreenPatch, ScreenPatch,
-        ScreenSurface,
+        AppEvent, AppEventAudience, FavoritesReplacePatch, HomeSectionsPatch,
+        PlaybackHistoryScreenPatch, PlaybackProgressScreenPatch, PlaylistDetailRemovePatch,
+        PlaylistDetailReplacePatch, PlaylistListRemovePatch, PlaylistListUpsertPatch,
+        RecoveryScreenPatch, ScreenPatch, ScreenSurface,
     },
 };
 
@@ -131,6 +136,15 @@ use crate::{
         crate::api::sync::album_sync_snapshot,
         crate::api::sync::playlist_sync_snapshot,
         crate::api::home::get_home,
+        crate::api::favorites::get_favorites,
+        crate::api::favorites::toggle_track_favorite,
+        crate::api::favorites::add_track_favorite,
+        crate::api::favorites::remove_track_favorite,
+        crate::api::startup::playlist_list_snapshot,
+        crate::api::startup::artists_browse_snapshot,
+        crate::api::startup::albums_browse_snapshot,
+        crate::api::startup::podcasts_browse_snapshot,
+        crate::api::startup::podcast_detail,
         crate::api::events::stream_events,
         crate::api::playlists::list_playlists,
         crate::api::playlists::create_playlist,
@@ -164,6 +178,7 @@ use crate::{
             AccountRole,
             AddPlaylistItemRequest,
             Album,
+            AlbumsBrowseSnapshot,
             AlbumDetailHeader,
             AlbumDetailResponse,
             AlbumDetailSummary,
@@ -172,6 +187,7 @@ use crate::{
             AlbumTrackGroup,
             Artist,
             ArtistAlbumGroup,
+            ArtistsBrowseSnapshot,
             ArtistDetailHeader,
             ArtistDetailLink,
             ArtistDetailResponse,
@@ -215,6 +231,11 @@ use crate::{
             Episode,
             EpisodeResponse,
             EpisodeResumeResponse,
+            FavoriteToggleOutcome,
+            FavoriteToggleResponse,
+            FavoriteTrackEntry,
+            FavoritesReadModel,
+            FavoritesReplacePatch,
             FullRescanRequest,
             HomeCard,
             HomeCardItemType,
@@ -260,6 +281,7 @@ use crate::{
             Playlist,
             PlaylistItem,
             PlaylistItemsResponse,
+            PlaylistListSnapshot,
             PlaylistScope,
             PlaylistSyncSnapshot,
             PlaylistDetailRemovePatch,
@@ -268,8 +290,11 @@ use crate::{
             PlaylistListUpsertPatch,
             PlaylistsResponse,
             Podcast,
+            PodcastDetailEpisode,
+            PodcastDetailReadModel,
             PodcastResponse,
             PodcastCatalogGrouping,
+            PodcastsBrowseSnapshot,
             ProviderHealth,
             ProviderHealthResponse,
             ProviderKind,
@@ -305,11 +330,13 @@ use crate::{
             SubtreeRescanRequest,
             SystemConfig,
             Track,
+            TrackFavorite,
             ScreenActionHint,
             ScreenArtwork,
             ScreenContextHint,
             ScreenPatch,
             ScreenSurface,
+            SearchTrackEntry,
             SyncPlaylistItemEntry,
             SyncTrackEntry,
             TranscodeSlotUsage,
@@ -324,6 +351,8 @@ use crate::{
         (name = "auth", description = "Authenticated account inspection"),
         (name = "catalog", description = "Published catalog browse and grouped search APIs for external clients"),
         (name = "home", description = "Account-scoped Home screen read model with fixed sections and latest podcast episode cards"),
+        (name = "favorites", description = "Account-scoped track favorites with toggle mutations and Favorites screen read model"),
+        (name = "startup", description = "Startup-oriented browse snapshots and podcast detail read model for warm-start cache hydration"),
         (name = "events", description = "Account-scoped Server-Sent Events with typed surface patches"),
         (name = "artwork", description = "Authenticated catalog artwork image delivery"),
         (name = "users", description = "Admin local account management"),
@@ -398,6 +427,7 @@ fn apply_contract_schema_overrides(openapi: &mut utoipa::openapi::OpenApi) {
         require_nullable_property(schemas, schema_name, field_name);
     }
     sonos_playback_response_target_schema(schemas);
+    search_track_entry_schema(schemas);
     nullable_property(schemas, "SystemConfigUpdateRequest", "public_base_url");
     for (schema_name, field_name) in [
         ("ErrorResponse", "details"),
@@ -406,6 +436,28 @@ fn apply_contract_schema_overrides(openapi: &mut utoipa::openapi::OpenApi) {
     ] {
         non_nullable_property(schemas, schema_name, field_name);
     }
+}
+
+fn search_track_entry_schema(
+    schemas: &mut std::collections::BTreeMap<String, RefOr<Schema>>,
+) {
+    let Some(RefOr::T(Schema::Object(mut schema))) = schemas.get("Track").cloned() else {
+        return;
+    };
+
+    schema.title = Some("SearchTrackEntry".to_string());
+    schema.properties.insert(
+        "is_favorite".to_string(),
+        RefOr::T(Schema::Object(Object::with_type(Type::Boolean))),
+    );
+    if !schema.required.iter().any(|field| field == "is_favorite") {
+        schema.required.push("is_favorite".to_string());
+    }
+
+    schemas.insert(
+        "SearchTrackEntry".to_string(),
+        RefOr::T(Schema::Object(schema)),
+    );
 }
 
 fn sonos_playback_response_target_schema(

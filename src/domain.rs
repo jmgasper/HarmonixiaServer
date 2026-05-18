@@ -297,6 +297,20 @@ pub struct PlaybackProgress {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TrackFavorite {
+    pub account_id: Uuid,
+    pub track_id: Uuid,
+    pub favorited_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FavoriteToggleOutcome {
+    Added,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 /// Represents playback history event in the shared domain model used by storage, state, API, pipeline, and provider layers.
 ///
 /// Functionality: Carries fields `id`, `item_type`, `item_id`, `position_seconds`, `duration_seconds`, `completed`, `played_at` for shared domain model used by storage, state, API, pipeline, and provider layers.

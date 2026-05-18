@@ -2631,7 +2631,7 @@ async fn events_stream_filters_account_scoped_events_and_emits_screen_patch_enve
 
     let (admin_status, mut admin_body) = open_sse_stream(app.clone(), TestAuth::Admin).await;
     assert_eq!(admin_status, StatusCode::OK);
-    let (user_status, mut user_body) = open_sse_stream(app, TestAuth::User).await;
+    let (user_status, mut user_body) = open_sse_stream(app.clone(), TestAuth::User).await;
     assert_eq!(user_status, StatusCode::OK);
 
     let personal = state
@@ -2723,6 +2723,130 @@ async fn events_stream_filters_account_scoped_events_and_emits_screen_patch_enve
     assert_eq!(progress_event["patch"]["progress"]["position_seconds"], 12);
     assert_no_sse_event(&mut user_body).await;
 
+    let (favorite_add_status, favorite_add) = request_json(
+        app.clone(),
+        "PUT",
+        &format!("/api/v1/me/favorites/tracks/{track_id}"),
+        json!({}),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(favorite_add_status, StatusCode::CREATED);
+    assert_eq!(favorite_add["track_id"], json!(track_id));
+    assert_eq!(favorite_add["is_favorite"], true);
+
+    let favorite_home_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(favorite_home_event["event"], "track_favorite_updated");
+    assert_eq!(favorite_home_event["resource"], "track_favorite");
+    assert_eq!(favorite_home_event["action"], "added");
+    assert_eq!(favorite_home_event["entity_id"], json!(track_id));
+    assert_eq!(favorite_home_event["audience"]["type"], "account");
+    assert_eq!(favorite_home_event["audience"]["account_id"], json!(admin.id));
+    assert_eq!(favorite_home_event["surface"], "home");
+    assert_eq!(
+        favorite_home_event["patch"]["type"],
+        "home_sections_replaced"
+    );
+    let favorite_home_revision = favorite_home_event["revision"].as_u64().unwrap();
+    assert!(favorite_home_revision > progress_event["revision"].as_u64().unwrap());
+
+    let favorite_screen_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(favorite_screen_event["event"], "track_favorite_updated");
+    assert_eq!(favorite_screen_event["action"], "added");
+    assert_eq!(favorite_screen_event["entity_id"], json!(track_id));
+    assert_eq!(favorite_screen_event["audience"]["type"], "account");
+    assert_eq!(favorite_screen_event["audience"]["account_id"], json!(admin.id));
+    assert_eq!(favorite_screen_event["surface"], "favorites");
+    assert_eq!(favorite_screen_event["patch"]["type"], "favorites_replaced");
+    assert_eq!(favorite_screen_event["patch"]["account_id"], json!(admin.id));
+    assert_eq!(
+        favorite_screen_event["patch"]["tracks"][0]["track"]["id"],
+        json!(track_id)
+    );
+    let favorite_screen_revision = favorite_screen_event["revision"].as_u64().unwrap();
+    assert!(favorite_screen_revision > favorite_home_revision);
+
+    let favorite_catalog_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(favorite_catalog_event["event"], "track_favorite_updated");
+    assert_eq!(favorite_catalog_event["action"], "added");
+    assert_eq!(favorite_catalog_event["entity_id"], json!(track_id));
+    assert_eq!(favorite_catalog_event["audience"]["type"], "account");
+    assert_eq!(favorite_catalog_event["audience"]["account_id"], json!(admin.id));
+    assert_eq!(favorite_catalog_event["surface"], "catalog");
+    assert_eq!(
+        favorite_catalog_event["patch"]["type"],
+        "recovery_requested"
+    );
+    assert_eq!(
+        favorite_catalog_event["patch"]["reason"],
+        "favorite_flags_changed"
+    );
+    let favorite_catalog_revision = favorite_catalog_event["revision"].as_u64().unwrap();
+    assert!(favorite_catalog_revision > favorite_screen_revision);
+    assert_eq!(state.current_revision(), favorite_catalog_revision);
+
+    let (favorites_read_status, favorites_read) =
+        get_json(app.clone(), "/api/v1/me/favorites/tracks", Some(TestAuth::Admin)).await;
+    assert_eq!(favorites_read_status, StatusCode::OK);
+    assert_eq!(favorites_read["revision"], json!(favorite_catalog_revision));
+    assert_eq!(favorites_read["tracks"][0]["track"]["id"], json!(track_id));
+    assert_no_sse_event(&mut user_body).await;
+
+    let (favorite_remove_status, _) = request_json(
+        app.clone(),
+        "DELETE",
+        &format!("/api/v1/me/favorites/tracks/{track_id}"),
+        json!({}),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(favorite_remove_status, StatusCode::NO_CONTENT);
+
+    let remove_home_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(remove_home_event["event"], "track_favorite_updated");
+    assert_eq!(remove_home_event["action"], "removed");
+    assert_eq!(remove_home_event["surface"], "home");
+    assert_eq!(
+        remove_home_event["patch"]["type"],
+        "home_sections_replaced"
+    );
+    let remove_home_revision = remove_home_event["revision"].as_u64().unwrap();
+    assert!(remove_home_revision > favorite_catalog_revision);
+
+    let remove_screen_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(remove_screen_event["event"], "track_favorite_updated");
+    assert_eq!(remove_screen_event["action"], "removed");
+    assert_eq!(remove_screen_event["surface"], "favorites");
+    assert_eq!(remove_screen_event["patch"]["type"], "favorites_replaced");
+    assert_eq!(remove_screen_event["patch"]["tracks"].as_array().unwrap().len(), 0);
+    let remove_screen_revision = remove_screen_event["revision"].as_u64().unwrap();
+    assert!(remove_screen_revision > remove_home_revision);
+
+    let remove_catalog_event = next_sse_json(&mut admin_body).await;
+    assert_eq!(remove_catalog_event["event"], "track_favorite_updated");
+    assert_eq!(remove_catalog_event["action"], "removed");
+    assert_eq!(remove_catalog_event["surface"], "catalog");
+    assert_eq!(
+        remove_catalog_event["patch"]["type"],
+        "recovery_requested"
+    );
+    let remove_catalog_revision = remove_catalog_event["revision"].as_u64().unwrap();
+    assert!(remove_catalog_revision > remove_screen_revision);
+    assert_eq!(state.current_revision(), remove_catalog_revision);
+
+    let (favorites_after_remove_status, favorites_after_remove) =
+        get_json(app.clone(), "/api/v1/me/favorites/tracks", Some(TestAuth::Admin)).await;
+    assert_eq!(favorites_after_remove_status, StatusCode::OK);
+    assert_eq!(
+        favorites_after_remove["revision"],
+        json!(remove_catalog_revision)
+    );
+    assert_eq!(
+        favorites_after_remove["tracks"].as_array().unwrap().len(),
+        0
+    );
+    assert_no_sse_event(&mut user_body).await;
+
     let shared = state
         .create_playlist(admin.id, "Shared Event Playlist", None, PlaylistScope::Shared)
         .await
@@ -2757,6 +2881,111 @@ async fn events_stream_filters_account_scoped_events_and_emits_screen_patch_enve
         shared_playlist_detail_event["patch"]["playlist_id"],
         json!(shared.id)
     );
+}
+
+#[tokio::test]
+/// Verifies that stale invisible favorites do not break the read model and can be removed.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Returns a future that resolves to `()` after the operation completes.
+///
+/// Errors:
+/// - Does not return recoverable errors. May panic if an internal invariant documented by the implementation is violated, such as a poisoned lock or intentionally failing test setup.
+async fn favorites_read_skips_invisible_entries_and_delete_removes_stale_favorite() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let visible = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/favorites-visible.flac",
+            "favorites-visible-hash",
+            "Favorites Artist",
+            "Favorites Album",
+            "Visible Favorite",
+            Some(1),
+        ))
+        .await
+        .unwrap();
+    let stale = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/favorites-stale.flac",
+            "favorites-stale-hash",
+            "Favorites Artist",
+            "Favorites Album",
+            "Stale Favorite",
+            Some(2),
+        ))
+        .await
+        .unwrap();
+    let visible_track_id = visible.track.as_ref().unwrap().id;
+    let stale_track_id = stale.track.as_ref().unwrap().id;
+    let app = router(state.clone());
+
+    let (visible_add_status, _) = request_json(
+        app.clone(),
+        "PUT",
+        &format!("/api/v1/me/favorites/tracks/{visible_track_id}"),
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(visible_add_status, StatusCode::CREATED);
+    let (stale_add_status, _) = request_json(
+        app.clone(),
+        "PUT",
+        &format!("/api/v1/me/favorites/tracks/{stale_track_id}"),
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(stale_add_status, StatusCode::CREATED);
+
+    sqlx::query("UPDATE tracks SET published_at = NULL WHERE id = $1")
+        .bind(stale_track_id)
+        .execute(state.repository().pool())
+        .await
+        .unwrap();
+
+    let (favorites_status, favorites) =
+        get_json(app.clone(), "/api/v1/me/favorites/tracks", Some(TestAuth::User)).await;
+    assert_eq!(favorites_status, StatusCode::OK);
+    let favorite_tracks = favorites["tracks"].as_array().unwrap();
+    assert_eq!(favorite_tracks.len(), 1);
+    assert_eq!(favorite_tracks[0]["track"]["id"], json!(visible_track_id));
+    assert!(!favorite_tracks
+        .iter()
+        .any(|entry| entry["track"]["id"] == json!(stale_track_id)));
+
+    let (delete_status, _) = request_json(
+        app.clone(),
+        "DELETE",
+        &format!("/api/v1/me/favorites/tracks/{stale_track_id}"),
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::NO_CONTENT);
+
+    let stale_favorite_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM account_track_favorites WHERE track_id = $1",
+    )
+    .bind(stale_track_id)
+    .fetch_one(state.repository().pool())
+    .await
+    .unwrap();
+    assert_eq!(stale_favorite_count, 0);
+
+    let (after_delete_status, after_delete) =
+        get_json(app, "/api/v1/me/favorites/tracks", Some(TestAuth::User)).await;
+    assert_eq!(after_delete_status, StatusCode::OK);
+    let remaining_tracks = after_delete["tracks"].as_array().unwrap();
+    assert_eq!(remaining_tracks.len(), 1);
+    assert_eq!(remaining_tracks[0]["track"]["id"], json!(visible_track_id));
 }
 
 #[tokio::test]
@@ -4477,7 +4706,7 @@ async fn catalog_search_returns_grouped_normalized_ranked_visible_results() {
         return;
     };
 
-    state
+    let love = state
         .repository()
         .import_catalog_file(music_import_request(
             "/dropbox/search-love.flac",
@@ -4489,6 +4718,7 @@ async fn catalog_search_returns_grouped_normalized_ranked_visible_results() {
         ))
         .await
         .unwrap();
+    let love_track_id = love.track.as_ref().unwrap().id;
     state
         .repository()
         .import_catalog_file(music_import_request(
@@ -4582,6 +4812,16 @@ async fn catalog_search_returns_grouped_normalized_ranked_visible_results() {
         CatalogImportDecision::QuarantinedUnstableGrouping
     ));
 
+    let user = state
+        .authenticate_local_account(USER_USERNAME, USER_PASSWORD)
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .add_track_favorite(user.id, love_track_id)
+        .await
+        .unwrap();
+
     let app = router(state);
 
     let (unauth_status, unauth_body) =
@@ -4611,6 +4851,17 @@ async fn catalog_search_returns_grouped_normalized_ranked_visible_results() {
     .await;
     assert_eq!(rank_status, StatusCode::OK);
     assert_eq!(rank_body["normalized_query"], "love");
+    let tracks = rank_body["tracks"].as_array().unwrap();
+    for track in tracks {
+        assert!(track.get("id").is_some());
+        assert!(track.get("album_id").is_some());
+        assert!(track.get("artist_id").is_some());
+        assert!(track.get("title").is_some());
+        assert!(track.get("is_favorite").is_some());
+        assert!(track.get("track").is_none());
+    }
+    assert_eq!(tracks[0]["id"], json!(love_track_id));
+    assert_eq!(tracks[0]["is_favorite"], true);
     let track_titles = rank_body["tracks"]
         .as_array()
         .unwrap()
@@ -11538,6 +11789,7 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
     assert!(paths.contains_key("/api/v1/me/playback/progress"));
     assert!(paths.contains_key("/api/v1/me/playback/history"));
     assert!(paths.contains_key("/api/v1/me/home"));
+    assert!(paths.contains_key("/api/v1/me/favorites/tracks"));
     assert!(paths.contains_key("/api/v1/events"));
     assert!(paths.contains_key("/api/v1/sonos/targets"));
     for route in ["play", "pause", "resume", "stop", "seek", "next", "previous"] {
@@ -11678,6 +11930,9 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         "BrowseEpisodesResponse",
         "EpisodeResumeResponse",
         "DetailTrackItem",
+        "FavoriteTrackEntry",
+        "FavoritesReadModel",
+        "FavoritesReplacePatch",
         "HomeCard",
         "HomeCardItemType",
         "HomeResponse",
@@ -11696,6 +11951,7 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         "ScreenContextHint",
         "ScreenPatch",
         "ScreenSurface",
+        "SearchTrackEntry",
         "DashboardSummaryResponse",
         "ErrorResponseDetails",
         "SonosDeliveryKind",
@@ -11716,6 +11972,17 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
     ] {
         assert!(schemas.contains_key(schema), "missing schema {schema}");
     }
+
+    let search_track_entry_schema = &schemas["SearchTrackEntry"];
+    let search_track_entry_properties = search_track_entry_schema["properties"].as_object().unwrap();
+    for field in ["id", "album_id", "artist_id", "title", "is_favorite"] {
+        assert!(
+            search_track_entry_properties.contains_key(field),
+            "SearchTrackEntry missing flattened field {field}"
+        );
+        assert!(schema_requires_field(search_track_entry_schema, field));
+    }
+    assert!(!search_track_entry_properties.contains_key("track"));
 
     let system_config_schema = &schemas["SystemConfig"];
     assert!(system_config_schema["properties"]

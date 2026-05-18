@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     api::{
+        favorites::{self, FavoriteTrackEntry},
         home::{self, HomeSection, HomeSectionId},
         sync::{self, PlaylistSyncSnapshot},
     },
@@ -34,12 +35,12 @@ use crate::{
     domain::{
         AacTranscodeProfile, AccountRole, Album, Artist, ArtworkAsset, ArtworkKind,
         AuthenticatedAccount,
-        CatalogEntityType, Episode, ImportJob, ImportJobKind, ImportJobSource, MaintenanceScope,
-        MediaFile, PlaybackContextType, PlaybackHistoryEvent, PlaybackItemType,
-        PlaybackProgress, Playlist, PlaylistItem, PlaylistScope, Podcast, ProviderHealth,
-        ProviderKind, ProviderSetting, ProviderStatus, QuarantineItem, QuarantineStatus,
-        RepairPlan, SonosDeliveryKind, SonosSignedClaim, SystemConfig, Track,
-        TranscodeSlotUsage, UserAccount,
+        CatalogEntityType, Episode, FavoriteToggleOutcome, ImportJob, ImportJobKind,
+        ImportJobSource, MaintenanceScope, MediaFile, PlaybackContextType,
+        PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress, Playlist, PlaylistItem,
+        PlaylistScope, Podcast, ProviderHealth, ProviderKind, ProviderSetting, ProviderStatus,
+        QuarantineItem, QuarantineStatus, RepairPlan, SonosDeliveryKind, SonosSignedClaim,
+        SystemConfig, Track, TrackFavorite, TranscodeSlotUsage, UserAccount,
         DEFAULT_SCAN_THREAD_COUNT,
     },
     error::{ApiError, SonosErrorReason},
@@ -184,8 +185,8 @@ pub struct AdminDashboardActiveImportJob {
 /// Represents one screen patch delivered to connected clients.
 ///
 /// Functionality: Carries the stable flat live-event envelope with typed direct
-/// screen patches for Home, playlist, playback, catalog recovery, or stream
-/// recovery surfaces.
+/// screen patches for Home, Favorites, playlist, playback, catalog recovery,
+/// or stream recovery surfaces.
 pub struct AppEvent {
     pub stream_epoch: Uuid,
     pub sequence: u64,
@@ -238,6 +239,7 @@ fn playlist_event_audience(playlist: &Playlist) -> AppEventAudience {
 #[serde(rename_all = "snake_case")]
 pub enum ScreenSurface {
     Home,
+    Favorites,
     PlaylistList,
     PlaylistDetail,
     Playback,
@@ -249,6 +251,7 @@ pub enum ScreenSurface {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScreenPatch {
     HomeSectionsReplaced(HomeSectionsPatch),
+    FavoritesReplaced(FavoritesReplacePatch),
     PlaylistListUpserted(PlaylistListUpsertPatch),
     PlaylistListRemoved(PlaylistListRemovePatch),
     PlaylistDetailReplaced(PlaylistDetailReplacePatch),
@@ -262,6 +265,12 @@ pub enum ScreenPatch {
 pub struct HomeSectionsPatch {
     pub account_id: Option<Uuid>,
     pub sections: Vec<HomeSection>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct FavoritesReplacePatch {
+    pub account_id: Uuid,
+    pub tracks: Vec<FavoriteTrackEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -856,6 +865,78 @@ impl AppState {
                 );
             }
         }
+    }
+
+    async fn publish_favorites_replaced(
+        &self,
+        account_id: Uuid,
+        event: &str,
+        resource: &str,
+        action: &str,
+        entity_id: Option<Uuid>,
+    ) {
+        match favorites::favorite_track_entries(self, account_id).await {
+            Ok(tracks) => self.publish_screen_event(
+                event,
+                resource,
+                action,
+                entity_id,
+                AppEventAudience::Account { account_id },
+                ScreenSurface::Favorites,
+                ScreenPatch::FavoritesReplaced(FavoritesReplacePatch { account_id, tracks }),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, %account_id, "failed to project Favorites patch; publishing recovery marker");
+                self.publish_screen_event(
+                    event,
+                    resource,
+                    action,
+                    entity_id,
+                    AppEventAudience::Account { account_id },
+                    ScreenSurface::Favorites,
+                    ScreenPatch::RecoveryRequested(RecoveryScreenPatch {
+                        reason: "favorites_projection_failed".to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    async fn publish_track_favorite_changed(
+        &self,
+        account_id: Uuid,
+        track_id: Uuid,
+        action: &str,
+    ) {
+        let event = "track_favorite_updated";
+        let resource = "track_favorite";
+        let entity_id = Some(track_id);
+
+        self.publish_home_sections_updated(
+            account_id,
+            &[
+                HomeSectionId::ContinueListening,
+                HomeSectionId::RecentlyPlayed,
+            ],
+            event,
+            resource,
+            action,
+            entity_id,
+        )
+        .await;
+        self.publish_favorites_replaced(account_id, event, resource, action, entity_id)
+            .await;
+        self.publish_screen_event(
+            event,
+            resource,
+            action,
+            entity_id,
+            AppEventAudience::Account { account_id },
+            ScreenSurface::Catalog,
+            ScreenPatch::RecoveryRequested(RecoveryScreenPatch {
+                reason: "favorite_flags_changed".to_string(),
+            }),
+        );
     }
 
     async fn publish_playback_progress_updated(
@@ -1655,6 +1736,112 @@ impl AppState {
             .map_err(api_storage_error)
     }
 
+    pub async fn toggle_track_favorite(
+        &self,
+        account_id: Uuid,
+        track_id: Uuid,
+    ) -> Result<FavoriteToggleOutcome, ApiError> {
+        let outcome = self
+            .inner
+            .repository
+            .toggle_track_favorite(account_id, track_id)
+            .await
+            .map_err(api_storage_error)?;
+        let action = match outcome {
+            FavoriteToggleOutcome::Added => "added",
+            FavoriteToggleOutcome::Removed => "removed",
+        };
+        self.publish_track_favorite_changed(account_id, track_id, action)
+            .await;
+        Ok(outcome)
+    }
+
+    pub async fn add_track_favorite(
+        &self,
+        account_id: Uuid,
+        track_id: Uuid,
+    ) -> Result<TrackFavorite, ApiError> {
+        let already_favorite = self.is_track_favorite(account_id, track_id).await?;
+        let favorite = self
+            .inner
+            .repository
+            .add_track_favorite(account_id, track_id)
+            .await
+            .map_err(api_storage_error)?;
+        if !already_favorite {
+            self.publish_track_favorite_changed(account_id, track_id, "added")
+                .await;
+        }
+        Ok(favorite)
+    }
+
+    pub async fn remove_track_favorite(
+        &self,
+        account_id: Uuid,
+        track_id: Uuid,
+    ) -> Result<(), ApiError> {
+        let removed = self
+            .inner
+            .repository
+            .remove_track_favorite(account_id, track_id)
+            .await
+            .map_err(api_storage_error)?;
+        if removed {
+            self.publish_track_favorite_changed(account_id, track_id, "removed")
+                .await;
+            Ok(())
+        } else {
+            Err(ApiError::NotFound(format!(
+                "track favorite {track_id} was not found"
+            )))
+        }
+    }
+
+    pub async fn list_track_favorites(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<TrackFavorite>, ApiError> {
+        self.inner
+            .repository
+            .list_track_favorites(account_id)
+            .await
+            .map_err(api_storage_error)
+    }
+
+    pub async fn track_favorite_ids_for_account(
+        &self,
+        account_id: Uuid,
+    ) -> Result<HashSet<Uuid>, ApiError> {
+        self.inner
+            .repository
+            .track_favorite_ids_for_account(account_id)
+            .await
+            .map_err(api_storage_error)
+    }
+
+    pub async fn is_track_favorite(
+        &self,
+        account_id: Uuid,
+        track_id: Uuid,
+    ) -> Result<bool, ApiError> {
+        self.inner
+            .repository
+            .is_track_favorite(account_id, track_id)
+            .await
+            .map_err(api_storage_error)
+    }
+
+    pub async fn playlists_for_startup_snapshot(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<Playlist>, ApiError> {
+        self.inner
+            .repository
+            .playlists_for_startup_snapshot(account_id)
+            .await
+            .map_err(api_storage_error)
+    }
+
     /// Handles visible playlist for application state facade used by HTTP handlers and background workers.
     ///
     /// Inputs:
@@ -2141,6 +2328,51 @@ impl AppState {
             .browse_podcasts(limit, cursor, sort)
             .await
             .map_err(api_catalog_browse_error)
+    }
+
+    pub async fn startup_browse_artists(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<Artist>, ApiError> {
+        self.inner
+            .repository
+            .startup_browse_artists(limit)
+            .await
+            .map_err(api_catalog_browse_error)
+    }
+
+    pub async fn startup_browse_albums(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<Album>, ApiError> {
+        self.inner
+            .repository
+            .startup_browse_albums(limit)
+            .await
+            .map_err(api_catalog_browse_error)
+    }
+
+    pub async fn startup_browse_podcasts(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<Podcast>, ApiError> {
+        self.inner
+            .repository
+            .startup_browse_podcasts(limit)
+            .await
+            .map_err(api_catalog_browse_error)
+    }
+
+    pub async fn podcast_detail(
+        &self,
+        podcast_id: Uuid,
+    ) -> Result<(Podcast, Vec<Episode>), ApiError> {
+        self.inner
+            .repository
+            .podcast_detail(podcast_id)
+            .await
+            .map_err(api_storage_error)?
+            .ok_or_else(|| ApiError::NotFound(format!("podcast {podcast_id} was not found")))
     }
 
     /// Handles visible podcast for application state facade used by HTTP handlers and background workers.
