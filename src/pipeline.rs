@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore},
-    task::JoinSet,
+    task::{self, JoinSet},
 };
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -388,10 +388,7 @@ impl ImportPipeline {
         let import_paths = self.resolve_import_paths(&running_job)?;
 
         let run_result = async {
-            let mut paths = Vec::new();
-            for root in import_paths {
-                paths.extend(media_paths(root)?);
-            }
+            let paths = collect_media_paths(import_paths).await?;
             summary.scanned_files = u32::try_from(paths.len()).unwrap_or(u32::MAX);
 
             let provider_credentials = Arc::new(provider_credentials);
@@ -618,7 +615,7 @@ impl ImportPipeline {
         providers_backing_off_in_run: SharedProviderBackoff,
         path: &Path,
     ) -> Result<CatalogImportDecision, ImportPipelineError> {
-        let probed = probe_media_file(path)?;
+        let probed = probe_media_file_blocking(path.to_path_buf()).await?;
         let source_path = path.to_string_lossy().to_string();
         let existing_managed_file = self
             .repository
@@ -762,54 +759,52 @@ impl ImportPipeline {
                 .is_none()
         {
             if let Some(target) = &managed_path {
-                let file_result = async {
-                    let final_path =
-                        retry_file_operation(|| {
-                            ensure_managed_file(path, target, &request.probe.file_hash)
-                        })
-                        .await?;
-                    request.managed_path = Some(final_path.to_string_lossy().to_string());
-                    if job.repair_plan.rewrite_sidecars {
-                        retry_file_operation(|| write_managed_sidecar(&final_path, &request))
-                            .await?;
-                    }
-                    if job.repair_plan.refresh_artwork {
-                        if let Some(copied_artwork) = retry_file_operation(|| {
-                            copy_folder_image(&probed, &request.grouping, &final_path)
-                        })
-                        .await?
-                        {
+                match materialize_managed_local_files_blocking(
+                    path.to_path_buf(),
+                    target.clone(),
+                    request.probe.file_hash.clone(),
+                    job.repair_plan.rewrite_sidecars,
+                    job.repair_plan.refresh_artwork,
+                    request.clone(),
+                    probed.clone(),
+                )
+                .await
+                {
+                    Ok(materialized) => {
+                        request.managed_path =
+                            Some(materialized.final_path.to_string_lossy().to_string());
+                        if let Some(copied_artwork) = materialized.copied_artwork {
                             request.artwork.push(copied_artwork);
                         }
-                        materialize_remote_artwork(&mut request, &final_path).await;
+                        if job.repair_plan.refresh_artwork {
+                            materialize_remote_artwork(&mut request, &materialized.final_path)
+                                .await;
+                        }
                     }
-                    Ok::<(), io::Error>(())
-                }
-                .await;
-
-                if let Err(error) = file_result {
-                    let error_message = error.to_string();
-                    let outcome = self
-                        .repository
-                        .quarantine_file_error(request, error_message.clone())
-                        .await?;
-                    self.repository
-                        .upsert_catalog_import_work_item(
-                            job.id,
-                            &path.to_string_lossy(),
+                    Err(error) => {
+                        let error_message = error.to_string();
+                        let outcome = self
+                            .repository
+                            .quarantine_file_error(request, error_message.clone())
+                            .await?;
+                        self.repository
+                            .upsert_catalog_import_work_item(
+                                job.id,
+                                &path.to_string_lossy(),
+                                Some(outcome.media_file.id),
+                                outcome.media_file.status,
+                                job.attempts + 1,
+                                Some(error_message.as_str()),
+                            )
+                            .await?;
+                        self.settle_related_quarantine(
+                            job,
+                            &outcome.decision,
                             Some(outcome.media_file.id),
-                            outcome.media_file.status,
-                            job.attempts + 1,
-                            Some(error_message.as_str()),
                         )
                         .await?;
-                    self.settle_related_quarantine(
-                        job,
-                        &outcome.decision,
-                        Some(outcome.media_file.id),
-                    )
-                    .await?;
-                    return Ok(outcome.decision);
+                        return Ok(outcome.decision);
+                    }
                 }
             }
         }
@@ -1293,7 +1288,7 @@ fn provider_backoff_duration(failure_count: u32) -> ChronoDuration {
 ///
 /// Errors:
 /// - Returns `io::Error` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
-async fn retry_file_operation<T, F>(mut operation: F) -> Result<T, io::Error>
+fn retry_file_operation<T, F>(mut operation: F) -> Result<T, io::Error>
 where
     F: FnMut() -> Result<T, io::Error>,
 {
@@ -1304,7 +1299,7 @@ where
             Err(error) if attempt >= FILE_OPERATION_MAX_ATTEMPTS => return Err(error),
             Err(_) => {
                 attempt += 1;
-                tokio::time::sleep(FILE_OPERATION_RETRY_BACKOFF).await;
+                std::thread::sleep(FILE_OPERATION_RETRY_BACKOFF);
             }
         }
     }
@@ -1962,6 +1957,25 @@ fn strength_for_string(value: &str, has_direct_local_tag: bool) -> LocalFieldStr
     }
 }
 
+async fn collect_media_paths(
+    import_paths: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, ImportPipelineError> {
+    task::spawn_blocking(move || {
+        let mut paths = Vec::new();
+        for root in import_paths {
+            paths.extend(media_paths(root)?);
+        }
+        Ok(paths)
+    })
+    .await?
+}
+
+async fn probe_media_file_blocking(path: PathBuf) -> Result<ProbedMediaFile, ImportPipelineError> {
+    task::spawn_blocking(move || probe_media_file(path))
+        .await?
+        .map_err(ImportPipelineError::from)
+}
+
 /// Handles media paths for maintenance import pipeline that scans files, enriches metadata, and mutates the catalog.
 ///
 /// Inputs:
@@ -1997,6 +2011,48 @@ fn media_paths(root: PathBuf) -> Result<Vec<PathBuf>, ImportPipelineError> {
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
+}
+
+struct ManagedLocalFileMaterialization {
+    final_path: PathBuf,
+    copied_artwork: Option<ArtworkAssetDraft>,
+}
+
+async fn materialize_managed_local_files_blocking(
+    source_path: PathBuf,
+    target_path: PathBuf,
+    file_hash: String,
+    rewrite_sidecars: bool,
+    refresh_artwork: bool,
+    request: CatalogImportRequest,
+    probed: ProbedMediaFile,
+) -> Result<ManagedLocalFileMaterialization, io::Error> {
+    task::spawn_blocking(move || {
+        let final_path = retry_file_operation(|| {
+            ensure_managed_file(&source_path, &target_path, &file_hash)
+        })?;
+        if rewrite_sidecars {
+            retry_file_operation(|| write_managed_sidecar(&final_path, &request))?;
+        }
+        let copied_artwork = if refresh_artwork {
+            retry_file_operation(|| copy_folder_image(&probed, &request.grouping, &final_path))?
+        } else {
+            None
+        };
+        Ok(ManagedLocalFileMaterialization {
+            final_path,
+            copied_artwork,
+        })
+    })
+    .await
+    .map_err(blocking_join_error_to_io_error)?
+}
+
+fn blocking_join_error_to_io_error(error: task::JoinError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!("blocking import task failed: {error}"),
+    )
 }
 
 /// Handles infer catalog grouping for maintenance import pipeline that scans files, enriches metadata, and mutates the catalog.

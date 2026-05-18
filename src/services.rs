@@ -5,7 +5,11 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use tokio::{task::JoinHandle, time::sleep};
+use tokio::{
+    runtime::{Builder, Runtime},
+    task::JoinHandle,
+    time::sleep,
+};
 use walkdir::WalkDir;
 
 use crate::{
@@ -13,6 +17,9 @@ use crate::{
     sonos::{self, SonosRuntimeConfig},
     state::AppState,
 };
+
+const BACKGROUND_RUNTIME_WORKER_THREADS: usize = 2;
+const BACKGROUND_RUNTIME_MAX_BLOCKING_THREADS: usize = 16;
 
 #[derive(Debug, Clone)]
 /// Represents background service config in the background import worker and dropbox watcher runtime services.
@@ -115,6 +122,7 @@ impl Default for DropboxWatcherConfig {
 /// Dependencies: depends on `Vec<JoinHandle<()>>` and any derives or trait bounds declared on the type.
 /// Used by: referenced from `src/lib.rs`, `src/main.rs`, `src/services.rs`, `tests/maintenance_api.rs`.
 pub struct BackgroundServices {
+    runtime: Option<Runtime>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -131,25 +139,29 @@ impl BackgroundServices {
     /// Errors:
     /// - Does not return recoverable errors.
     pub fn spawn(state: AppState, config: BackgroundServiceConfig) -> Self {
+        let runtime = background_runtime();
         let mut handles = Vec::with_capacity(4);
-        handles.push(tokio::spawn(import_worker_loop(
+        handles.push(runtime.spawn(import_worker_loop(
             state.clone(),
             config.import_worker,
         )));
-        handles.push(tokio::spawn(dropbox_watcher_loop(
+        handles.push(runtime.spawn(dropbox_watcher_loop(
             state.clone(),
             config.dropbox_watcher,
         )));
         let sonos_config = config.sonos;
-        handles.push(tokio::spawn(sonos::runtime_loop(
+        handles.push(runtime.spawn(sonos::runtime_loop(
             state.clone(),
             sonos_config.clone(),
         )));
-        handles.push(tokio::spawn(sonos::active_session_loop(
+        handles.push(runtime.spawn(sonos::active_session_loop(
             state,
             sonos_config.request_timeout,
         )));
-        Self { handles }
+        Self {
+            runtime: Some(runtime),
+            handles,
+        }
     }
 
     /// Spawns asynchronous work for background import worker and dropbox watcher runtime services.
@@ -164,8 +176,10 @@ impl BackgroundServices {
     /// Errors:
     /// - Does not return recoverable errors.
     pub fn spawn_import_worker(state: AppState, config: ImportWorkerConfig) -> Self {
+        let runtime = background_runtime();
         Self {
-            handles: vec![tokio::spawn(import_worker_loop(state, config))],
+            handles: vec![runtime.spawn(import_worker_loop(state, config))],
+            runtime: Some(runtime),
         }
     }
 
@@ -181,8 +195,10 @@ impl BackgroundServices {
     /// Errors:
     /// - Does not return recoverable errors.
     pub fn spawn_dropbox_watcher(state: AppState, config: DropboxWatcherConfig) -> Self {
+        let runtime = background_runtime();
         Self {
-            handles: vec![tokio::spawn(dropbox_watcher_loop(state, config))],
+            handles: vec![runtime.spawn(dropbox_watcher_loop(state, config))],
+            runtime: Some(runtime),
         }
     }
 }
@@ -202,7 +218,21 @@ impl Drop for BackgroundServices {
         for handle in &self.handles {
             handle.abort();
         }
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
+}
+
+/// Builds the runtime used exclusively by background scanning and device services.
+fn background_runtime() -> Runtime {
+    Builder::new_multi_thread()
+        .worker_threads(BACKGROUND_RUNTIME_WORKER_THREADS)
+        .max_blocking_threads(BACKGROUND_RUNTIME_MAX_BLOCKING_THREADS)
+        .thread_name("harmonixia-background")
+        .enable_all()
+        .build()
+        .expect("failed to build Harmonixia background runtime")
 }
 
 /// Handles import worker loop for background import worker and dropbox watcher runtime services.
@@ -292,7 +322,7 @@ async fn scan_dropbox_once(
     let now = Instant::now();
     let mut present = HashSet::new();
 
-    for (path, fingerprint) in supported_media_files(&root) {
+    for (path, fingerprint) in supported_media_files_blocking(root).await? {
         present.insert(path.clone());
         let stable_fingerprint = {
             let entry = observed
@@ -338,6 +368,17 @@ async fn scan_dropbox_once(
 
     observed.retain(|path, _| present.contains(path));
     Ok(())
+}
+
+async fn supported_media_files_blocking(
+    root: PathBuf,
+) -> Result<Vec<(PathBuf, FileFingerprint)>, crate::error::ApiError> {
+    tokio::task::spawn_blocking(move || supported_media_files(&root))
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "dropbox watcher scan task failed");
+            crate::error::ApiError::Internal
+        })
 }
 
 /// Handles supported media files for background import worker and dropbox watcher runtime services.

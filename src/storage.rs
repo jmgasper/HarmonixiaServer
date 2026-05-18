@@ -400,7 +400,7 @@ impl DatabaseConfig {
                 .ok()
                 .filter(|value| *value > 0)
                 .ok_or(ConfigError::InvalidMaxConnections)?,
-            Err(_) => 5,
+            Err(_) => 15,
         };
 
         let connect_timeout = match std::env::var("HARMONIXIA_DATABASE_CONNECT_TIMEOUT_SECONDS") {

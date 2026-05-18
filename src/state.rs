@@ -409,7 +409,7 @@ impl Default for ServerConfig {
         Self {
             database: DatabaseConfig {
                 url: "postgres://localhost/harmonixia".to_string(),
-                max_connections: 5,
+                max_connections: 15,
                 connect_timeout: std::time::Duration::from_secs(5),
                 schema: None,
             },
