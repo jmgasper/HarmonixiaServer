@@ -362,6 +362,7 @@ mod tests {
             disc_number: Some(1),
             track_number: Some(1),
             duration_seconds: Some(180),
+            quality: Some("Lossless".to_string()),
             stable_grouping: true,
             published_at: Some(updated_at),
             created_at: updated_at,

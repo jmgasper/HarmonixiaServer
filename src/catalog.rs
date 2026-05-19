@@ -65,6 +65,19 @@ const TRACK_SELECT: &str = r#"
     updated_at
 "#;
 
+const TRACK_QUALITY_SELECT_MF: &str = r#"
+    CASE
+        WHEN lower(coalesce(mf.audio_codec, '')) IN ('flac', 'alac', 'wavpack', 'ape', 'tta', 'dsd')
+          OR lower(coalesce(mf.audio_codec, '')) LIKE 'pcm_%'
+          OR lower(coalesce(mf.container, '')) IN ('flac', 'wav', 'wave', 'aiff', 'aif', 'wv', 'ape', 'tta', 'dsf', 'dff')
+          OR lower(coalesce(mf.mime_type, '')) IN ('audio/flac', 'audio/x-flac', 'audio/wav', 'audio/x-wav', 'audio/aiff', 'audio/x-aiff')
+        THEN 'Lossless'
+        WHEN mf.bitrate IS NOT NULL AND mf.bitrate > 0
+        THEN concat(round(mf.bitrate::numeric / 1000.0)::integer, 'kbps')
+        ELSE NULL
+    END AS quality
+"#;
+
 const TRACK_FAVORITE_SELECT: &str = r#"
     account_id,
     track_id,
@@ -1172,7 +1185,8 @@ impl PgMaintenanceRepository {
               t.stable_grouping,
               t.published_at,
               t.created_at,
-              t.updated_at
+              t.updated_at,
+              {TRACK_QUALITY_SELECT_MF}
             FROM tracks t
             JOIN albums al ON al.id = t.album_id
             JOIN artists album_artist ON album_artist.id = al.artist_id
@@ -1228,7 +1242,8 @@ impl PgMaintenanceRepository {
               t.stable_grouping,
               t.published_at,
               t.created_at,
-              t.updated_at
+              t.updated_at,
+              {TRACK_QUALITY_SELECT_MF}
             FROM tracks t
             JOIN albums al ON al.id = t.album_id
             JOIN artists album_artist ON album_artist.id = al.artist_id
@@ -1274,7 +1289,8 @@ impl PgMaintenanceRepository {
               t.stable_grouping,
               t.published_at,
               t.created_at,
-              t.updated_at
+              t.updated_at,
+              {TRACK_QUALITY_SELECT_MF}
             FROM tracks t
             JOIN albums al ON al.id = t.album_id
             JOIN artists album_artist ON album_artist.id = al.artist_id
@@ -1609,6 +1625,44 @@ impl PgMaintenanceRepository {
             .await?;
 
         rows.iter().map(artwork_asset_from_row).collect::<Result<Vec<_>, _>>().map(Some)
+    }
+
+    pub async fn visible_metadata_provenance_for_entity(
+        &self,
+        account_id: Uuid,
+        entity_type: CatalogEntityType,
+        entity_id: Uuid,
+    ) -> Result<Option<Vec<MetadataProvenance>>, StorageError> {
+        if !self
+            .visible_artwork_entity_exists(account_id, entity_type, entity_id)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        let sql = format!(
+            r#"
+            SELECT {METADATA_PROVENANCE_SELECT}
+            FROM metadata_provenance mp
+            WHERE mp.entity_type = $1::text::catalog_entity_type
+              AND mp.entity_id = $2
+            ORDER BY
+              mp.field_name ASC,
+              mp.confidence DESC,
+              mp.created_at DESC,
+              mp.id ASC
+            "#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(entity_type_name(entity_type))
+            .bind(entity_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.iter()
+            .map(metadata_provenance_from_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
     }
 
     pub async fn visible_artwork_asset(
@@ -2301,6 +2355,7 @@ impl PgMaintenanceRepository {
               t.published_at,
               t.created_at,
               t.updated_at,
+              {TRACK_QUALITY_SELECT_MF},
               lower(COALESCE(album_artist.sort_name, album_artist.name)) AS browse_album_artist_key,
               lower(al.title) AS browse_album_title_key,
               COALESCE(t.disc_number, 0) AS browse_disc_key,
@@ -2310,6 +2365,7 @@ impl PgMaintenanceRepository {
             JOIN albums al ON al.id = t.album_id
             JOIN artists album_artist ON album_artist.id = al.artist_id
             JOIN artists track_artist ON track_artist.id = t.artist_id
+            JOIN media_files mf ON mf.id = t.canonical_media_file_id
             WHERE t.published_at IS NOT NULL
               AND t.stable_grouping
               AND al.published_at IS NOT NULL
@@ -2318,12 +2374,7 @@ impl PgMaintenanceRepository {
               AND album_artist.stable_grouping
               AND track_artist.published_at IS NOT NULL
               AND track_artist.stable_grouping
-              AND EXISTS (
-                SELECT 1
-                FROM media_files mf
-                WHERE mf.id = t.canonical_media_file_id
-                  AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
-              )
+              AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
               AND (
                 $1::text IS NULL
                 OR (
@@ -3006,7 +3057,15 @@ impl PgMaintenanceRepository {
     ) -> Result<Vec<Artist>, CatalogSearchError> {
         let sql = format!(
             r#"
-            SELECT {ARTIST_SELECT}
+            SELECT
+              ar.id,
+              ar.name,
+              ar.normalized_name,
+              ar.sort_name,
+              ar.stable_grouping,
+              ar.published_at,
+              ar.created_at,
+              ar.updated_at
             FROM catalog_search_projection csp
             JOIN artists ar ON ar.id = csp.entity_id
             WHERE csp.entity_type = 'artist'::catalog_entity_type
@@ -3182,12 +3241,14 @@ impl PgMaintenanceRepository {
               t.stable_grouping,
               t.published_at,
               t.created_at,
-              t.updated_at
+              t.updated_at,
+              {TRACK_QUALITY_SELECT_MF}
             FROM catalog_search_projection csp
             JOIN tracks t ON t.id = csp.entity_id
             JOIN albums al ON al.id = t.album_id
             JOIN artists album_artist ON album_artist.id = al.artist_id
             JOIN artists track_artist ON track_artist.id = t.artist_id
+            JOIN media_files mf ON mf.id = t.canonical_media_file_id
             WHERE csp.entity_type = 'track'::catalog_entity_type
               AND csp.published
               AND t.published_at IS NOT NULL
@@ -3199,16 +3260,11 @@ impl PgMaintenanceRepository {
               AND track_artist.published_at IS NOT NULL
               AND track_artist.stable_grouping
               AND {SEARCH_MATCH_PREDICATE}
-              AND EXISTS (
-                SELECT 1
-                FROM media_files mf
-                WHERE mf.id = t.canonical_media_file_id
-                  AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
-                  AND ($3::integer IS NULL OR al.release_year = $3)
-                  AND {GENRE_FILTER_PREDICATE}
-                  AND {FORMAT_FILTER_PREDICATE}
-                  AND ($6::text IS NULL OR mf.media_kind = $6::text::media_kind)
-              )
+              AND {BROWSE_VISIBLE_MEDIA_FILE_PREDICATE}
+              AND ($3::integer IS NULL OR al.release_year = $3)
+              AND {GENRE_FILTER_PREDICATE}
+              AND {FORMAT_FILTER_PREDICATE}
+              AND ($6::text IS NULL OR mf.media_kind = $6::text::media_kind)
             ORDER BY
               {SEARCH_RANK_EXPRESSION} ASC,
               csp.normalized_display_title ASC,
@@ -3253,7 +3309,14 @@ impl PgMaintenanceRepository {
     ) -> Result<Vec<Podcast>, CatalogSearchError> {
         let sql = format!(
             r#"
-            SELECT {PODCAST_SELECT}
+            SELECT
+              p.id,
+              p.title,
+              p.normalized_title,
+              p.stable_grouping,
+              p.published_at,
+              p.created_at,
+              p.updated_at
             FROM catalog_search_projection csp
             JOIN podcasts p ON p.id = csp.entity_id
             WHERE csp.entity_type = 'podcast'::catalog_entity_type
@@ -3397,7 +3460,16 @@ impl PgMaintenanceRepository {
 
         let sql = format!(
             r#"
-            SELECT {PLAYLIST_SELECT}
+            SELECT
+              p.id,
+              p.name,
+              p.description,
+              p.scope::text AS scope,
+              p.owner_account_id,
+              p.created_by_account_id,
+              p.updated_by_account_id,
+              p.created_at,
+              p.updated_at
             FROM catalog_search_projection csp
             JOIN playlists p ON p.id = csp.entity_id
             WHERE csp.entity_type = 'playlist'::catalog_entity_type
@@ -6125,6 +6197,7 @@ fn track_from_row(row: &PgRow) -> Result<Track, StorageError> {
         disc_number: row.try_get("disc_number")?,
         track_number: row.try_get("track_number")?,
         duration_seconds: row.try_get("duration_seconds")?,
+        quality: row.try_get("quality").ok().flatten(),
         stable_grouping: row.try_get("stable_grouping")?,
         published_at: row.try_get("published_at")?,
         created_at: row.try_get("created_at")?,

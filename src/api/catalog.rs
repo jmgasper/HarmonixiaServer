@@ -19,7 +19,7 @@ use crate::{
     catalog::CatalogBrowsePage,
     domain::{
         Album, AlbumKind, Artist, ArtworkKind, CatalogEntityType, Episode, PlaybackItemType,
-        PlaybackProgress, Playlist, Podcast, Track,
+        MetadataProvenance, PlaybackProgress, Playlist, Podcast, Track,
     },
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -112,8 +112,21 @@ pub struct CatalogBrowsePageMetadata {
 /// Dependencies: depends on `Vec<Artist>`, `CatalogBrowsePageMetadata` and any derives or trait bounds declared on the type.
 /// Used by: referenced from `src/api/catalog.rs`, `src/api/openapi.rs`.
 pub struct BrowseArtistsResponse {
-    pub artists: Vec<Artist>,
+    pub artists: Vec<ArtistBrowseItem>,
     pub page: CatalogBrowsePageMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ArtistBrowseItem {
+    pub id: Uuid,
+    pub name: String,
+    pub normalized_name: String,
+    pub sort_name: Option<String>,
+    pub stable_grouping: bool,
+    pub published_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub primary_artwork: Option<ScreenArtwork>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -144,6 +157,7 @@ pub struct ArtistDetailResponse {
     pub snapshot_at: DateTime<Utc>,
     pub artist: ArtistDetailHeader,
     pub primary_artwork: Option<ScreenArtwork>,
+    pub metadata: ArtistDetailMetadata,
     pub summary: ArtistDetailSummary,
     pub album_groups: Vec<ArtistAlbumGroup>,
     pub track_groups: Vec<ArtistTrackGroup>,
@@ -174,6 +188,22 @@ pub struct ArtistDetailSummary {
     pub album_count: usize,
     pub track_count: usize,
     pub duration_seconds: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ArtistDetailMetadata {
+    pub description: Option<String>,
+    pub genres: Vec<String>,
+    pub style: Option<String>,
+    pub mood: Option<String>,
+    pub label: Option<String>,
+    pub links: Vec<ArtistExternalLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ArtistExternalLink {
+    pub kind: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -408,7 +438,7 @@ pub async fn search_catalog(
 /// - Returns `ApiError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
 pub async fn browse_artists(
     State(state): State<AppState>,
-    AuthenticatedUser(_account): AuthenticatedUser,
+    AuthenticatedUser(account): AuthenticatedUser,
     Query(query): Query<CatalogBrowseQuery>,
 ) -> Result<Json<BrowseArtistsResponse>, ApiError> {
     let page = state
@@ -421,7 +451,7 @@ pub async fn browse_artists(
 
     Ok(Json(BrowseArtistsResponse {
         page: page_metadata(&page),
-        artists: page.items,
+        artists: artist_browse_items(&state, account.id, page.items).await?,
     }))
 }
 
@@ -460,6 +490,15 @@ pub async fn get_artist_detail(
         ArtworkKind::Artist,
     )
     .await?;
+    let metadata = artist_detail_metadata(
+        &state
+            .visible_metadata_provenance_for_entity(
+                account.id,
+                CatalogEntityType::Artist,
+                artist.id,
+            )
+            .await?,
+    );
     let album_groups =
         artist_album_groups(&state, account.id, &favorite_ids, &artist, albums).await?;
     let all_track_items = detail_track_items(
@@ -481,6 +520,7 @@ pub async fn get_artist_detail(
             sort_name: artist.sort_name,
         },
         primary_artwork,
+        metadata,
         summary: ArtistDetailSummary {
             album_count: album_groups.len(),
             track_count: all_track_items.len(),
@@ -498,6 +538,36 @@ pub async fn get_artist_detail(
             format!("/api/v1/catalog/artists/{artist_id}/detail"),
         )],
     }))
+}
+
+pub(crate) async fn artist_browse_items(
+    state: &AppState,
+    account_id: Uuid,
+    artists: Vec<Artist>,
+) -> Result<Vec<ArtistBrowseItem>, ApiError> {
+    let mut items = Vec::with_capacity(artists.len());
+    for artist in artists {
+        let primary_artwork = primary_artwork(
+            state,
+            account_id,
+            CatalogEntityType::Artist,
+            artist.id,
+            ArtworkKind::Artist,
+        )
+        .await?;
+        items.push(ArtistBrowseItem {
+            id: artist.id,
+            name: artist.name,
+            normalized_name: artist.normalized_name,
+            sort_name: artist.sort_name,
+            stable_grouping: artist.stable_grouping,
+            published_at: artist.published_at,
+            created_at: artist.created_at,
+            updated_at: artist.updated_at,
+            primary_artwork,
+        });
+    }
+    Ok(items)
 }
 
 #[utoipa::path(
@@ -1108,6 +1178,111 @@ fn sum_track_duration(tracks: &[Track]) -> Option<i32> {
         .filter(|duration| *duration > 0)
         .sum::<i32>();
     (total > 0).then_some(total)
+}
+
+fn artist_detail_metadata(provenance: &[MetadataProvenance]) -> ArtistDetailMetadata {
+    let mut genres_by_key = BTreeMap::new();
+    for field in ["genre", "genres"] {
+        for row in provenance
+            .iter()
+            .filter(|row| row.field_name.eq_ignore_ascii_case(field))
+        {
+            for value in json_strings(&row.value) {
+                genres_by_key
+                    .entry(value.to_ascii_lowercase())
+                    .or_insert(value);
+            }
+        }
+    }
+
+    let mut links = Vec::new();
+    for (field, kind) in [
+        ("website", "website"),
+        ("facebook", "facebook"),
+        ("twitter", "twitter"),
+        ("lastfm", "lastfm"),
+        ("last_fm", "lastfm"),
+    ] {
+        if let Some(url) = best_text_field(provenance, &[field]) {
+            links.push(ArtistExternalLink {
+                kind: kind.to_string(),
+                url,
+            });
+        }
+    }
+    links = dedupe_links(links);
+
+    ArtistDetailMetadata {
+        description: best_text_field(provenance, &["description", "biography", "bio"]),
+        genres: genres_by_key.into_values().collect(),
+        style: best_text_field(provenance, &["style"]),
+        mood: best_text_field(provenance, &["mood"]),
+        label: best_text_field(provenance, &["label"]),
+        links,
+    }
+}
+
+fn best_text_field(provenance: &[MetadataProvenance], fields: &[&str]) -> Option<String> {
+    let mut best: Option<(&MetadataProvenance, String)> = None;
+    for row in provenance.iter().filter(|row| {
+        fields
+            .iter()
+            .any(|field| row.field_name.eq_ignore_ascii_case(field))
+    }) {
+        let Some(value) = json_text(&row.value) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map(|(current, _)| metadata_candidate_is_better(row, current))
+            .unwrap_or(true)
+        {
+            best = Some((row, value));
+        }
+    }
+    best.map(|(_, value)| value)
+}
+
+fn metadata_candidate_is_better(
+    candidate: &MetadataProvenance,
+    current: &MetadataProvenance,
+) -> bool {
+    candidate.confidence > current.confidence
+        || ((candidate.confidence - current.confidence).abs() < f32::EPSILON
+            && candidate.created_at > current.created_at)
+}
+
+fn json_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => non_empty_text(text),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn json_strings(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(text) => non_empty_text(text).into_iter().collect(),
+        serde_json::Value::Array(values) => values.iter().filter_map(json_text).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn non_empty_text(value: &str) -> Option<String> {
+    let text = value.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn dedupe_links(links: Vec<ArtistExternalLink>) -> Vec<ArtistExternalLink> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for link in links {
+        let key = (link.kind.to_ascii_lowercase(), link.url.to_ascii_lowercase());
+        if seen.insert(key) {
+            deduped.push(link);
+        }
+    }
+    deduped
 }
 
 /// Handles page metadata for catalog browsing and search.

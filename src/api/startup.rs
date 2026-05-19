@@ -9,14 +9,14 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
+    api::catalog::{artist_browse_items, ArtistBrowseItem},
     api::home::{
         action_hint, primary_artwork, progress_hint, PlaybackPositionHint, ScreenActionHint,
         ScreenArtwork,
     },
     auth::AuthenticatedUser,
     domain::{
-        Album, Artist, ArtworkKind, CatalogEntityType, Episode, PlaybackItemType, Playlist,
-        Podcast,
+        Album, ArtworkKind, CatalogEntityType, Episode, PlaybackItemType, Playlist, Podcast,
     },
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -44,7 +44,7 @@ pub struct PlaylistListSnapshot {
 pub struct ArtistsBrowseSnapshot {
     pub revision: u64,
     pub snapshot_at: DateTime<Utc>,
-    pub artists: Vec<Artist>,
+    pub artists: Vec<ArtistBrowseItem>,
     pub limit: u32,
 }
 
@@ -114,12 +114,13 @@ pub async fn playlist_list_snapshot(
 )]
 pub async fn artists_browse_snapshot(
     State(state): State<AppState>,
-    AuthenticatedUser(_account): AuthenticatedUser,
+    AuthenticatedUser(account): AuthenticatedUser,
 ) -> Result<Json<ArtistsBrowseSnapshot>, ApiError> {
+    let artists = state.startup_browse_artists(STARTUP_BROWSE_LIMIT).await?;
     Ok(Json(ArtistsBrowseSnapshot {
         revision: state.current_revision(),
         snapshot_at: Utc::now(),
-        artists: state.startup_browse_artists(STARTUP_BROWSE_LIMIT).await?,
+        artists: artist_browse_items(&state, account.id, artists).await?,
         limit: STARTUP_BROWSE_LIMIT,
     }))
 }

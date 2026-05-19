@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use axum::{extract::State, routing::get, Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -9,8 +11,8 @@ use crate::{
     catalog::CatalogPodcastEpisode,
     domain::{
         Album, Artist, ArtworkAsset, ArtworkKind, CatalogEntityType, Episode,
-        PlaybackContextType, PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress, Podcast,
-        Track,
+        PlaybackContextType, PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress,
+        Playlist, Podcast, Track,
     },
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -39,6 +41,7 @@ pub struct HomeSection {
 #[serde(rename_all = "snake_case")]
 pub enum HomeSectionId {
     ContinueListening,
+    RecentlyPlayedItems,
     RecentlyPlayed,
     NewReleases,
     LatestPodcasts,
@@ -52,6 +55,7 @@ pub struct HomeCard {
     pub title: String,
     pub subtitle: Option<String>,
     pub detail: Option<String>,
+    pub quality: Option<String>,
     pub artwork: Option<ScreenArtwork>,
     pub context: Option<ScreenContextHint>,
     pub progress: Option<PlaybackPositionHint>,
@@ -67,6 +71,7 @@ pub enum HomeCardItemType {
     Track,
     Episode,
     Album,
+    Playlist,
     Podcast,
 }
 
@@ -141,15 +146,22 @@ pub async fn home_sections(
     only: Option<&[HomeSectionId]>,
 ) -> Result<Vec<HomeSection>, ApiError> {
     if only.is_none() {
-        let (continue_listening, recently_played, new_releases, latest_podcasts) =
-            tokio::try_join!(
-                continue_listening_section(state, account_id),
-                recently_played_section(state, account_id),
-                new_releases_section(state, account_id),
-                latest_podcasts_section(state, account_id),
-            )?;
+        let (
+            continue_listening,
+            recently_played_items,
+            recently_played,
+            new_releases,
+            latest_podcasts,
+        ) = tokio::try_join!(
+            continue_listening_section(state, account_id),
+            recently_played_items_section(state, account_id),
+            recently_played_section(state, account_id),
+            new_releases_section(state, account_id),
+            latest_podcasts_section(state, account_id),
+        )?;
         return Ok(vec![
             continue_listening,
+            recently_played_items,
             recently_played,
             new_releases,
             latest_podcasts,
@@ -161,6 +173,9 @@ pub async fn home_sections(
 
     if include(HomeSectionId::ContinueListening) {
         sections.push(continue_listening_section(state, account_id).await?);
+    }
+    if include(HomeSectionId::RecentlyPlayedItems) {
+        sections.push(recently_played_items_section(state, account_id).await?);
     }
     if include(HomeSectionId::RecentlyPlayed) {
         sections.push(recently_played_section(state, account_id).await?);
@@ -192,12 +207,25 @@ pub async fn recently_played_section(
     state: &AppState,
     account_id: Uuid,
 ) -> Result<HomeSection, ApiError> {
-    let history = state.playback_history_for_account(account_id, 20).await?;
+    let history = state.playback_history_for_account(account_id, 100).await?;
     Ok(HomeSection {
         id: HomeSectionId::RecentlyPlayed,
-        title: "Recently played".to_string(),
-        position: 1,
+        title: "Recently played tracks".to_string(),
+        position: 2,
         items: recently_played_cards(state, account_id, history).await?,
+    })
+}
+
+pub async fn recently_played_items_section(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<HomeSection, ApiError> {
+    let history = state.playback_history_for_account(account_id, 100).await?;
+    Ok(HomeSection {
+        id: HomeSectionId::RecentlyPlayedItems,
+        title: "Recently played albums and playlists".to_string(),
+        position: 1,
+        items: recently_played_item_cards(state, account_id, history).await?,
     })
 }
 
@@ -209,7 +237,7 @@ pub async fn new_releases_section(
     Ok(HomeSection {
         id: HomeSectionId::NewReleases,
         title: "New releases".to_string(),
-        position: 2,
+        position: 3,
         items: album_cards(state, account_id, albums).await?,
     })
 }
@@ -222,7 +250,7 @@ pub async fn latest_podcasts_section(
     Ok(HomeSection {
         id: HomeSectionId::LatestPodcasts,
         title: "Latest podcast episodes".to_string(),
-        position: 3,
+        position: 4,
         items: latest_podcast_episode_cards(state, account_id, latest_podcast_episodes).await?,
     })
 }
@@ -260,7 +288,12 @@ async fn recently_played_cards(
 ) -> Result<Vec<HomeCard>, ApiError> {
     let favorite_ids = state.track_favorite_ids_for_account(account_id).await?;
     let mut cards = Vec::new();
-    for item in history.into_iter().take(20) {
+    let mut seen = HashSet::new();
+    for item in history {
+        let key = format!("{}:{}", item.item_type, item.item_id);
+        if !seen.insert(key) {
+            continue;
+        }
         if let Some(card) = playback_card(
             state,
             account_id,
@@ -275,8 +308,98 @@ async fn recently_played_cards(
         {
             cards.push(card);
         }
+        if cards.len() >= 20 {
+            break;
+        }
     }
     Ok(cards)
+}
+
+async fn recently_played_item_cards(
+    state: &AppState,
+    account_id: Uuid,
+    history: Vec<PlaybackHistoryEvent>,
+) -> Result<Vec<HomeCard>, ApiError> {
+    let mut cards = Vec::new();
+    let mut seen = HashSet::new();
+    for item in history {
+        let Some(card) = recently_played_item_card(state, account_id, &item).await? else {
+            continue;
+        };
+        let key = format!("{:?}:{}", card.item_type, card.item_id);
+        if !seen.insert(key) {
+            continue;
+        }
+        cards.push(card);
+        if cards.len() >= 20 {
+            break;
+        }
+    }
+    Ok(cards)
+}
+
+async fn recently_played_item_card(
+    state: &AppState,
+    account_id: Uuid,
+    event: &PlaybackHistoryEvent,
+) -> Result<Option<HomeCard>, ApiError> {
+    match event.item_type {
+        PlaybackItemType::Track => {
+            if event.context_type == Some(PlaybackContextType::Playlist) {
+                if let Some(playlist_id) = event.context_id {
+                    match state.visible_playlist(account_id, playlist_id).await {
+                        Ok(playlist) => {
+                            return Ok(Some(
+                                playlist_card(
+                                    state,
+                                    account_id,
+                                    "recently_played_items",
+                                    playlist,
+                                    Some(event.played_at),
+                                )
+                                .await?,
+                            ));
+                        }
+                        Err(ApiError::NotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+
+            let track = match state.visible_track(event.item_id).await {
+                Ok(track) => track,
+                Err(ApiError::NotFound(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let album_id = if event.context_type == Some(PlaybackContextType::Album) {
+                event.context_id.unwrap_or(track.album_id)
+            } else {
+                track.album_id
+            };
+            let album = match state.visible_album(album_id).await {
+                Ok(album) => album,
+                Err(ApiError::NotFound(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let artist = match state.visible_artist(album.artist_id).await {
+                Ok(artist) => artist,
+                Err(ApiError::NotFound(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            Ok(Some(
+                album_card(
+                    state,
+                    account_id,
+                    "recently_played_items",
+                    album,
+                    artist,
+                    Some(event.played_at),
+                )
+                .await?,
+            ))
+        }
+        PlaybackItemType::Episode => Ok(None),
+    }
 }
 
 async fn album_cards(
@@ -291,7 +414,10 @@ async fn album_cards(
             Err(ApiError::NotFound(_)) => continue,
             Err(error) => return Err(error),
         };
-        cards.push(album_card(state, account_id, album, artist).await?);
+        cards.push(
+            album_card(state, account_id, "new_releases", album, artist, None)
+                .await?,
+        );
     }
     Ok(cards)
 }
@@ -322,7 +448,7 @@ async fn latest_podcast_episode_cards(
 async fn playback_card(
     state: &AppState,
     account_id: Uuid,
-    favorite_ids: &std::collections::HashSet<Uuid>,
+    favorite_ids: &HashSet<Uuid>,
     section_id: &str,
     item_type: PlaybackItemType,
     item_id: Uuid,
@@ -402,6 +528,14 @@ async fn track_home_card(
         ArtworkKind::Cover,
     )
     .await?;
+    let context = track_context_hint(
+        state,
+        account_id,
+        &album,
+        progress.and_then(|item| item.context_type.zip(item.context_id)),
+        history.and_then(|item| item.context_type.zip(item.context_id)),
+    )
+    .await?;
     Ok(HomeCard {
         id: format!("{section_id}:track:{}", track.id),
         item_type: HomeCardItemType::Track,
@@ -409,12 +543,9 @@ async fn track_home_card(
         title: track.title,
         subtitle: Some(artist.name),
         detail: Some(album.title.clone()),
+        quality: track.quality,
         artwork,
-        context: Some(ScreenContextHint {
-            entity_type: CatalogEntityType::Album,
-            entity_id: album.id,
-            title: album.title,
-        }),
+        context: Some(context),
         progress: progress.map(progress_hint),
         is_favorite: Some(is_favorite),
         played_at: history.map(|event| event.played_at),
@@ -453,6 +584,7 @@ async fn episode_home_card(
         detail: episode
             .episode_number
             .map(|number| format!("Episode {number}")),
+        quality: None,
         artwork,
         context: Some(ScreenContextHint {
             entity_type: CatalogEntityType::Podcast,
@@ -481,8 +613,10 @@ async fn episode_home_card(
 async fn album_card(
     state: &AppState,
     account_id: Uuid,
+    section_id: &str,
     album: Album,
     artist: Artist,
+    played_at: Option<DateTime<Utc>>,
 ) -> Result<HomeCard, ApiError> {
     let artwork = primary_artwork(
         state,
@@ -493,12 +627,13 @@ async fn album_card(
     )
     .await?;
     Ok(HomeCard {
-        id: format!("new_releases:album:{}", album.id),
+        id: format!("{section_id}:album:{}", album.id),
         item_type: HomeCardItemType::Album,
         item_id: album.id,
         title: album.title.clone(),
         subtitle: Some(artist.name),
         detail: album.release_year.map(|year| year.to_string()),
+        quality: None,
         artwork,
         context: Some(ScreenContextHint {
             entity_type: CatalogEntityType::Album,
@@ -507,12 +642,53 @@ async fn album_card(
         }),
         progress: None,
         is_favorite: None,
-        played_at: None,
+        played_at,
         released_at: album.published_at,
         actions: vec![action_hint(
             "open",
             "GET",
             format!("/api/v1/catalog/albums/{}/detail", album.id),
+        )],
+    })
+}
+
+async fn playlist_card(
+    state: &AppState,
+    account_id: Uuid,
+    section_id: &str,
+    playlist: Playlist,
+    played_at: Option<DateTime<Utc>>,
+) -> Result<HomeCard, ApiError> {
+    let artwork = primary_artwork(
+        state,
+        account_id,
+        CatalogEntityType::Playlist,
+        playlist.id,
+        ArtworkKind::Cover,
+    )
+    .await?;
+    Ok(HomeCard {
+        id: format!("{section_id}:playlist:{}", playlist.id),
+        item_type: HomeCardItemType::Playlist,
+        item_id: playlist.id,
+        title: playlist.name.clone(),
+        subtitle: playlist.description.clone(),
+        detail: Some("Playlist".to_string()),
+        quality: None,
+        artwork,
+        context: Some(ScreenContextHint {
+            entity_type: CatalogEntityType::Playlist,
+            entity_id: playlist.id,
+            title: playlist.name,
+        }),
+        progress: None,
+        is_favorite: None,
+        played_at,
+        released_at: None,
+        actions: vec![action_hint(
+            "open",
+            "GET",
+            format!("/api/v1/playlists/{}", playlist.id),
         )],
     })
 }
@@ -532,6 +708,48 @@ pub async fn primary_artwork(
         Err(ApiError::NotFound(_)) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+async fn track_context_hint(
+    state: &AppState,
+    account_id: Uuid,
+    fallback_album: &Album,
+    progress_context: Option<(PlaybackContextType, Uuid)>,
+    history_context: Option<(PlaybackContextType, Uuid)>,
+) -> Result<ScreenContextHint, ApiError> {
+    match progress_context.or(history_context) {
+        Some((PlaybackContextType::Playlist, id)) => {
+            match state.visible_playlist(account_id, id).await {
+                Ok(playlist) => {
+                    return Ok(ScreenContextHint {
+                        entity_type: CatalogEntityType::Playlist,
+                        entity_id: playlist.id,
+                        title: playlist.name,
+                    });
+                }
+                Err(ApiError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Some((PlaybackContextType::Album, id)) => match state.visible_album(id).await {
+            Ok(album) => {
+                return Ok(ScreenContextHint {
+                    entity_type: CatalogEntityType::Album,
+                    entity_id: album.id,
+                    title: album.title,
+                });
+            }
+            Err(ApiError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        },
+        _ => {}
+    }
+
+    Ok(ScreenContextHint {
+        entity_type: CatalogEntityType::Album,
+        entity_id: fallback_album.id,
+        title: fallback_album.title.clone(),
+    })
 }
 
 fn screen_artwork(artwork: ArtworkAsset) -> ScreenArtwork {

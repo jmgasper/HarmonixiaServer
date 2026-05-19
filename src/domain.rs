@@ -1230,6 +1230,7 @@ pub struct Track {
     pub disc_number: Option<i32>,
     pub track_number: Option<i32>,
     pub duration_seconds: Option<i32>,
+    pub quality: Option<String>,
     pub stable_grouping: bool,
     pub published_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,

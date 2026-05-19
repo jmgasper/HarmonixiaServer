@@ -36,7 +36,7 @@ use crate::{
         AacTranscodeProfile, AccountRole, Album, Artist, ArtworkAsset, ArtworkKind,
         AuthenticatedAccount,
         CatalogEntityType, Episode, FavoriteToggleOutcome, ImportJob, ImportJobKind,
-        ImportJobSource, MaintenanceScope, MediaFile, PlaybackContextType,
+        ImportJobSource, MaintenanceScope, MediaFile, MetadataProvenance, PlaybackContextType,
         PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress, Playlist, PlaylistItem,
         PlaylistScope, Podcast, ProviderHealth, ProviderKind, ProviderSetting, ProviderStatus,
         QuarantineItem, QuarantineStatus, RepairPlan, SonosDeliveryKind, SonosSignedClaim,
@@ -977,7 +977,10 @@ impl AppState {
     ) {
         self.publish_home_sections_updated(
             account_id,
-            &[HomeSectionId::RecentlyPlayed],
+            &[
+                HomeSectionId::RecentlyPlayedItems,
+                HomeSectionId::RecentlyPlayed,
+            ],
             "playback_history_updated",
             "playback_history",
             "updated",
@@ -2589,6 +2592,25 @@ impl AppState {
         self.inner
             .repository
             .visible_artwork_assets(account_id, entity_type, entity_id, artwork_kind)
+            .await
+            .map_err(api_storage_error)?
+            .ok_or_else(|| {
+                ApiError::NotFound(format!(
+                    "{} {entity_id} was not found",
+                    entity_type.api_name()
+                ))
+            })
+    }
+
+    pub async fn visible_metadata_provenance_for_entity(
+        &self,
+        account_id: Uuid,
+        entity_type: CatalogEntityType,
+        entity_id: Uuid,
+    ) -> Result<Vec<MetadataProvenance>, ApiError> {
+        self.inner
+            .repository
+            .visible_metadata_provenance_for_entity(account_id, entity_type, entity_id)
             .await
             .map_err(api_storage_error)?
             .ok_or_else(|| {

@@ -1238,6 +1238,24 @@ impl TheAudioDbProvider {
 
         Ok(response.artists.into_iter().flatten().next())
     }
+
+    async fn search_artist_by_mbid(
+        &self,
+        artist_mbid: &str,
+    ) -> Result<Option<TheAudioDbArtist>, ProviderHttpError> {
+        let Some(api_key) = self.api_key.as_deref() else {
+            return Ok(None);
+        };
+        let response = self
+            .http
+            .get_json::<TheAudioDbArtistResponse>(
+                &format!("/api/v1/json/{api_key}/artist-mb.php"),
+                &[("i", artist_mbid.to_string())],
+            )
+            .await?;
+
+        Ok(response.artists.into_iter().flatten().next())
+    }
 }
 
 /// Handles provider base url for metadata provider registry and provider adapters used by the import pipeline.
@@ -1724,13 +1742,29 @@ impl MetadataProvider for TheAudioDbProvider {
             Err(error) => log_provider_error(self.kind(), &error),
         }
 
-        let artist_search = self.search_artist(&grouping.album_artist).await;
-        result.outcome.observe_http(&artist_search);
-        match artist_search {
-            Ok(Some(artist)) => add_the_audio_db_artist(&mut result.bundle, self.kind(), artist),
-            Ok(None) => {}
-            Err(error) if error.is_not_found() => {}
-            Err(error) => log_provider_error(self.kind(), &error),
+        let mut matched_artist = None;
+        if let Some(artist_mbid) = musicbrainz_artist_id(context) {
+            let artist_search = self.search_artist_by_mbid(&artist_mbid).await;
+            result.outcome.observe_http(&artist_search);
+            match artist_search {
+                Ok(Some(artist)) => matched_artist = Some(artist),
+                Ok(None) => {}
+                Err(error) if error.is_not_found() => {}
+                Err(error) => log_provider_error(self.kind(), &error),
+            }
+        }
+        if matched_artist.is_none() {
+            let artist_search = self.search_artist(&grouping.album_artist).await;
+            result.outcome.observe_http(&artist_search);
+            match artist_search {
+                Ok(Some(artist)) => matched_artist = Some(artist),
+                Ok(None) => {}
+                Err(error) if error.is_not_found() => {}
+                Err(error) => log_provider_error(self.kind(), &error),
+            }
+        }
+        if let Some(artist) = matched_artist {
+            add_the_audio_db_artist(&mut result.bundle, self.kind(), artist);
         }
 
         result
@@ -1913,23 +1947,57 @@ struct TheAudioDbArtistResponse {
     artists: Option<Vec<TheAudioDbArtist>>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 /// Represents the audio db artist in the metadata provider registry and provider adapters used by the import pipeline.
 ///
-/// Functionality: Carries fields `id_artist`, `artist`, `artist_thumb`, `artist_fanart`, `artist_fanart_2` for metadata provider registry and provider adapters used by the import pipeline.
-/// Dependencies: depends on `Option<String>`, `Option<String>`, `Option<String>`, `Option<String>`, `Option<String>` and any derives or trait bounds declared on the type.
+/// Functionality: Carries normalized artist fields from TheAudioDB for metadata provider registry and provider adapters used by the import pipeline.
+/// Dependencies: depends on optional TheAudioDB string fields and any derives or trait bounds declared on the type.
 /// Used by: referenced from `src/providers.rs`.
 struct TheAudioDbArtist {
     #[serde(rename = "idArtist")]
     id_artist: Option<String>,
     #[serde(rename = "strArtist")]
     artist: Option<String>,
+    #[serde(rename = "strLabel")]
+    label: Option<String>,
+    #[serde(rename = "strGenre")]
+    genre: Option<String>,
+    #[serde(rename = "strStyle")]
+    style: Option<String>,
+    #[serde(rename = "strMood")]
+    mood: Option<String>,
+    #[serde(rename = "strBiography")]
+    biography: Option<String>,
+    #[serde(rename = "strBiographyEN")]
+    biography_en: Option<String>,
+    #[serde(rename = "strWebsite")]
+    website: Option<String>,
+    #[serde(rename = "strFacebook")]
+    facebook: Option<String>,
+    #[serde(rename = "strTwitter")]
+    twitter: Option<String>,
+    #[serde(rename = "strLastFMChart")]
+    lastfm: Option<String>,
     #[serde(rename = "strArtistThumb")]
     artist_thumb: Option<String>,
+    #[serde(rename = "strArtistThumb2")]
+    artist_thumb_2: Option<String>,
+    #[serde(rename = "strArtistWideThumb")]
+    artist_wide_thumb: Option<String>,
+    #[serde(rename = "strArtistLogo")]
+    artist_logo: Option<String>,
+    #[serde(rename = "strArtistCutout")]
+    artist_cutout: Option<String>,
+    #[serde(rename = "strArtistClearart")]
+    artist_clearart: Option<String>,
+    #[serde(rename = "strArtistBanner")]
+    artist_banner: Option<String>,
     #[serde(rename = "strArtistFanart")]
     artist_fanart: Option<String>,
     #[serde(rename = "strArtistFanart2")]
     artist_fanart_2: Option<String>,
+    #[serde(rename = "strArtistFanart3")]
+    artist_fanart_3: Option<String>,
 }
 
 /// Handles add musicbrainz recording for metadata provider registry and provider adapters used by the import pipeline.
@@ -2524,37 +2592,93 @@ fn add_the_audio_db_artist(
             confidence,
         );
     }
-    if let Some(url) = artist.artist_thumb.as_deref().and_then(non_empty) {
-        bundle.artwork.push(ArtworkAssetDraft {
-            entity_type: CatalogEntityType::Artist,
-            provider,
-            artwork_kind: ArtworkKind::Artist,
-            source_uri: Some(url.to_string()),
-            file_path: None,
-            mime_type: mime_type_for_uri(url).map(str::to_string),
-            width: None,
-            height: None,
-            confidence: 0.76,
-        });
+    for (field_name, value) in [
+        ("label", artist.label.as_deref()),
+        ("genre", artist.genre.as_deref()),
+        ("style", artist.style.as_deref()),
+        ("mood", artist.mood.as_deref()),
+        (
+            "description",
+            artist
+                .biography_en
+                .as_deref()
+                .or(artist.biography.as_deref()),
+        ),
+        ("website", artist.website.as_deref()),
+        ("facebook", artist.facebook.as_deref()),
+        ("twitter", artist.twitter.as_deref()),
+        ("lastfm", artist.lastfm.as_deref()),
+    ] {
+        if let Some(value) = value.and_then(non_empty) {
+            push_provenance(
+                bundle,
+                CatalogEntityType::Artist,
+                provider,
+                field_name,
+                json!(value),
+                confidence,
+            );
+        }
     }
-    if let Some(url) = artist
-        .artist_fanart
-        .as_deref()
-        .or(artist.artist_fanart_2.as_deref())
-        .and_then(non_empty)
-    {
-        bundle.artwork.push(ArtworkAssetDraft {
-            entity_type: CatalogEntityType::Artist,
-            provider,
-            artwork_kind: ArtworkKind::Fanart,
-            source_uri: Some(url.to_string()),
-            file_path: None,
-            mime_type: mime_type_for_uri(url).map(str::to_string),
-            width: None,
-            height: None,
-            confidence: 0.74,
-        });
+
+    for (url, confidence) in [
+        (artist.artist_thumb.as_deref(), 0.78),
+        (artist.artist_thumb_2.as_deref(), 0.77),
+        (artist.artist_wide_thumb.as_deref(), 0.72),
+        (artist.artist_cutout.as_deref(), 0.70),
+        (artist.artist_clearart.as_deref(), 0.70),
+    ] {
+        if let Some(url) = url.and_then(non_empty) {
+            push_artwork(
+                bundle,
+                CatalogEntityType::Artist,
+                provider,
+                ArtworkKind::Artist,
+                url,
+                confidence,
+            );
+        }
     }
+
+    for (url, confidence) in [
+        (artist.artist_fanart.as_deref(), 0.74),
+        (artist.artist_fanart_2.as_deref(), 0.73),
+        (artist.artist_fanart_3.as_deref(), 0.72),
+        (artist.artist_banner.as_deref(), 0.68),
+        (artist.artist_logo.as_deref(), 0.66),
+    ] {
+        if let Some(url) = url.and_then(non_empty) {
+            push_artwork(
+                bundle,
+                CatalogEntityType::Artist,
+                provider,
+                ArtworkKind::Fanart,
+                url,
+                confidence,
+            );
+        }
+    }
+}
+
+fn push_artwork(
+    bundle: &mut ProviderMetadataBundle,
+    entity_type: CatalogEntityType,
+    provider: ProviderKind,
+    artwork_kind: ArtworkKind,
+    url: &str,
+    confidence: f32,
+) {
+    bundle.artwork.push(ArtworkAssetDraft {
+        entity_type,
+        provider,
+        artwork_kind,
+        source_uri: Some(url.to_string()),
+        file_path: None,
+        mime_type: mime_type_for_uri(url).map(str::to_string),
+        width: None,
+        height: None,
+        confidence,
+    });
 }
 
 /// Handles add music provenance for metadata provider registry and provider adapters used by the import pipeline.
@@ -4026,6 +4150,7 @@ mod tests {
                     "https://www.theaudiodb.com/images/media/artist/fanart.jpg".to_string(),
                 ),
                 artist_fanart_2: None,
+                ..Default::default()
             },
         );
 

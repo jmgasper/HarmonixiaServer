@@ -4142,6 +4142,7 @@ async fn home_and_catalog_detail_contracts_expose_ordered_read_models() {
         section_ids,
         vec![
             "continue_listening",
+            "recently_played_items",
             "recently_played",
             "new_releases",
             "latest_podcasts"
@@ -4157,11 +4158,15 @@ async fn home_and_catalog_detail_contracts_expose_ordered_read_models() {
         home["sections"][0]["items"][0]["progress"]["position_seconds"],
         30
     );
-    let release_items = home["sections"][2]["items"].as_array().unwrap();
+    let recent_items = home["sections"][1]["items"].as_array().unwrap();
+    assert!(recent_items
+        .iter()
+        .any(|item| item["item_type"] == "album" && item["item_id"] == json!(album_id)));
+    let release_items = home["sections"][3]["items"].as_array().unwrap();
     assert!(release_items
         .iter()
         .any(|item| item["item_type"] == "album" && item["item_id"] == json!(album_id)));
-    let podcast_items = home["sections"][3]["items"].as_array().unwrap();
+    let podcast_items = home["sections"][4]["items"].as_array().unwrap();
     assert!(podcast_items
         .iter()
         .all(|item| item["item_type"] == "episode"));
