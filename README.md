@@ -12,6 +12,8 @@ This foundation slice implements the Postgres-backed core API surface:
   startup defaults.
 - Quarantine retry handoff back into the shared import pipeline.
 - Personal and household-shared playlist CRUD foundations.
+- Account-scoped shared playback session runtime for Android queue/state,
+  local attachment, Sonos target binding, and confirmed transfers.
 - User-scoped playback progress and history persistence.
 - Account-scoped Home screen read model with fixed v1 sections, card-ready
   artwork/action/context hints, latest podcast episode cards, and refresh
@@ -39,7 +41,9 @@ HARMONIXIA_DATABASE_URL=postgres://user:password@localhost/harmonixia cargo run
 Startup requires Postgres. The server connects before binding the HTTP listener,
 applies embedded migrations from `migrations/`, and verifies the tables used by
 system configuration, provider settings, accounts, import jobs, provider health,
-quarantine retry state, playlists, and playback progress/history.
+quarantine retry state, playlists, and playback progress/history. Shared
+playback sessions are runtime-only and use those durable progress/history rows
+for resume and recently played projections.
 
 Environment variables:
 
@@ -79,6 +83,13 @@ browse surfaces:
 
 - `GET /api/v1/me/home`
 - `GET /api/v1/events`
+- `GET /api/v1/me/playback/session`
+- `POST /api/v1/me/playback/session/attach`
+- `POST /api/v1/me/playback/session/detach`
+- `PUT /api/v1/me/playback/session/queue`
+- `PATCH /api/v1/me/playback/session/state`
+- `POST /api/v1/me/playback/session/transfer`
+- `POST /api/v1/me/playback/session/transfer/confirm`
 - `GET /api/v1/catalog/artists/{artist_id}/detail`
 - `GET /api/v1/catalog/albums/{album_id}/detail`
 - `GET /api/v1/catalog/podcasts`

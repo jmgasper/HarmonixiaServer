@@ -31,6 +31,8 @@ pub fn router() -> Router<AppState> {
         .route("/targets/:target_id/resume", post(resume_target))
         .route("/targets/:target_id/stop", post(stop_target))
         .route("/targets/:target_id/seek", post(seek_target))
+        .route("/targets/:target_id/volume", post(set_target_volume))
+        .route("/targets/:target_id/mute", post(set_target_mute))
         .route("/targets/:target_id/next", post(next_target))
         .route("/targets/:target_id/previous", post(previous_target))
         .route("/media/:token", get(fetch_signed_media))
@@ -127,6 +129,16 @@ pub enum SonosPlayRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SonosSeekRequest {
     pub position_seconds: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SonosVolumeRequest {
+    pub volume: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SonosMuteRequest {
+    pub muted: bool,
 }
 
 impl SonosPlayRequest {
@@ -288,6 +300,59 @@ pub async fn seek_target(
 
 #[utoipa::path(
     post,
+    path = "/api/v1/sonos/targets/{target_id}/volume",
+    tag = "sonos",
+    security(("basicAuth" = [])),
+    params(("target_id" = String, Path, description = "Sonos speaker or group target id")),
+    request_body = SonosVolumeRequest,
+    responses(
+        (status = 200, description = "Sonos target volume updated", body = SonosPlaybackResponse),
+        (status = 400, description = "Volume is outside the supported 0-100 range", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 503, description = "Sonos target is unreachable", body = ErrorResponse)
+    )
+)]
+pub async fn set_target_volume(
+    State(state): State<AppState>,
+    Path(target_id): Path<String>,
+    _user: AuthenticatedUser,
+    Json(request): Json<SonosVolumeRequest>,
+) -> Result<Json<SonosPlaybackResponse>, Response> {
+    state
+        .sonos_set_target_volume(target_id, request)
+        .await
+        .map(Json)
+        .map_err(map_sonos_operation_error)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/sonos/targets/{target_id}/mute",
+    tag = "sonos",
+    security(("basicAuth" = [])),
+    params(("target_id" = String, Path, description = "Sonos speaker or group target id")),
+    request_body = SonosMuteRequest,
+    responses(
+        (status = 200, description = "Sonos target mute state updated", body = SonosPlaybackResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 503, description = "Sonos target is unreachable", body = ErrorResponse)
+    )
+)]
+pub async fn set_target_mute(
+    State(state): State<AppState>,
+    Path(target_id): Path<String>,
+    _user: AuthenticatedUser,
+    Json(request): Json<SonosMuteRequest>,
+) -> Result<Json<SonosPlaybackResponse>, Response> {
+    state
+        .sonos_set_target_mute(target_id, request)
+        .await
+        .map(Json)
+        .map_err(map_sonos_operation_error)
+}
+
+#[utoipa::path(
+    post,
     path = "/api/v1/sonos/targets/{target_id}/next",
     tag = "sonos",
     security(("basicAuth" = [])),
@@ -439,7 +504,7 @@ fn map_sonos_signed_media_validation_error(
     }
 }
 
-fn map_sonos_operation_error(error: SonosOperationError) -> Response {
+pub(crate) fn map_sonos_operation_error(error: SonosOperationError) -> Response {
     match error {
         SonosOperationError::Api(error) => error.into_response(),
         SonosOperationError::Reason(reason) => {
@@ -506,7 +571,17 @@ fn sonos_error_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{SonosDeliveryKind, SonosSignedClaim};
+    use crate::{
+        domain::{
+            PlaybackRepeatMode, PlaybackSessionState, PlaybackTransferState,
+            SonosDeliveryKind, SonosSignedClaim,
+        },
+        state::{
+            PlaybackSessionAttachment, PlaybackSessionQueueItem, PlaybackSessionReadModel,
+            PlaybackSessionTarget, PlaybackSessionTransfer,
+        },
+    };
+    use chrono::Utc;
     use serde_json::json;
 
     #[test]
@@ -608,5 +683,87 @@ mod tests {
         assert_eq!(value["volume_percent"], serde_json::Value::Null);
         assert_eq!(value["muted"], serde_json::Value::Null);
         assert_eq!(value["transport_state"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn playback_session_target_serializes_local_and_sonos_bindings() {
+        let attachment_id = Uuid::parse_str("018f26c0-0000-7000-8000-000000000030").unwrap();
+
+        assert_eq!(
+            serde_json::to_value(PlaybackSessionTarget::LocalAndroid {
+                attachment_id: Some(attachment_id),
+            })
+            .unwrap(),
+            json!({
+                "kind": "local_android",
+                "attachment_id": "018f26c0-0000-7000-8000-000000000030"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(PlaybackSessionTarget::Sonos {
+                target_id: "speaker-1".into(),
+            })
+            .unwrap(),
+            json!({
+                "kind": "sonos",
+                "target_id": "speaker-1"
+            })
+        );
+    }
+
+    #[test]
+    fn playback_session_snapshot_serializes_required_null_transfer_fields() {
+        let now = Utc::now();
+        let session = PlaybackSessionReadModel {
+            session_id: Uuid::parse_str("018f26c0-0000-7000-8000-000000000031").unwrap(),
+            queue: vec![PlaybackSessionQueueItem {
+                item_type: PlaybackItemType::Track,
+                item_id: Uuid::parse_str("018f26c0-0000-7000-8000-000000000032").unwrap(),
+                duration_seconds: None,
+            }],
+            context_type: None,
+            context_id: None,
+            current_index: Some(0),
+            playback_state: PlaybackSessionState::Playing,
+            position_seconds: 12,
+            duration_seconds: None,
+            repeat_mode: PlaybackRepeatMode::One,
+            shuffle: true,
+            active_target: PlaybackSessionTarget::Sonos {
+                target_id: "speaker-1".into(),
+            },
+            attachment: Some(PlaybackSessionAttachment {
+                attachment_id: Uuid::parse_str("018f26c0-0000-7000-8000-000000000033")
+                    .unwrap(),
+                device_id: None,
+                device_name: None,
+                app_instance_id: None,
+                attached_at: now,
+            }),
+            transfer: Some(PlaybackSessionTransfer {
+                transfer_id: Uuid::parse_str("018f26c0-0000-7000-8000-000000000034")
+                    .unwrap(),
+                state: PlaybackTransferState::Pending,
+                requested_target: PlaybackSessionTarget::LocalAndroid {
+                    attachment_id: None,
+                },
+                confirmed_target: None,
+                requested_at: now,
+                confirmed_at: None,
+                failure_reason: None,
+            }),
+            revision: 7,
+            snapshot_at: now,
+        };
+        let value = serde_json::to_value(session).unwrap();
+
+        assert_eq!(value["queue"][0]["duration_seconds"], serde_json::Value::Null);
+        assert_eq!(value["context_type"], serde_json::Value::Null);
+        assert_eq!(value["context_id"], serde_json::Value::Null);
+        assert_eq!(value["duration_seconds"], serde_json::Value::Null);
+        assert_eq!(value["attachment"]["device_id"], serde_json::Value::Null);
+        assert_eq!(value["transfer"]["confirmed_target"], serde_json::Value::Null);
+        assert_eq!(value["transfer"]["confirmed_at"], serde_json::Value::Null);
+        assert_eq!(value["transfer"]["failure_reason"], serde_json::Value::Null);
     }
 }

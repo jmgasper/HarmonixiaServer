@@ -250,6 +250,38 @@ pub enum PlaybackContextType {
     Podcast,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackRepeatMode {
+    Off,
+    One,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackSessionState {
+    Stopped,
+    Playing,
+    Paused,
+    Buffering,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackTargetKind {
+    LocalAndroid,
+    Sonos,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackTransferState {
+    Pending,
+    Confirmed,
+    Failed,
+}
+
 impl PlaybackContextType {
     pub fn api_name(self) -> &'static str {
         match self {

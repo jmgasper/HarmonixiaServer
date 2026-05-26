@@ -17,8 +17,9 @@ use crate::{
         media::resolve_original_file,
         sonos::{
             SonosGroupTarget, SonosNextItemSummary, SonosPlaybackResponse,
-            SonosPlaybackTarget, SonosPlayRequest, SonosSeekRequest,
+            SonosMuteRequest, SonosPlaybackTarget, SonosPlayRequest, SonosSeekRequest,
             SonosSessionSummary, SonosSpeakerTarget, SonosTargetsResponse,
+            SonosVolumeRequest,
         },
     },
     domain::{
@@ -27,8 +28,9 @@ use crate::{
     },
     error::{ApiError, SonosErrorReason},
     state::{
-        sonos_aac_profile_for_delivery, sonos_delivery_kind_for_media_file, AppState,
-        SonosMediaAuthorizationContext, SonosSignedMediaIssueError,
+        playback_state_for_sonos_status, sonos_aac_profile_for_delivery,
+        sonos_delivery_kind_for_media_file, AppState, PlaybackSessionQueueItem,
+        PlaybackSessionReadModel, SonosMediaAuthorizationContext, SonosSignedMediaIssueError,
     },
     transcode::TranscodeSlot,
 };
@@ -38,6 +40,8 @@ const ZONE_PLAYER_ST: &str = "urn:schemas-upnp-org:device:ZonePlayer:1";
 const GROUP_RENDERING_CONTROL_PATH: &str = "/MediaRenderer/GroupRenderingControl/Control";
 const GROUP_RENDERING_CONTROL_SERVICE: &str =
     "urn:schemas-upnp-org:service:GroupRenderingControl:1";
+const RENDERING_CONTROL_PATH: &str = "/MediaRenderer/RenderingControl/Control";
+const RENDERING_CONTROL_SERVICE: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
 const AV_TRANSPORT_CONTROL_PATH: &str = "/MediaRenderer/AVTransport/Control";
 const AV_TRANSPORT_SERVICE: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const EMPTY_DISCOVERY_REFRESHES_BEFORE_EXPIRY: usize = 3;
@@ -778,14 +782,6 @@ pub async fn play_target(
     owner: AuthenticatedAccount,
     request: SonosPlayRequest,
 ) -> Result<SonosPlaybackResponse, SonosOperationError> {
-    expire_reconnecting_target_if_overdue(&state, &target_id, Instant::now()).await;
-    if let Some(snapshot) = state.sonos_managed_sessions().snapshot(&target_id) {
-        if snapshot.status == SonosSessionStatus::Reconnecting {
-            return Err(SonosOperationError::reason(SonosErrorReason::TargetReconnecting));
-        }
-    }
-
-    let resolved_target = resolve_live_target(&state, &target_id)?;
     let playback_context = playback_context_for_sonos_request(&request);
     let queue = resolve_play_queue(&state, owner.id, request).await?;
     if queue.is_empty() {
@@ -793,7 +789,95 @@ pub async fn play_target(
             ApiError::BadRequest("Sonos play source resolved to an empty queue".into()).into(),
         );
     }
+    let context_type = playback_context.map(|context| context.0);
+    let context_id = playback_context.map(|context| context.1);
+    let response = start_managed_sonos_session(
+        state.clone(),
+        target_id.clone(),
+        owner.clone(),
+        queue.clone(),
+        context_type,
+        context_id,
+        0,
+        0,
+    )
+    .await?;
+    if let Err(error) = state.replace_playback_session_from_sonos_start(
+        owner.id,
+        &target_id,
+        playback_queue_from_sonos_queue(&queue),
+        context_type,
+        context_id,
+        0,
+        0,
+        response
+            .session
+            .as_ref()
+            .and_then(|session| session.current_duration_seconds),
+        playback_state_for_sonos_status(
+            SonosSessionStatus::Active,
+            target_transport_state(&response.target),
+        ),
+    ) {
+        tracing::debug!(%error, %target_id, "failed to synchronize direct Sonos play into shared playback session");
+    }
+    Ok(response)
+}
 
+pub async fn play_session_snapshot(
+    state: AppState,
+    target_id: String,
+    owner: AuthenticatedAccount,
+    snapshot: &PlaybackSessionReadModel,
+) -> Result<SonosPlaybackResponse, SonosOperationError> {
+    let current_index = snapshot
+        .current_index
+        .ok_or_else(|| ApiError::BadRequest("playback session has no current queue item".into()))?
+        as usize;
+    if current_index >= snapshot.queue.len() {
+        return Err(ApiError::BadRequest(
+            "playback session current_index points outside the queue".into(),
+        )
+        .into());
+    }
+    let queue = sonos_queue_from_playback_queue(&snapshot.queue);
+    start_managed_sonos_session(
+        state,
+        target_id,
+        owner,
+        queue,
+        snapshot.context_type,
+        snapshot.context_id,
+        current_index,
+        snapshot.position_seconds,
+    )
+    .await
+}
+
+async fn start_managed_sonos_session(
+    state: AppState,
+    target_id: String,
+    owner: AuthenticatedAccount,
+    queue: Vec<SonosQueueEntry>,
+    context_type: Option<PlaybackContextType>,
+    context_id: Option<Uuid>,
+    queue_index: usize,
+    position_seconds: u32,
+) -> Result<SonosPlaybackResponse, SonosOperationError> {
+    expire_reconnecting_target_if_overdue(&state, &target_id, Instant::now()).await;
+    if let Some(snapshot) = state.sonos_managed_sessions().snapshot(&target_id) {
+        if snapshot.status == SonosSessionStatus::Reconnecting {
+            return Err(SonosOperationError::reason(SonosErrorReason::TargetReconnecting));
+        }
+    }
+    if queue.is_empty() || queue_index >= queue.len() {
+        return Err(ApiError::BadRequest(
+            "Sonos playback snapshot has an invalid queue index".into(),
+        )
+        .into());
+    }
+
+    let resolved_target = resolve_live_target(&state, &target_id)?;
     let session_generation = state.sonos_managed_sessions().next_generation(&target_id);
     let item_generation = 1;
     let session_id = Uuid::new_v4();
@@ -803,7 +887,7 @@ pub async fn play_target(
         session_id,
         session_generation,
         item_generation,
-        &queue[0],
+        &queue[queue_index],
     )
     .await?;
 
@@ -820,7 +904,15 @@ pub async fn play_target(
     }
     ungroup_if_needed(&client, &resolved_target).await?;
     let now = Instant::now();
-    let current_duration_seconds = queue[0].duration_seconds;
+    let current_duration_seconds = queue[queue_index].duration_seconds;
+    if let Some(duration_seconds) = current_duration_seconds {
+        if position_seconds > duration_seconds {
+            return Err(ApiError::BadRequest(format!(
+                "position_seconds {position_seconds} exceeds current item duration {duration_seconds}"
+            ))
+            .into());
+        }
+    }
     let session = ManagedSonosSession {
         target_id: target_id.clone(),
         target_kind: resolved_target.kind,
@@ -829,14 +921,14 @@ pub async fn play_target(
         grouped_coordinator_id: resolved_target.grouped_coordinator_id.clone(),
         owner_account_id: owner.id,
         owner_username: owner.username,
-        context_type: playback_context.map(|context| context.0),
-        context_id: playback_context.map(|context| context.1),
+        context_type,
+        context_id,
         session_id,
         session_generation,
         item_generation,
         queue,
-        queue_index: 0,
-        current_position_seconds: 0,
+        queue_index,
+        current_position_seconds: position_seconds,
         current_duration_seconds,
         status: SonosSessionStatus::Active,
         position_advancing: true,
@@ -864,13 +956,38 @@ pub async fn play_target(
             return Err(error);
         }
     };
-    if let Err(error) = load_and_start_current_item(&client, &resolved_target, &media_url).await {
+    if let Err(error) = set_current_item_uri(&client, &resolved_target, &media_url).await {
         if let Some(session) = replaced_session {
             state.sonos_managed_sessions().insert(session);
         } else {
             state.sonos_managed_sessions().remove(&target_id);
         }
         return Err(error);
+    }
+    if let Err(error) = start_current_item(&client, &resolved_target).await {
+        stop_target_after_startup_failure(&client, &resolved_target, &target_id).await;
+        if let Some(session) = replaced_session {
+            state.sonos_managed_sessions().insert(session);
+        } else {
+            state.sonos_managed_sessions().remove(&target_id);
+        }
+        return Err(error);
+    }
+    if position_seconds > 0 {
+        let target = format_duration(position_seconds);
+        let body = format!(
+            "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{target}</Target>"
+        );
+        if let Err(error) = send_av_transport_action(&client, &resolved_target, "Seek", &body).await
+        {
+            stop_target_after_startup_failure(&client, &resolved_target, &target_id).await;
+            if let Some(session) = replaced_session {
+                state.sonos_managed_sessions().insert(session);
+            } else {
+                state.sonos_managed_sessions().remove(&target_id);
+            }
+            return Err(error);
+        }
     }
     let latest_target = refresh_target_after_command(&client, resolved_target.clone()).await;
     state.sonos_managed_sessions().update(&target_id, |session| {
@@ -916,6 +1033,30 @@ pub async fn seek_target(
     .await
 }
 
+pub async fn set_target_volume(
+    state: AppState,
+    target_id: String,
+    request: SonosVolumeRequest,
+) -> Result<SonosPlaybackResponse, SonosOperationError> {
+    if request.volume > 100 {
+        return Err(ApiError::BadRequest("Sonos volume must be between 0 and 100".into()).into());
+    }
+    command_target_rendering(
+        state,
+        target_id,
+        SonosRenderingCommand::Volume(request.volume),
+    )
+    .await
+}
+
+pub async fn set_target_mute(
+    state: AppState,
+    target_id: String,
+    request: SonosMuteRequest,
+) -> Result<SonosPlaybackResponse, SonosOperationError> {
+    command_target_rendering(state, target_id, SonosRenderingCommand::Mute(request.muted)).await
+}
+
 pub async fn next_target(
     state: AppState,
     target_id: String,
@@ -934,11 +1075,33 @@ pub async fn stop_target(
     state: AppState,
     target_id: String,
 ) -> Result<SonosPlaybackResponse, SonosOperationError> {
+    stop_target_inner(state, target_id, true).await
+}
+
+pub async fn stop_target_for_transfer(
+    state: AppState,
+    target_id: String,
+) -> Result<SonosPlaybackResponse, SonosOperationError> {
+    stop_target_inner(state, target_id, false).await
+}
+
+async fn stop_target_inner(
+    state: AppState,
+    target_id: String,
+    sync_shared_session: bool,
+) -> Result<SonosPlaybackResponse, SonosOperationError> {
     let transport_guard = state
         .sonos_managed_sessions()
         .acquire_transport_guard(&target_id)
         .await;
-    if expire_reconnecting_target_if_overdue(&state, &target_id, Instant::now()).await {
+    if expire_reconnecting_target_if_overdue_with_shared_sync(
+        &state,
+        &target_id,
+        Instant::now(),
+        sync_shared_session,
+    )
+    .await
+    {
         return Err(SonosOperationError::reason(SonosErrorReason::SessionNotManaged));
     }
     let Some(mut session) = state.sonos_managed_sessions().remove(&target_id) else {
@@ -972,6 +1135,12 @@ pub async fn stop_target(
     let stopped_snapshot = session.snapshot();
     drop(transport_guard);
     write_session_snapshot_attribution(&state, &stopped_snapshot, false, true).await;
+    if sync_shared_session {
+        let _ = state.stop_playback_session_sonos_target(
+            stopped_snapshot.owner_account_id,
+            &stopped_snapshot.target_id,
+        );
+    }
     Ok(SonosPlaybackResponse {
         target,
         session: None,
@@ -1035,7 +1204,7 @@ pub async fn reconcile_active_sessions(state: &AppState, request_timeout: Durati
                 let position_advancing =
                     position_advancing_for_transport(target_transport_state(&target.public_target))
                         .unwrap_or(session.position_advancing);
-                let updated =
+                let updated_snapshot =
                     state
                         .sonos_managed_sessions()
                         .update_snapshot(&session, |session| {
@@ -1045,8 +1214,10 @@ pub async fn reconcile_active_sessions(state: &AppState, request_timeout: Durati
                             session.status = SonosSessionStatus::Active;
                             session.reconnect_deadline = None;
                             session.transient_loss_observed_at = None;
+                            session.snapshot()
                         });
-                if updated.is_some() {
+                if let Some(updated_snapshot) = updated_snapshot {
+                    sync_shared_session_snapshot(state, &updated_snapshot, "target_refreshed");
                     maybe_write_heartbeat(state, &session, now).await;
                 }
             }
@@ -1059,6 +1230,48 @@ enum SonosControlCommand {
     Pause,
     Resume,
     Seek(u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SonosRenderingCommand {
+    Volume(u8),
+    Mute(bool),
+}
+
+async fn command_target_rendering(
+    state: AppState,
+    target_id: String,
+    command: SonosRenderingCommand,
+) -> Result<SonosPlaybackResponse, SonosOperationError> {
+    let resolved_target = resolve_live_target(&state, &target_id)?;
+    let client = control_client()?;
+    let transport_guard = state
+        .sonos_managed_sessions()
+        .acquire_transport_guard(&target_id)
+        .await;
+
+    match command {
+        SonosRenderingCommand::Volume(volume) => {
+            send_volume_action(&client, &resolved_target, volume).await?;
+        }
+        SonosRenderingCommand::Mute(muted) => {
+            send_mute_action(&client, &resolved_target, muted).await?;
+        }
+    }
+
+    let latest_target = refresh_target_after_command(&client, resolved_target.clone()).await;
+    let now = Instant::now();
+    let session = state.sonos_managed_sessions().update(&target_id, |session| {
+        session.latest_target = latest_target.clone();
+        session.cache_control_target(&resolved_target);
+        session.summary(now)
+    });
+    drop(transport_guard);
+
+    Ok(SonosPlaybackResponse {
+        target: latest_target,
+        session: session.flatten(),
+    })
 }
 
 async fn command_current_session(
@@ -1152,6 +1365,7 @@ async fn command_current_session(
     drop(transport_guard);
 
     write_session_snapshot_attribution(&state, &current_snapshot, false, true).await;
+    sync_shared_session_snapshot(&state, &current_snapshot, "state_updated");
 
     Ok(SonosPlaybackResponse {
         target: latest_target,
@@ -1302,6 +1516,7 @@ async fn item_change_current_session(
 
     write_session_snapshot_attribution(&state, &outgoing_snapshot, false, true).await;
     write_session_snapshot_attribution(&state, &current_snapshot, false, true).await;
+    sync_shared_session_snapshot(&state, &current_snapshot, "state_updated");
 
     Ok(SonosPlaybackResponse {
         target: latest_target,
@@ -1420,6 +1635,28 @@ fn queue_entry_from_media_file(
     }
 }
 
+fn playback_queue_from_sonos_queue(queue: &[SonosQueueEntry]) -> Vec<PlaybackSessionQueueItem> {
+    queue
+        .iter()
+        .map(|entry| PlaybackSessionQueueItem {
+            item_type: entry.item_type,
+            item_id: entry.item_id,
+            duration_seconds: entry.duration_seconds,
+        })
+        .collect()
+}
+
+fn sonos_queue_from_playback_queue(queue: &[PlaybackSessionQueueItem]) -> Vec<SonosQueueEntry> {
+    queue
+        .iter()
+        .map(|entry| SonosQueueEntry {
+            item_type: entry.item_type,
+            item_id: entry.item_id,
+            duration_seconds: entry.duration_seconds,
+        })
+        .collect()
+}
+
 async fn prepare_current_item(
     state: &AppState,
     target_id: &str,
@@ -1532,15 +1769,6 @@ async fn ungroup_if_needed(
     .map(|_| ())
 }
 
-async fn load_and_start_current_item(
-    client: &reqwest::Client,
-    target: &SonosResolvedTarget,
-    media_url: &str,
-) -> Result<(), SonosOperationError> {
-    set_current_item_uri(client, target, media_url).await?;
-    start_current_item(client, target).await
-}
-
 async fn set_current_item_uri(
     client: &reqwest::Client,
     target: &SonosResolvedTarget,
@@ -1569,6 +1797,27 @@ async fn start_current_item(
     .map(|_| ())
 }
 
+async fn stop_target_after_startup_failure(
+    client: &reqwest::Client,
+    target: &SonosResolvedTarget,
+    target_id: &str,
+) {
+    if let Err(error) = send_av_transport_action(
+        client,
+        target,
+        "Stop",
+        "<InstanceID>0</InstanceID>",
+    )
+    .await
+    {
+        tracing::debug!(
+            %error,
+            %target_id,
+            "failed to stop Sonos target after startup rollback"
+        );
+    }
+}
+
 async fn send_av_transport_action(
     client: &reqwest::Client,
     target: &SonosResolvedTarget,
@@ -1585,6 +1834,97 @@ async fn send_av_transport_action(
         location,
         AV_TRANSPORT_CONTROL_PATH,
         AV_TRANSPORT_SERVICE,
+        action,
+        body,
+    )
+    .await
+    .ok_or_else(|| SonosOperationError::reason(SonosErrorReason::TargetUnreachable))
+}
+
+async fn send_volume_action(
+    client: &reqwest::Client,
+    target: &SonosResolvedTarget,
+    volume: u8,
+) -> Result<(), SonosOperationError> {
+    match target.kind {
+        SonosTargetKind::Speaker => {
+            let body = format!(
+                "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{volume}</DesiredVolume>"
+            );
+            send_rendering_action(client, target, "SetVolume", &body).await
+        }
+        SonosTargetKind::Group => {
+            let body = format!(
+                "<InstanceID>0</InstanceID><DesiredVolume>{volume}</DesiredVolume>"
+            );
+            send_group_rendering_action(client, target, "SetGroupVolume", &body).await
+        }
+    }?;
+    Ok(())
+}
+
+async fn send_mute_action(
+    client: &reqwest::Client,
+    target: &SonosResolvedTarget,
+    muted: bool,
+) -> Result<(), SonosOperationError> {
+    let desired_mute = if muted { 1 } else { 0 };
+    match target.kind {
+        SonosTargetKind::Speaker => {
+            let body = format!(
+                "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>{desired_mute}</DesiredMute>"
+            );
+            send_rendering_action(client, target, "SetMute", &body).await
+        }
+        SonosTargetKind::Group => {
+            let body = format!(
+                "<InstanceID>0</InstanceID><DesiredMute>{desired_mute}</DesiredMute>"
+            );
+            send_group_rendering_action(client, target, "SetGroupMute", &body).await
+        }
+    }?;
+    Ok(())
+}
+
+async fn send_rendering_action(
+    client: &reqwest::Client,
+    target: &SonosResolvedTarget,
+    action: &str,
+    body: &str,
+) -> Result<String, SonosOperationError> {
+    let location = target
+        .control_location
+        .as_deref()
+        .or(target.coordinator_location.as_deref())
+        .ok_or_else(|| SonosOperationError::reason(SonosErrorReason::TargetUnreachable))?;
+    soap_action(
+        client,
+        location,
+        RENDERING_CONTROL_PATH,
+        RENDERING_CONTROL_SERVICE,
+        action,
+        body,
+    )
+    .await
+    .ok_or_else(|| SonosOperationError::reason(SonosErrorReason::TargetUnreachable))
+}
+
+async fn send_group_rendering_action(
+    client: &reqwest::Client,
+    target: &SonosResolvedTarget,
+    action: &str,
+    body: &str,
+) -> Result<String, SonosOperationError> {
+    let location = target
+        .coordinator_location
+        .as_deref()
+        .or(target.control_location.as_deref())
+        .ok_or_else(|| SonosOperationError::reason(SonosErrorReason::TargetUnreachable))?;
+    soap_action(
+        client,
+        location,
+        GROUP_RENDERING_CONTROL_PATH,
+        GROUP_RENDERING_CONTROL_SERVICE,
         action,
         body,
     )
@@ -1695,9 +2035,16 @@ fn mark_session_reconnecting(
     snapshot: &ManagedSonosSessionSnapshot,
     now: Instant,
 ) {
-    state.sonos_managed_sessions().update_snapshot(snapshot, |session| {
-        record_active_verification_miss(session, now);
-    });
+    if let Some(updated_snapshot) =
+        state
+            .sonos_managed_sessions()
+            .update_snapshot(snapshot, |session| {
+                record_active_verification_miss(session, now);
+                session.snapshot()
+            })
+    {
+        sync_shared_session_snapshot(state, &updated_snapshot, "reconnecting");
+    }
 }
 
 fn record_active_verification_miss(session: &mut ManagedSonosSession, now: Instant) {
@@ -1725,10 +2072,25 @@ async fn expire_reconnecting_target_if_overdue(
     target_id: &str,
     now: Instant,
 ) -> bool {
+    expire_reconnecting_target_if_overdue_with_shared_sync(state, target_id, now, true).await
+}
+
+async fn expire_reconnecting_target_if_overdue_with_shared_sync(
+    state: &AppState,
+    target_id: &str,
+    now: Instant,
+    sync_shared_session: bool,
+) -> bool {
     let Some(snapshot) = state.sonos_managed_sessions().snapshot(target_id) else {
         return false;
     };
-    expire_reconnecting_snapshot_if_overdue(state, &snapshot, now).await
+    expire_reconnecting_snapshot_if_overdue_with_shared_sync(
+        state,
+        &snapshot,
+        now,
+        sync_shared_session,
+    )
+    .await
 }
 
 async fn expire_reconnecting_snapshot_if_overdue(
@@ -1736,13 +2098,29 @@ async fn expire_reconnecting_snapshot_if_overdue(
     snapshot: &ManagedSonosSessionSnapshot,
     now: Instant,
 ) -> bool {
+    expire_reconnecting_snapshot_if_overdue_with_shared_sync(state, snapshot, now, true).await
+}
+
+async fn expire_reconnecting_snapshot_if_overdue_with_shared_sync(
+    state: &AppState,
+    snapshot: &ManagedSonosSessionSnapshot,
+    now: Instant,
+    sync_shared_session: bool,
+) -> bool {
     if !reconnect_deadline_elapsed(snapshot, now) {
         return false;
     }
     let Some(session) = state.sonos_managed_sessions().remove_snapshot(snapshot) else {
         return false;
     };
-    write_session_snapshot_attribution(state, &session.snapshot(), false, true).await;
+    let expired_snapshot = session.snapshot();
+    write_session_snapshot_attribution(state, &expired_snapshot, false, true).await;
+    if sync_shared_session {
+        let _ = state.stop_playback_session_sonos_target(
+            expired_snapshot.owner_account_id,
+            &expired_snapshot.target_id,
+        );
+    }
     true
 }
 
@@ -1920,6 +2298,7 @@ async fn resume_reconnected_session(
     };
     drop(transport_guard);
     write_session_snapshot_attribution(state, &current_snapshot, false, true).await;
+    sync_shared_session_snapshot(state, &current_snapshot, "target_refreshed");
     Ok(())
 }
 
@@ -1973,7 +2352,31 @@ async fn maybe_write_heartbeat(
         .flatten();
     if let Some(snapshot) = snapshot_to_write {
         write_session_snapshot_attribution(state, &snapshot, false, false).await;
+        sync_shared_session_snapshot(state, &snapshot, "heartbeat");
     }
+}
+
+fn sync_shared_session_snapshot(
+    state: &AppState,
+    snapshot: &ManagedSonosSessionSnapshot,
+    action: &'static str,
+) {
+    let playback_state = playback_state_for_sonos_status(
+        snapshot.status,
+        target_transport_state(&snapshot.latest_target),
+    );
+    let _ = state.sync_playback_session_from_sonos(
+        snapshot.owner_account_id,
+        &snapshot.target_id,
+        playback_queue_from_sonos_queue(&snapshot.queue),
+        snapshot.context_type,
+        snapshot.context_id,
+        snapshot.queue_index as u32,
+        snapshot.current_position_seconds,
+        snapshot.current_duration_seconds,
+        playback_state,
+        action,
+    );
 }
 
 async fn write_session_attribution(
@@ -2262,8 +2665,8 @@ async fn fetch_volume(client: &reqwest::Client, location: &str) -> Option<u8> {
     let response = soap_action(
         client,
         location,
-        "/MediaRenderer/RenderingControl/Control",
-        "urn:schemas-upnp-org:service:RenderingControl:1",
+        RENDERING_CONTROL_PATH,
+        RENDERING_CONTROL_SERVICE,
         "GetVolume",
         "<InstanceID>0</InstanceID><Channel>Master</Channel>",
     )
@@ -2288,8 +2691,8 @@ async fn fetch_mute(client: &reqwest::Client, location: &str) -> Option<bool> {
     let response = soap_action(
         client,
         location,
-        "/MediaRenderer/RenderingControl/Control",
-        "urn:schemas-upnp-org:service:RenderingControl:1",
+        RENDERING_CONTROL_PATH,
+        RENDERING_CONTROL_SERVICE,
         "GetMute",
         "<InstanceID>0</InstanceID><Channel>Master</Channel>",
     )
@@ -2599,6 +3002,7 @@ fn control_targets_from_snapshots(
         let coordinator_location = topology
             .and_then(|topology| topology.coordinator_id.as_ref())
             .and_then(|coordinator_id| coordinator_locations.get(coordinator_id))
+            .or_else(|| coordinator_locations.get(&group.id))
             .cloned();
         controls.insert(
             group.id.clone(),

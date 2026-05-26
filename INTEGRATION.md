@@ -811,6 +811,126 @@ requests for the same item and profile share in-flight generation, but if no
 slot is available the request returns `503` immediately. Once generated, the
 server reuses the cached rendition for that media file and profile.
 
+## Shared Playback Session
+
+Android should treat the account-scoped shared playback session as the runtime
+source of truth for queue, target binding, local attachment, and transfer state.
+Progress and history endpoints remain the durable resume/recently-played layer.
+
+Attach a local Android controller:
+
+```text
+POST /api/v1/me/playback/session/attach
+Content-Type: application/json
+
+{
+  "device_id": "android-device-id",
+  "device_name": "Pixel",
+  "app_instance_id": "install-id"
+}
+```
+
+Detach removes only the local controller binding. It never stops server-managed
+Sonos playback:
+
+```text
+POST /api/v1/me/playback/session/detach
+```
+
+Read the current authoritative snapshot:
+
+```text
+GET /api/v1/me/playback/session
+```
+
+The response includes `session_id`, ID-based `queue`, `context_type`,
+`context_id`, `current_index`, `playback_state`, `position_seconds`,
+`duration_seconds`, `repeat_mode` (`off`, `one`, `all`), `shuffle`,
+`active_target`, nullable `attachment`, nullable `transfer`, `revision`, and
+`snapshot_at`.
+
+Replace the queue for local playback and future transfer snapshots:
+
+```text
+PUT /api/v1/me/playback/session/queue
+Content-Type: application/json
+
+{
+  "queue": [
+    {
+      "item_type": "track",
+      "item_id": "track-uuid",
+      "duration_seconds": 212
+    }
+  ],
+  "context_type": "album",
+  "context_id": "album-uuid",
+  "current_index": 0,
+  "playback_state": "playing",
+  "position_seconds": 0,
+  "duration_seconds": 212
+}
+```
+
+Patch state without replacing the queue:
+
+```text
+PATCH /api/v1/me/playback/session/state
+Content-Type: application/json
+
+{
+  "playback_state": "paused",
+  "current_index": 0,
+  "position_seconds": 73,
+  "duration_seconds": 212,
+  "repeat_mode": "all",
+  "shuffle": true
+}
+```
+
+Request transfer to Sonos. The server marks a pending transfer, starts Sonos
+from the exact session queue/index/position snapshot, and flips `active_target`
+to Sonos only after the Sonos destination confirms by loading playback:
+
+```text
+POST /api/v1/me/playback/session/transfer
+Content-Type: application/json
+
+{
+  "target": {
+    "kind": "sonos",
+    "target_id": "speaker-or-group-id"
+  }
+}
+```
+
+Request transfer back to Android. The response keeps `active_target` as Sonos
+and exposes a pending `transfer` block until Android has started local rendering:
+
+```text
+POST /api/v1/me/playback/session/transfer
+Content-Type: application/json
+
+{
+  "target": {
+    "kind": "local_android",
+    "attachment_id": "attachment-uuid"
+  }
+}
+```
+
+After local rendering starts, confirm the transfer id. Stale transfer ids return
+`409 Conflict` and cannot override a newer pending transfer:
+
+```text
+POST /api/v1/me/playback/session/transfer/confirm
+Content-Type: application/json
+
+{
+  "transfer_id": "transfer-uuid"
+}
+```
+
 ## Playback Progress and History
 
 Use playback progress for resume state and history for recently played views.
@@ -1085,12 +1205,14 @@ For a streaming-app style client:
 3. Page through /catalog/artists, /catalog/albums, and /catalog/tracks.
 4. Page through /catalog/podcasts and /catalog/episodes if podcast UI is enabled.
 5. GET /api/v1/playlists and then /playlists/{id}/items for each visible playlist.
-6. GET /api/v1/me/playback/progress to hydrate resume state.
-7. Connect to /api/v1/events for live Home, playlist, and playback screen patches.
-8. Use /catalog/search for interactive search rather than local-only matching.
-9. For playback, prefer original media when supported, HLS for mobile/seeking,
+6. POST /api/v1/me/playback/session/attach and GET /api/v1/me/playback/session
+   to bind local playback and hydrate the runtime queue/target snapshot.
+7. GET /api/v1/me/playback/progress to hydrate durable resume state.
+8. Connect to /api/v1/events for live Home, playlist, and playback screen patches.
+9. Use /catalog/search for interactive search rather than local-only matching.
+10. For playback, prefer original media when supported, HLS for mobile/seeking,
    and direct AAC for simple transcoded playback.
-10. Write playback progress during and after playback.
+11. Write playback progress during and after playback.
 ```
 
 For live updates, use the authenticated SSE stream:
@@ -1194,6 +1316,36 @@ The `patch` object is authoritative for the happy path and is typed by
     "playlist_id": "playlist-uuid"
   },
   {
+    "type": "playback_session_replaced",
+    "account_id": "account-uuid",
+    "session": {
+      "session_id": "session-uuid",
+      "queue": [],
+      "current_index": null,
+      "playback_state": "stopped",
+      "position_seconds": 0,
+      "duration_seconds": null,
+      "repeat_mode": "off",
+      "shuffle": false,
+      "active_target": {
+        "kind": "local_android",
+        "attachment_id": null
+      },
+      "attachment": null,
+      "transfer": null,
+      "revision": 42,
+      "snapshot_at": "2026-05-09T10:00:00Z"
+    }
+  },
+  {
+    "type": "playback_progress_updated",
+    "action": "progress_updated",
+    "account_id": "account-uuid",
+    "item_type": "track",
+    "item_id": "track-uuid",
+    "progress": {}
+  },
+  {
     "type": "playback_history_updated",
     "action": "history_updated",
     "account_id": "account-uuid",
@@ -1204,8 +1356,11 @@ The `patch` object is authoritative for the happy path and is typed by
 ]
 ```
 
-Home patches replace only the affected `HomeSection` values. Playback progress
-emits a `continue_listening` section replacement; playback history emits a
+Home patches replace only the affected `HomeSection` values. The
+`playback_session_replaced` patch is authoritative for Android runtime
+reconciliation; apply it directly and reserve HTTP refetches for recovery cases
+such as sequence gaps or malformed patches. Playback progress emits a
+`continue_listening` section replacement; playback history emits a
 `recently_played` section replacement; library/catalog publication emits
 `new_releases` and `latest_podcasts` replacements plus a catalog-only recovery
 marker for catalog browse/detail surfaces. Playlist CRUD and item mutations

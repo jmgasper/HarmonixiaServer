@@ -11,8 +11,9 @@ use harmonixia_server::{
         CatalogEntityType, CatalogGrouping, CatalogImportDecision, CatalogImportRequest,
         ImportJobKind, ImportJobSource, ImportJobStatus, MaintenanceScope, MediaFileStatus,
         MediaProbeFacts, MetadataProvenanceDraft, MusicCatalogGrouping, PodcastCatalogGrouping,
-        PlaybackItemType, ProviderHealth, ProviderKind, ProviderStatus, QuarantineItem,
-        QuarantineStatus, RepairPlan, PlaylistScope, SonosDeliveryKind, SonosSessionStatus,
+        PlaybackItemType, PlaybackSessionState, ProviderHealth, ProviderKind, ProviderStatus,
+        QuarantineItem, QuarantineStatus, RepairPlan, PlaylistScope, SonosDeliveryKind,
+        SonosSessionStatus,
     },
     pipeline::ImportWorkRequest,
     providers::{ProviderCredential, ProviderRegistry},
@@ -21,7 +22,8 @@ use harmonixia_server::{
     },
     sonos::{SonosGroupSnapshot, SonosLiveState, SonosSnapshot, SonosSpeakerSnapshot},
     state::{
-        AppEvent, ProviderConfig, ScreenPatch, ServerConfigError, SonosMediaAuthorizationRequest,
+        AppEvent, PlaybackSessionQueueItem, ProviderConfig, ScreenPatch, ServerConfigError,
+        SonosMediaAuthorizationRequest,
     },
     storage::{DatabaseConfig, StorageError},
     router, AppState, ServerConfig,
@@ -922,6 +924,10 @@ fn sonos_action_from_request(request: &str) -> Option<&'static str> {
         "Seek",
         "Stop",
         "BecomeCoordinatorOfStandaloneGroup",
+        "SetVolume",
+        "SetMute",
+        "SetGroupVolume",
+        "SetGroupMute",
         "GetTransportInfo",
         "GetVolume",
         "GetMute",
@@ -3061,6 +3067,602 @@ async fn rapid_playback_progress_home_patches_are_monotonic() {
     );
     assert_eq!(first_position, 10);
     assert_eq!(second_position, 20);
+}
+
+#[tokio::test]
+async fn playback_session_attach_queue_state_sse_and_stale_transfer_contract() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let imported = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/session-contract.flac",
+            "session-contract-hash",
+            "Session Artist",
+            "Session Album",
+            "Session Track",
+            Some(1),
+        ))
+        .await
+        .unwrap();
+    let track_id = imported.track.as_ref().unwrap().id;
+    let admin = state
+        .authenticate_local_account(ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .unwrap()
+        .unwrap();
+    let app = router(state.clone());
+    let (sse_status, mut sse_body) = open_sse_stream(app.clone(), TestAuth::Admin).await;
+    assert_eq!(sse_status, StatusCode::OK);
+
+    let attachment_id = Uuid::new_v4();
+    let (attach_status, attach) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/attach",
+        json!({
+            "attachment_id": attachment_id,
+            "device_id": "android-device-1",
+            "device_name": "Android Phone",
+            "app_instance_id": "instance-1"
+        }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(attach_status, StatusCode::OK);
+    assert_eq!(attach["attachment"]["attachment_id"], json!(attachment_id));
+    assert_eq!(attach["active_target"]["kind"], "local_android");
+    assert_eq!(attach["active_target"]["attachment_id"], json!(attachment_id));
+
+    let attach_event = next_sse_json(&mut sse_body).await;
+    assert_eq!(attach_event["event"], "playback_session_replaced");
+    assert_eq!(attach_event["surface"], "playback");
+    assert_eq!(attach_event["audience"]["account_id"], json!(admin.id));
+    assert_eq!(attach_event["patch"]["type"], "playback_session_replaced");
+    assert_eq!(
+        attach_event["patch"]["session"]["session_id"],
+        attach["session_id"]
+    );
+    let attach_revision = attach_event["revision"].as_u64().unwrap();
+
+    let (get_status, get_body) =
+        get_json(app.clone(), "/api/v1/me/playback/session", Some(TestAuth::Admin)).await;
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(get_body["session_id"], attach["session_id"]);
+
+    let (queue_status, queue) = request_json(
+        app.clone(),
+        "PUT",
+        "/api/v1/me/playback/session/queue",
+        json!({
+            "queue": [{
+                "item_type": "track",
+                "item_id": track_id,
+                "duration_seconds": 180
+            }],
+            "context_type": "album",
+            "context_id": Uuid::new_v4(),
+            "current_index": 0,
+            "playback_state": "playing",
+            "position_seconds": 12,
+            "duration_seconds": 180
+        }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(queue_status, StatusCode::OK);
+    assert_eq!(queue["queue"][0]["item_id"], json!(track_id));
+    assert_eq!(queue["current_index"], 0);
+    assert_eq!(queue["playback_state"], "playing");
+
+    let queue_event = next_sse_json(&mut sse_body).await;
+    assert_eq!(
+        queue_event["patch"]["session"]["queue"][0]["item_id"],
+        json!(track_id)
+    );
+    let queue_revision = queue_event["revision"].as_u64().unwrap();
+    assert!(queue_revision > attach_revision);
+
+    let (state_status, session_state) = request_json(
+        app.clone(),
+        "PATCH",
+        "/api/v1/me/playback/session/state",
+        json!({
+            "repeat_mode": "all",
+            "shuffle": true,
+            "position_seconds": 30,
+            "duration_seconds": 180
+        }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(state_status, StatusCode::OK);
+    assert_eq!(session_state["repeat_mode"], "all");
+    assert_eq!(session_state["shuffle"], true);
+    assert_eq!(session_state["position_seconds"], 30);
+
+    let state_event = next_sse_json(&mut sse_body).await;
+    assert_eq!(
+        state_event["patch"]["session"]["position_seconds"],
+        json!(30)
+    );
+    let state_revision = state_event["revision"].as_u64().unwrap();
+    assert!(state_revision > queue_revision);
+    let _home_progress_event = next_sse_json(&mut sse_body).await;
+    let _playback_progress_event = next_sse_json(&mut sse_body).await;
+
+    let (first_transfer_status, first_transfer) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/transfer",
+        json!({ "target": { "kind": "local_android", "attachment_id": attachment_id } }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(first_transfer_status, StatusCode::OK);
+    let stale_transfer_id = first_transfer["transfer"]["transfer_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(first_transfer["transfer"]["state"], "pending");
+
+    let (second_transfer_status, second_transfer) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/transfer",
+        json!({ "target": { "kind": "local_android", "attachment_id": attachment_id } }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(second_transfer_status, StatusCode::OK);
+    let current_transfer_id = second_transfer["transfer"]["transfer_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(stale_transfer_id, current_transfer_id);
+
+    let (stale_status, stale_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/transfer/confirm",
+        json!({ "transfer_id": stale_transfer_id }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(stale_status, StatusCode::CONFLICT);
+    assert_eq!(stale_body["code"], "conflict");
+
+    let (confirm_status, confirmed) = request_json(
+        app,
+        "POST",
+        "/api/v1/me/playback/session/transfer/confirm",
+        json!({ "transfer_id": current_transfer_id }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(confirm_status, StatusCode::OK);
+    assert!(confirmed["transfer"].is_null());
+    assert_eq!(confirmed["active_target"]["kind"], "local_android");
+}
+
+#[tokio::test]
+async fn playback_session_sonos_transfer_and_direct_play_stay_synchronized() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-shared-session-sonos-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+    let first_path = library_root.join("Artist/Album/shared-session-one.mp3");
+    let second_path = library_root.join("Artist/Album/shared-session-two.mp3");
+    fs::write(&first_path, b"shared one").unwrap();
+    fs::write(&second_path, b"shared two").unwrap();
+    let first_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &first_path,
+        "shared-session-one",
+        "Shared Session One",
+        120,
+    )
+    .await;
+    let second_track = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &second_path,
+        "shared-session-two",
+        "Shared Session Two",
+        180,
+    )
+    .await;
+
+    let sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-shared",
+        "Shared Room",
+        &sonos.base_url,
+        "PLAYING",
+    ));
+
+    let app = router(state.clone());
+    let (attach_status, attach) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/attach",
+        json!({ "device_id": "android-shared" }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(attach_status, StatusCode::OK);
+    let attachment_id = attach["attachment"]["attachment_id"].clone();
+
+    let (queue_status, _) = request_json(
+        app.clone(),
+        "PUT",
+        "/api/v1/me/playback/session/queue",
+        json!({
+            "queue": [
+                { "item_type": "track", "item_id": first_track, "duration_seconds": 120 },
+                { "item_type": "track", "item_id": second_track, "duration_seconds": 180 }
+            ],
+            "current_index": 1,
+            "playback_state": "playing",
+            "position_seconds": 33,
+            "duration_seconds": 180
+        }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(queue_status, StatusCode::OK);
+
+    let (transfer_status, transferred) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/transfer",
+        json!({ "target": { "kind": "sonos", "target_id": "speaker-shared" } }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(transfer_status, StatusCode::OK);
+    assert_eq!(transferred["active_target"]["kind"], "sonos");
+    assert_eq!(transferred["active_target"]["target_id"], "speaker-shared");
+    assert_eq!(transferred["current_index"], 1);
+    assert_eq!(transferred["position_seconds"], 33);
+    assert!(transferred["transfer"].is_null());
+    assert!(sonos
+        .raw_requests()
+        .iter()
+        .any(|request| request.contains("Seek")
+            && request.contains("<Target>00:00:33</Target>")));
+    let requests_after_transfer = sonos.requests().len();
+
+    let (queue_replace_status, queue_replace) = request_json(
+        app.clone(),
+        "PUT",
+        "/api/v1/me/playback/session/queue",
+        json!({
+            "queue": [
+                { "item_type": "track", "item_id": first_track, "duration_seconds": 120 }
+            ],
+            "current_index": 0,
+            "playback_state": "playing",
+            "position_seconds": 0,
+            "duration_seconds": 120
+        }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(queue_replace_status, StatusCode::OK);
+    assert_eq!(queue_replace["active_target"]["kind"], "sonos");
+    assert_eq!(queue_replace["active_target"]["target_id"], "speaker-shared");
+    assert_eq!(
+        state
+            .sonos_managed_sessions()
+            .session_summary("speaker-shared", Instant::now())
+            .unwrap()
+            .current_item_id,
+        first_track
+    );
+    assert!(sonos.requests()[requests_after_transfer..]
+        .iter()
+        .any(|request| request.ends_with(" SetAVTransportURI")));
+
+    let requests_after_queue_refresh = sonos.requests().len();
+    let (clear_status, cleared) = request_json(
+        app.clone(),
+        "PUT",
+        "/api/v1/me/playback/session/queue",
+        json!({
+            "queue": [],
+            "playback_state": "stopped",
+            "position_seconds": 0
+        }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(clear_status, StatusCode::OK);
+    assert!(cleared["queue"].as_array().unwrap().is_empty());
+    assert_eq!(cleared["active_target"]["kind"], "sonos");
+    assert!(state
+        .sonos_managed_sessions()
+        .session_summary("speaker-shared", Instant::now())
+        .is_none());
+    assert!(sonos.requests()[requests_after_queue_refresh..]
+        .iter()
+        .any(|request| request.ends_with(" Stop")));
+
+    let (direct_play_status, direct_play) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-shared/play",
+        json!({ "source_type": "track", "source_id": first_track }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(direct_play_status, StatusCode::OK);
+    assert_eq!(direct_play["session"]["current_item_id"], json!(first_track));
+
+    let (synced_status, synced) =
+        get_json(app.clone(), "/api/v1/me/playback/session", Some(TestAuth::User)).await;
+    assert_eq!(synced_status, StatusCode::OK);
+    assert_eq!(synced["queue"][0]["item_id"], json!(first_track));
+    assert_eq!(synced["active_target"]["kind"], "sonos");
+    assert_eq!(synced["active_target"]["target_id"], "speaker-shared");
+
+    let (detach_status, detached) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/detach",
+        json!({}),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(detach_status, StatusCode::OK);
+    assert!(detached["attachment"].is_null());
+    assert_eq!(detached["active_target"]["kind"], "sonos");
+    assert!(state
+        .sonos_managed_sessions()
+        .session_summary("speaker-shared", Instant::now())
+        .is_some());
+
+    let (local_transfer_status, local_pending) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/transfer",
+        json!({ "target": { "kind": "local_android", "attachment_id": attachment_id } }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(local_transfer_status, StatusCode::OK);
+    assert_eq!(local_pending["transfer"]["state"], "pending");
+    assert_eq!(local_pending["active_target"]["kind"], "sonos");
+    assert!(state
+        .sonos_managed_sessions()
+        .session_summary("speaker-shared", Instant::now())
+        .is_some());
+    let transfer_id = local_pending["transfer"]["transfer_id"].as_str().unwrap();
+
+    let (confirm_status, confirmed) = request_json(
+        app,
+        "POST",
+        "/api/v1/me/playback/session/transfer/confirm",
+        json!({ "transfer_id": transfer_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(confirm_status, StatusCode::OK);
+    assert_eq!(confirmed["active_target"]["kind"], "local_android");
+    assert!(confirmed["transfer"].is_null());
+    assert!(state
+        .sonos_managed_sessions()
+        .session_summary("speaker-shared", Instant::now())
+        .is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn playback_session_sonos_transfer_seek_failure_stops_target_and_keeps_local_binding() {
+    let root = std::env::temp_dir().join(format!(
+        "harmonixia-shared-session-seek-fail-{}",
+        Uuid::new_v4().simple()
+    ));
+    let library_root = root.join("library");
+    let dropbox_root = root.join("dropbox");
+    fs::create_dir_all(library_root.join("Artist/Album")).unwrap();
+    fs::create_dir_all(&dropbox_root).unwrap();
+
+    let Some(state) = test_state_with_roots(library_root.clone(), dropbox_root.clone()).await
+    else {
+        return;
+    };
+    configure_public_base_url(
+        &state,
+        &library_root,
+        &dropbox_root,
+        "https://speaker-lan.example.test",
+    )
+    .await;
+    let track_path = library_root.join("Artist/Album/shared-session-seek-fail.mp3");
+    fs::write(&track_path, b"seek fail").unwrap();
+    let track_id = import_sonos_test_track(
+        &state,
+        &dropbox_root,
+        &track_path,
+        "shared-session-seek-fail",
+        "Shared Session Seek Fail",
+        120,
+    )
+    .await;
+
+    let sonos = MockSonosSoapServer::start().await;
+    state.replace_sonos_snapshot(sonos_snapshot_for_speaker(
+        "speaker-seek-fail",
+        "Seek Fail Room",
+        &sonos.base_url,
+        "STOPPED",
+    ));
+
+    let app = router(state.clone());
+    let (attach_status, attach) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/attach",
+        json!({ "device_id": "android-seek-fail" }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(attach_status, StatusCode::OK);
+    let attachment_id = attach["attachment"]["attachment_id"].clone();
+
+    let (queue_status, _) = request_json(
+        app.clone(),
+        "PUT",
+        "/api/v1/me/playback/session/queue",
+        json!({
+            "queue": [
+                { "item_type": "track", "item_id": track_id, "duration_seconds": 120 }
+            ],
+            "current_index": 0,
+            "playback_state": "playing",
+            "position_seconds": 45,
+            "duration_seconds": 120
+        }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(queue_status, StatusCode::OK);
+
+    sonos.fail_next_action("Seek");
+    let (transfer_status, transfer_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/transfer",
+        json!({ "target": { "kind": "sonos", "target_id": "speaker-seek-fail" } }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(transfer_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        transfer_body["details"]["reason"],
+        json!("target_unreachable")
+    );
+
+    let (session_status, session) =
+        get_json(app, "/api/v1/me/playback/session", Some(TestAuth::User)).await;
+    assert_eq!(session_status, StatusCode::OK);
+    assert_eq!(session["active_target"]["kind"], "local_android");
+    assert_eq!(session["active_target"]["attachment_id"], attachment_id);
+    assert_eq!(session["transfer"]["state"], "failed");
+    assert!(state
+        .sonos_managed_sessions()
+        .session_summary("speaker-seek-fail", Instant::now())
+        .is_none());
+
+    let requests = sonos.requests();
+    let play = requests
+        .iter()
+        .rposition(|request| request.ends_with(" Play"))
+        .expect("transfer startup should issue Play");
+    let seek = requests
+        .iter()
+        .rposition(|request| request.ends_with(" Seek"))
+        .expect("transfer startup should issue Seek");
+    let stop = requests
+        .iter()
+        .rposition(|request| request.ends_with(" Stop"))
+        .expect("failed transfer startup should stop the target");
+    assert!(play < seek);
+    assert!(seek < stop);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn local_transfer_confirmation_tolerates_unmanaged_sonos_after_preflight() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let imported = state
+        .repository()
+        .import_catalog_file(music_import_request(
+            "/dropbox/orphan-sonos-session.flac",
+            "orphan-sonos-session-hash",
+            "Orphan Sonos Artist",
+            "Orphan Sonos Album",
+            "Orphan Sonos Track",
+            Some(1),
+        ))
+        .await
+        .unwrap();
+    let track_id = imported.track.as_ref().unwrap().id;
+    let account = state
+        .authenticate_local_account(USER_USERNAME, USER_PASSWORD)
+        .await
+        .unwrap()
+        .unwrap();
+    let attachment_id = Uuid::new_v4();
+    state
+        .replace_playback_session_from_sonos_start(
+            account.id,
+            "orphan-sonos",
+            vec![PlaybackSessionQueueItem {
+                item_type: PlaybackItemType::Track,
+                item_id: track_id,
+                duration_seconds: Some(120),
+            }],
+            None,
+            None,
+            0,
+            10,
+            Some(120),
+            PlaybackSessionState::Playing,
+        )
+        .unwrap();
+
+    let app = router(state.clone());
+    let (transfer_status, pending) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/me/playback/session/transfer",
+        json!({ "target": { "kind": "local_android", "attachment_id": attachment_id } }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(transfer_status, StatusCode::OK);
+    assert_eq!(pending["active_target"]["kind"], "sonos");
+    let transfer_id = pending["transfer"]["transfer_id"].as_str().unwrap();
+
+    let (confirm_status, confirmed) = request_json(
+        app,
+        "POST",
+        "/api/v1/me/playback/session/transfer/confirm",
+        json!({ "transfer_id": transfer_id }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(confirm_status, StatusCode::OK);
+    assert_eq!(confirmed["active_target"]["kind"], "local_android");
+    assert_eq!(
+        confirmed["active_target"]["attachment_id"],
+        json!(attachment_id)
+    );
+    assert!(confirmed["transfer"].is_null());
 }
 
 #[tokio::test]
@@ -6091,6 +6693,70 @@ async fn sonos_targets_returns_live_snapshot_for_authenticated_user_and_replaces
 }
 
 #[tokio::test]
+async fn sonos_group_volume_and_mute_routes_use_group_rendering_control() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let sonos = MockSonosSoapServer::start().await;
+    let mut locations = BTreeMap::new();
+    locations.insert(
+        "group-party".to_string(),
+        format!("{}/xml/device.xml", sonos.base_url),
+    );
+    state.replace_sonos_snapshot(SonosSnapshot::from_targets_with_control_locations(
+        Vec::new(),
+        vec![SonosGroupSnapshot {
+            id: "group-party".into(),
+            display_name: "Party Group".into(),
+            available: true,
+            live: SonosLiveState {
+                volume_percent: Some(44),
+                muted: Some(false),
+                raw_transport_state: Some("PLAYING".into()),
+            },
+        }],
+        locations,
+    ));
+
+    let app = router(state);
+    let (volume_status, volume_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/group-party/volume",
+        json!({ "volume": 72 }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(volume_status, StatusCode::OK);
+    assert_eq!(volume_body["target"]["id"], "group-party");
+    assert!(volume_body["session"].is_null());
+
+    let (mute_status, mute_body) = request_json(
+        app,
+        "POST",
+        "/api/v1/sonos/targets/group-party/mute",
+        json!({ "muted": true }),
+        Some(TestAuth::User),
+    )
+    .await;
+    assert_eq!(mute_status, StatusCode::OK);
+    assert_eq!(mute_body["target"]["id"], "group-party");
+    assert!(mute_body["session"].is_null());
+
+    let requests = sonos.raw_requests();
+    assert!(requests.iter().any(|request| {
+        request.contains("POST /MediaRenderer/GroupRenderingControl/Control")
+            && request.contains("SetGroupVolume")
+            && request.contains("<DesiredVolume>72</DesiredVolume>")
+    }));
+    assert!(requests.iter().any(|request| {
+        request.contains("POST /MediaRenderer/GroupRenderingControl/Control")
+            && request.contains("SetGroupMute")
+            && request.contains("<DesiredMute>1</DesiredMute>")
+    }));
+}
+
+#[tokio::test]
 async fn sonos_managed_playback_controls_queue_replacement_and_owner_attribution() {
     let root = std::env::temp_dir().join(format!(
         "harmonixia-sonos-playback-{}",
@@ -6241,6 +6907,36 @@ async fn sonos_managed_playback_controls_queue_replacement_and_owner_attribution
     .await;
     assert_eq!(seek_status, StatusCode::OK);
     assert_eq!(seek_body["session"]["current_position_seconds"], 42);
+
+    let (volume_status, volume_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-kitchen/volume",
+        json!({ "volume": 61 }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(volume_status, StatusCode::OK);
+    assert_eq!(volume_body["target"]["id"], "speaker-kitchen");
+
+    let (mute_status, mute_body) = request_json(
+        app.clone(),
+        "POST",
+        "/api/v1/sonos/targets/speaker-kitchen/mute",
+        json!({ "muted": true }),
+        Some(TestAuth::Admin),
+    )
+    .await;
+    assert_eq!(mute_status, StatusCode::OK);
+    assert_eq!(mute_body["target"]["id"], "speaker-kitchen");
+
+    let volume_requests = sonos.raw_requests();
+    assert!(volume_requests.iter().any(|request| {
+        request.contains("SetVolume") && request.contains("<DesiredVolume>61</DesiredVolume>")
+    }));
+    assert!(volume_requests.iter().any(|request| {
+        request.contains("SetMute") && request.contains("<DesiredMute>1</DesiredMute>")
+    }));
 
     let (user_progress_status, user_progress) = get_json(
         app.clone(),
@@ -11793,11 +12489,22 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
     ));
     assert!(paths.contains_key("/api/v1/me/playback/progress"));
     assert!(paths.contains_key("/api/v1/me/playback/history"));
+    assert!(paths.contains_key("/api/v1/me/playback/session"));
+    assert!(paths.contains_key("/api/v1/me/playback/session/attach"));
+    assert!(paths.contains_key("/api/v1/me/playback/session/detach"));
+    assert!(paths.contains_key("/api/v1/me/playback/session/queue"));
+    assert!(paths.contains_key("/api/v1/me/playback/session/state"));
+    assert!(paths.contains_key("/api/v1/me/playback/session/transfer"));
+    assert!(paths.contains_key(
+        "/api/v1/me/playback/session/transfer/confirm"
+    ));
     assert!(paths.contains_key("/api/v1/me/home"));
     assert!(paths.contains_key("/api/v1/me/favorites/tracks"));
     assert!(paths.contains_key("/api/v1/events"));
     assert!(paths.contains_key("/api/v1/sonos/targets"));
-    for route in ["play", "pause", "resume", "stop", "seek", "next", "previous"] {
+    for route in [
+        "play", "pause", "resume", "stop", "seek", "volume", "mute", "next", "previous",
+    ] {
         assert!(paths.contains_key(&format!(
             "/api/v1/sonos/targets/{{target_id}}/{route}"
         )));
@@ -11872,6 +12579,18 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
             ["application/json"]["schema"]["$ref"]
             .as_str(),
         Some("#/components/schemas/SonosSeekRequest")
+    );
+    assert_eq!(
+        paths["/api/v1/sonos/targets/{target_id}/volume"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"]["$ref"]
+            .as_str(),
+        Some("#/components/schemas/SonosVolumeRequest")
+    );
+    assert_eq!(
+        paths["/api/v1/sonos/targets/{target_id}/mute"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"]["$ref"]
+            .as_str(),
+        Some("#/components/schemas/SonosMuteRequest")
     );
 
     let schemes = body["components"]["securitySchemes"]
@@ -11950,6 +12669,21 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         "PlaybackProgressScreenPatch",
         "PlaybackProgressWriteRequest",
         "PlaybackProgressWriteResponse",
+        "PlaybackRepeatMode",
+        "PlaybackSessionAttachment",
+        "PlaybackSessionAttachRequest",
+        "PlaybackSessionQueueItem",
+        "PlaybackSessionQueueReplaceRequest",
+        "PlaybackSessionReadModel",
+        "PlaybackSessionReplacedPatch",
+        "PlaybackSessionState",
+        "PlaybackSessionStatePatchRequest",
+        "PlaybackSessionTarget",
+        "PlaybackSessionTransfer",
+        "PlaybackSessionTransferConfirmRequest",
+        "PlaybackSessionTransferRequest",
+        "PlaybackTargetKind",
+        "PlaybackTransferState",
         "PlaylistScreenPatch",
         "ScreenActionHint",
         "ScreenArtwork",
@@ -11962,6 +12696,7 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         "SonosDeliveryKind",
         "SonosErrorReason",
         "SonosGroupTarget",
+        "SonosMuteRequest",
         "SonosNextItemSummary",
         "SonosPlaybackResponse",
         "SonosPlaybackTarget",
@@ -11974,6 +12709,7 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         "SonosSpeakerTarget",
         "SonosTargetsResponse",
         "SonosTransportState",
+        "SonosVolumeRequest",
     ] {
         assert!(schemas.contains_key(schema), "missing schema {schema}");
     }
@@ -12090,6 +12826,39 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
     assert!(!schema_property_is_nullable(
         &schemas["SonosSessionSummary"],
         "reconnect_seconds_remaining"
+    ));
+    for field in [
+        "context_type",
+        "context_id",
+        "current_index",
+        "duration_seconds",
+        "attachment",
+        "transfer",
+    ] {
+        assert!(schema_requires_field(
+            &schemas["PlaybackSessionReadModel"],
+            field
+        ));
+        assert!(schema_property_is_nullable(
+            &schemas["PlaybackSessionReadModel"],
+            field
+        ));
+    }
+    assert!(schema_requires_field(
+        &schemas["PlaybackSessionQueueItem"],
+        "duration_seconds"
+    ));
+    assert!(schema_property_is_nullable(
+        &schemas["PlaybackSessionQueueItem"],
+        "duration_seconds"
+    ));
+    assert!(schema_requires_field(
+        &schemas["PlaybackSessionTransfer"],
+        "confirmed_target"
+    ));
+    assert!(schema_property_is_nullable(
+        &schemas["PlaybackSessionTransfer"],
+        "confirmed_target"
     ));
 
     assert_eq!(
@@ -12262,6 +13031,15 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         ("/api/v1/me/playback/progress", "get"),
         ("/api/v1/me/playback/history", "get"),
         ("/api/v1/me/playback/history", "post"),
+        ("/api/v1/me/playback/session", "get"),
+        ("/api/v1/me/playback/session/attach", "post"),
+        ("/api/v1/me/playback/session/detach", "post"),
+        ("/api/v1/me/playback/session/queue", "put"),
+        ("/api/v1/me/playback/session/state", "patch"),
+        ("/api/v1/me/playback/session/transfer", "post"),
+        ("/api/v1/me/playback/session/transfer/confirm", "post"),
+        ("/api/v1/sonos/targets/{target_id}/volume", "post"),
+        ("/api/v1/sonos/targets/{target_id}/mute", "post"),
         ("/api/v1/me/home", "get"),
         ("/api/v1/events", "get"),
     ];

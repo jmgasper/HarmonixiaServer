@@ -11,7 +11,7 @@ use std::{
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -37,11 +37,12 @@ use crate::{
         AuthenticatedAccount,
         CatalogEntityType, Episode, FavoriteToggleOutcome, ImportJob, ImportJobKind,
         ImportJobSource, MaintenanceScope, MediaFile, MetadataProvenance, PlaybackContextType,
-        PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress, Playlist, PlaylistItem,
+        PlaybackHistoryEvent, PlaybackItemType, PlaybackProgress, PlaybackRepeatMode,
+        PlaybackSessionState, PlaybackTargetKind, PlaybackTransferState, Playlist, PlaylistItem,
         PlaylistScope, Podcast, ProviderHealth, ProviderKind, ProviderSetting, ProviderStatus,
-        QuarantineItem, QuarantineStatus, RepairPlan, SonosDeliveryKind, SonosSignedClaim,
-        SystemConfig, Track, TrackFavorite, TranscodeSlotUsage, UserAccount,
-        DEFAULT_SCAN_THREAD_COUNT,
+        QuarantineItem, QuarantineStatus, RepairPlan, SonosDeliveryKind, SonosSessionStatus,
+        SonosSignedClaim, SonosTransportState, SystemConfig, Track, TrackFavorite,
+        TranscodeSlotUsage, UserAccount, DEFAULT_SCAN_THREAD_COUNT,
     },
     error::{ApiError, SonosErrorReason},
     pipeline::{
@@ -258,6 +259,7 @@ pub enum ScreenPatch {
     PlaylistDetailRemoved(PlaylistDetailRemovePatch),
     PlaybackProgressUpdated(PlaybackProgressScreenPatch),
     PlaybackHistoryUpdated(PlaybackHistoryScreenPatch),
+    PlaybackSessionReplaced(PlaybackSessionReplacedPatch),
     RecoveryRequested(RecoveryScreenPatch),
 }
 
@@ -315,6 +317,83 @@ pub struct PlaybackHistoryScreenPatch {
     pub item_type: PlaybackItemType,
     pub item_id: Uuid,
     pub history_event: PlaybackHistoryEvent,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlaybackSessionReplacedPatch {
+    pub account_id: Uuid,
+    pub session: PlaybackSessionReadModel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaybackSessionReadModel {
+    pub session_id: Uuid,
+    pub queue: Vec<PlaybackSessionQueueItem>,
+    #[schema(required = true, nullable = true)]
+    pub context_type: Option<PlaybackContextType>,
+    #[schema(required = true, nullable = true)]
+    pub context_id: Option<Uuid>,
+    #[schema(required = true, nullable = true)]
+    pub current_index: Option<u32>,
+    pub playback_state: PlaybackSessionState,
+    pub position_seconds: u32,
+    #[schema(required = true, nullable = true)]
+    pub duration_seconds: Option<u32>,
+    pub repeat_mode: PlaybackRepeatMode,
+    pub shuffle: bool,
+    pub active_target: PlaybackSessionTarget,
+    #[schema(required = true, nullable = true)]
+    pub attachment: Option<PlaybackSessionAttachment>,
+    #[schema(required = true, nullable = true)]
+    pub transfer: Option<PlaybackSessionTransfer>,
+    pub revision: u64,
+    pub snapshot_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaybackSessionQueueItem {
+    pub item_type: PlaybackItemType,
+    pub item_id: Uuid,
+    #[schema(required = true, nullable = true)]
+    pub duration_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaybackSessionAttachment {
+    pub attachment_id: Uuid,
+    #[schema(required = true, nullable = true)]
+    pub device_id: Option<String>,
+    #[schema(required = true, nullable = true)]
+    pub device_name: Option<String>,
+    #[schema(required = true, nullable = true)]
+    pub app_instance_id: Option<String>,
+    pub attached_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlaybackSessionTarget {
+    LocalAndroid {
+        #[schema(required = true, nullable = true)]
+        attachment_id: Option<Uuid>,
+    },
+    Sonos {
+        target_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaybackSessionTransfer {
+    pub transfer_id: Uuid,
+    pub state: PlaybackTransferState,
+    pub requested_target: PlaybackSessionTarget,
+    #[schema(required = true, nullable = true)]
+    pub confirmed_target: Option<PlaybackSessionTarget>,
+    pub requested_at: DateTime<Utc>,
+    #[schema(required = true, nullable = true)]
+    pub confirmed_at: Option<DateTime<Utc>>,
+    #[schema(required = true, nullable = true)]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -497,12 +576,58 @@ struct AppStateInner {
     event_stream_epoch: Uuid,
     event_sequence: AtomicU64,
     event_tx: broadcast::Sender<AppEvent>,
+    playback_sessions: RwLock<HashMap<Uuid, PlaybackSessionRuntime>>,
     sonos_snapshot: RwLock<SonosSnapshot>,
     sonos_sessions: ManagedSonosSessions,
     sonos_media_authorization: SonosSignedMediaRuntime,
     transcode_admission: TranscodeAdmission,
     hls_generation_coordinator: HlsGenerationCoordinator,
     repository: PgMaintenanceRepository,
+}
+
+#[derive(Debug, Clone)]
+struct PlaybackSessionRuntime {
+    session_id: Uuid,
+    queue: Vec<PlaybackSessionQueueItem>,
+    context_type: Option<PlaybackContextType>,
+    context_id: Option<Uuid>,
+    current_index: Option<usize>,
+    playback_state: PlaybackSessionState,
+    position_seconds: u32,
+    duration_seconds: Option<u32>,
+    repeat_mode: PlaybackRepeatMode,
+    shuffle: bool,
+    active_target: PlaybackSessionTarget,
+    attachment: Option<PlaybackSessionAttachment>,
+    transfer: Option<PlaybackSessionTransfer>,
+    revision: u64,
+    snapshot_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlaybackSessionQueueReplacement {
+    pub queue: Vec<PlaybackSessionQueueItem>,
+    pub context_type: Option<PlaybackContextType>,
+    pub context_id: Option<Uuid>,
+    pub current_index: Option<u32>,
+    pub playback_state: Option<PlaybackSessionState>,
+    pub position_seconds: Option<u32>,
+    pub duration_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlaybackSessionStateMutation {
+    pub playback_state: Option<PlaybackSessionState>,
+    pub current_index: Option<u32>,
+    pub position_seconds: Option<u32>,
+    pub duration_seconds: Option<u32>,
+    pub repeat_mode: Option<PlaybackRepeatMode>,
+    pub shuffle: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlaybackSessionTransferConfirmation {
+    pub sonos_target_to_stop: Option<String>,
 }
 
 #[derive(Debug)]
@@ -574,6 +699,7 @@ impl AppState {
                 event_stream_epoch: Uuid::new_v4(),
                 event_sequence: AtomicU64::new(0),
                 event_tx,
+                playback_sessions: RwLock::new(HashMap::new()),
                 sonos_snapshot: RwLock::new(SonosSnapshot::empty()),
                 sonos_sessions: ManagedSonosSessions::new(),
                 sonos_media_authorization: SonosSignedMediaRuntime::new(),
@@ -625,6 +751,351 @@ impl AppState {
         self.inner.event_sequence.load(Ordering::Relaxed)
     }
 
+    pub fn playback_session_for_account(
+        &self,
+        account_id: Uuid,
+    ) -> PlaybackSessionReadModel {
+        let now = Utc::now();
+        let mut sessions = self
+            .inner
+            .playback_sessions
+            .write()
+            .expect("playback sessions lock poisoned");
+        let revision = self.current_revision();
+        sessions
+            .entry(account_id)
+            .or_insert_with(|| PlaybackSessionRuntime::new(revision, now))
+            .to_read_model()
+    }
+
+    pub fn attach_playback_session(
+        &self,
+        account_id: Uuid,
+        attachment_id: Option<Uuid>,
+        device_id: Option<String>,
+        device_name: Option<String>,
+        app_instance_id: Option<String>,
+    ) -> PlaybackSessionReadModel {
+        self.mutate_playback_session(account_id, "attached", None, |session, now| {
+            let attachment_id = attachment_id.unwrap_or_else(Uuid::new_v4);
+            session.attachment = Some(PlaybackSessionAttachment {
+                attachment_id,
+                device_id,
+                device_name,
+                app_instance_id,
+                attached_at: now,
+            });
+            if matches!(session.active_target, PlaybackSessionTarget::LocalAndroid { .. }) {
+                session.active_target = PlaybackSessionTarget::LocalAndroid {
+                    attachment_id: Some(attachment_id),
+                };
+            }
+            Ok(())
+        })
+        .expect("playback attachment mutation should not fail")
+    }
+
+    pub fn detach_playback_session(
+        &self,
+        account_id: Uuid,
+    ) -> PlaybackSessionReadModel {
+        self.mutate_playback_session(account_id, "detached", None, |session, _now| {
+            session.attachment = None;
+            if matches!(session.active_target, PlaybackSessionTarget::LocalAndroid { .. }) {
+                session.active_target = PlaybackSessionTarget::LocalAndroid {
+                    attachment_id: None,
+                };
+            }
+            Ok(())
+        })
+        .expect("playback detach mutation should not fail")
+    }
+
+    pub fn replace_playback_session_queue(
+        &self,
+        account_id: Uuid,
+        replacement: PlaybackSessionQueueReplacement,
+    ) -> Result<PlaybackSessionReadModel, ApiError> {
+        self.mutate_playback_session(account_id, "queue_replaced", None, |session, _now| {
+            apply_playback_session_queue_replacement(session, replacement)
+        })
+    }
+
+    pub fn preview_playback_session_queue_replacement(
+        &self,
+        account_id: Uuid,
+        replacement: &PlaybackSessionQueueReplacement,
+    ) -> Result<PlaybackSessionReadModel, ApiError> {
+        let mut session = self.playback_session_runtime_snapshot(account_id);
+        apply_playback_session_queue_replacement(&mut session, replacement.clone())?;
+        Ok(session.to_read_model())
+    }
+
+    pub fn update_playback_session_state(
+        &self,
+        account_id: Uuid,
+        mutation: PlaybackSessionStateMutation,
+    ) -> Result<PlaybackSessionReadModel, ApiError> {
+        self.mutate_playback_session(account_id, "state_updated", None, |session, _now| {
+            apply_playback_session_state_mutation(session, mutation)
+        })
+    }
+
+    pub fn preview_playback_session_state_update(
+        &self,
+        account_id: Uuid,
+        mutation: &PlaybackSessionStateMutation,
+    ) -> Result<PlaybackSessionReadModel, ApiError> {
+        let mut session = self.playback_session_runtime_snapshot(account_id);
+        apply_playback_session_state_mutation(&mut session, mutation.clone())?;
+        Ok(session.to_read_model())
+    }
+
+    pub fn commit_playback_session_snapshot(
+        &self,
+        account_id: Uuid,
+        snapshot: PlaybackSessionReadModel,
+        action: &'static str,
+    ) -> Result<PlaybackSessionReadModel, ApiError> {
+        self.mutate_playback_session(account_id, action, None, |session, _now| {
+            apply_playback_session_snapshot(session, snapshot);
+            Ok(())
+        })
+    }
+
+    pub fn request_playback_session_transfer(
+        &self,
+        account_id: Uuid,
+        target: PlaybackSessionTarget,
+    ) -> Result<(Uuid, PlaybackSessionReadModel), ApiError> {
+        let transfer_id = Uuid::new_v4();
+        let snapshot =
+            self.mutate_playback_session(account_id, "transfer_requested", Some(transfer_id), |session, now| {
+                if session.queue.is_empty() {
+                    return Err(ApiError::Conflict(
+                        "cannot transfer an empty playback session".into(),
+                    ));
+                }
+                session.transfer = Some(PlaybackSessionTransfer {
+                    transfer_id,
+                    state: PlaybackTransferState::Pending,
+                    requested_target: target,
+                    confirmed_target: None,
+                    requested_at: now,
+                    confirmed_at: None,
+                    failure_reason: None,
+                });
+                Ok(())
+            })?;
+        Ok((transfer_id, snapshot))
+    }
+
+    pub fn confirm_playback_session_transfer(
+        &self,
+        account_id: Uuid,
+        transfer_id: Uuid,
+    ) -> Result<PlaybackSessionReadModel, ApiError> {
+        self.mutate_playback_session(
+            account_id,
+            "transfer_confirmed",
+            Some(transfer_id),
+            |session, _now| {
+                let transfer = session
+                    .transfer
+                    .as_ref()
+                    .ok_or_else(|| ApiError::Conflict("no pending playback transfer".into()))?;
+                if transfer.transfer_id != transfer_id
+                    || transfer.state != PlaybackTransferState::Pending
+                {
+                    return Err(ApiError::Conflict(
+                        "stale playback transfer confirmation".into(),
+                    ));
+                }
+                session.active_target = transfer.requested_target.clone();
+                session.transfer = None;
+                Ok(())
+            },
+        )
+    }
+
+    pub fn playback_session_transfer_confirmation(
+        &self,
+        account_id: Uuid,
+        transfer_id: Uuid,
+    ) -> Result<PlaybackSessionTransferConfirmation, ApiError> {
+        let sessions = self
+            .inner
+            .playback_sessions
+            .read()
+            .expect("playback sessions lock poisoned");
+        let session = sessions
+            .get(&account_id)
+            .ok_or_else(|| ApiError::Conflict("no pending playback transfer".into()))?;
+        let transfer = session
+            .transfer
+            .as_ref()
+            .ok_or_else(|| ApiError::Conflict("no pending playback transfer".into()))?;
+        if transfer.transfer_id != transfer_id || transfer.state != PlaybackTransferState::Pending {
+            return Err(ApiError::Conflict("stale playback transfer confirmation".into()));
+        }
+        let sonos_target_to_stop = match (&transfer.requested_target, &session.active_target) {
+            (
+                PlaybackSessionTarget::LocalAndroid { .. },
+                PlaybackSessionTarget::Sonos { target_id },
+            ) => Some(target_id.clone()),
+            _ => None,
+        };
+        Ok(PlaybackSessionTransferConfirmation {
+            sonos_target_to_stop,
+        })
+    }
+
+    pub fn confirm_playback_session_transfer_to_sonos(
+        &self,
+        account_id: Uuid,
+        transfer_id: Uuid,
+        target_id: &str,
+    ) -> Result<PlaybackSessionReadModel, ApiError> {
+        self.mutate_playback_session(account_id, "transfer_confirmed", Some(transfer_id), |session, _now| {
+            let transfer = session
+                .transfer
+                .as_ref()
+                .ok_or_else(|| ApiError::Conflict("no pending playback transfer".into()))?;
+            if transfer.transfer_id != transfer_id
+                || transfer.state != PlaybackTransferState::Pending
+            {
+                return Err(ApiError::Conflict("stale playback transfer confirmation".into()));
+            }
+            match &transfer.requested_target {
+                PlaybackSessionTarget::Sonos {
+                    target_id: requested,
+                } if requested == target_id => {}
+                _ => {
+                    return Err(ApiError::Conflict(
+                        "playback transfer destination did not match".into(),
+                    ));
+                }
+            }
+            session.active_target = PlaybackSessionTarget::Sonos {
+                target_id: target_id.to_string(),
+            };
+            session.transfer = None;
+            Ok(())
+        })
+    }
+
+    pub fn fail_playback_session_transfer(
+        &self,
+        account_id: Uuid,
+        transfer_id: Uuid,
+        reason: impl Into<String>,
+    ) -> Option<PlaybackSessionReadModel> {
+        self.mutate_playback_session(account_id, "transfer_failed", Some(transfer_id), |session, now| {
+            let Some(transfer) = session.transfer.as_mut() else {
+                return Ok(());
+            };
+            if transfer.transfer_id != transfer_id {
+                return Ok(());
+            }
+            transfer.state = PlaybackTransferState::Failed;
+            transfer.confirmed_at = Some(now);
+            transfer.failure_reason = Some(reason.into());
+            Ok(())
+        })
+        .ok()
+    }
+
+    pub fn replace_playback_session_from_sonos_start(
+        &self,
+        account_id: Uuid,
+        target_id: &str,
+        queue: Vec<PlaybackSessionQueueItem>,
+        context_type: Option<PlaybackContextType>,
+        context_id: Option<Uuid>,
+        current_index: u32,
+        position_seconds: u32,
+        duration_seconds: Option<u32>,
+        playback_state: PlaybackSessionState,
+    ) -> Result<PlaybackSessionReadModel, ApiError> {
+        validate_playback_context(context_type, context_id)?;
+        let current_index = validate_session_queue_index(&queue, Some(current_index))?
+            .ok_or_else(|| ApiError::BadRequest("Sonos session queue cannot be empty".into()))?;
+        validate_progress_seconds(position_seconds, duration_seconds)?;
+        self.mutate_playback_session(account_id, "target_updated", None, |session, _now| {
+            session.queue = queue;
+            session.context_type = context_type;
+            session.context_id = context_id;
+            session.current_index = Some(current_index);
+            session.position_seconds = position_seconds;
+            session.duration_seconds = duration_seconds;
+            session.playback_state = playback_state;
+            session.active_target = PlaybackSessionTarget::Sonos {
+                target_id: target_id.to_string(),
+            };
+            session.transfer = None;
+            Ok(())
+        })
+    }
+
+    pub fn sync_playback_session_from_sonos(
+        &self,
+        account_id: Uuid,
+        target_id: &str,
+        queue: Vec<PlaybackSessionQueueItem>,
+        context_type: Option<PlaybackContextType>,
+        context_id: Option<Uuid>,
+        current_index: u32,
+        position_seconds: u32,
+        duration_seconds: Option<u32>,
+        playback_state: PlaybackSessionState,
+        action: &'static str,
+    ) -> Option<PlaybackSessionReadModel> {
+        self.mutate_playback_session(account_id, action, None, |session, _now| {
+            match &session.active_target {
+                PlaybackSessionTarget::Sonos {
+                    target_id: active_target_id,
+                } if active_target_id == target_id => {}
+                _ => return Ok(()),
+            }
+            let Some(current_index) = validate_session_queue_index(&queue, Some(current_index))?
+            else {
+                return Ok(());
+            };
+            validate_progress_seconds(position_seconds, duration_seconds)?;
+            session.queue = queue;
+            session.context_type = context_type;
+            session.context_id = context_id;
+            session.current_index = Some(current_index);
+            session.position_seconds = position_seconds;
+            session.duration_seconds = duration_seconds;
+            session.playback_state = playback_state;
+            Ok(())
+        })
+        .ok()
+    }
+
+    pub fn stop_playback_session_sonos_target(
+        &self,
+        account_id: Uuid,
+        target_id: &str,
+    ) -> Option<PlaybackSessionReadModel> {
+        self.mutate_playback_session(account_id, "target_stopped", None, |session, _now| {
+            match &session.active_target {
+                PlaybackSessionTarget::Sonos {
+                    target_id: active_target_id,
+                } if active_target_id == target_id => {}
+                _ => return Ok(()),
+            }
+            session.active_target = PlaybackSessionTarget::LocalAndroid {
+                attachment_id: session.attachment.as_ref().map(|attachment| attachment.attachment_id),
+            };
+            session.playback_state = PlaybackSessionState::Stopped;
+            session.transfer = None;
+            Ok(())
+        })
+        .ok()
+    }
+
     /// Publishes an event to connected clients. Slow or disconnected receivers are ignored.
     pub fn publish_event(
         &self,
@@ -658,6 +1129,23 @@ impl AppState {
     ) {
         let sequence = self.inner.event_sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let timestamp = Utc::now();
+        self.publish_screen_event_with_metadata(
+            sequence, timestamp, event, resource, action, entity_id, audience, surface, patch,
+        );
+    }
+
+    fn publish_screen_event_with_metadata(
+        &self,
+        sequence: u64,
+        timestamp: DateTime<Utc>,
+        event: &str,
+        resource: &str,
+        action: &str,
+        entity_id: Option<Uuid>,
+        audience: AppEventAudience,
+        surface: ScreenSurface,
+        patch: ScreenPatch,
+    ) {
         let event = AppEvent {
             stream_epoch: self.inner.event_stream_epoch,
             sequence,
@@ -673,6 +1161,64 @@ impl AppState {
             audience,
         };
         let _ = self.inner.event_tx.send(event);
+    }
+
+    fn mutate_playback_session<F>(
+        &self,
+        account_id: Uuid,
+        action: &str,
+        entity_id: Option<Uuid>,
+        mutation: F,
+    ) -> Result<PlaybackSessionReadModel, ApiError>
+    where
+        F: FnOnce(&mut PlaybackSessionRuntime, DateTime<Utc>) -> Result<(), ApiError>,
+    {
+        let now = Utc::now();
+        let (sequence, snapshot) = {
+            let mut sessions = self
+                .inner
+                .playback_sessions
+                .write()
+                .expect("playback sessions lock poisoned");
+            let revision = self.current_revision();
+            let session = sessions
+                .entry(account_id)
+                .or_insert_with(|| PlaybackSessionRuntime::new(revision, now));
+            mutation(session, now)?;
+            let sequence = self.inner.event_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+            session.revision = sequence;
+            session.snapshot_at = now;
+            (sequence, session.to_read_model())
+        };
+
+        self.publish_screen_event_with_metadata(
+            sequence,
+            now,
+            "playback_session_replaced",
+            "playback_session",
+            action,
+            entity_id,
+            AppEventAudience::Account { account_id },
+            ScreenSurface::Playback,
+            ScreenPatch::PlaybackSessionReplaced(PlaybackSessionReplacedPatch {
+                account_id,
+                session: snapshot.clone(),
+            }),
+        );
+        Ok(snapshot)
+    }
+
+    fn playback_session_runtime_snapshot(&self, account_id: Uuid) -> PlaybackSessionRuntime {
+        let now = Utc::now();
+        let sessions = self
+            .inner
+            .playback_sessions
+            .read()
+            .expect("playback sessions lock poisoned");
+        sessions
+            .get(&account_id)
+            .cloned()
+            .unwrap_or_else(|| PlaybackSessionRuntime::new(self.current_revision(), now))
     }
 
     /// Publishes catalog-derived Home section replacements for connected clients.
@@ -1164,6 +1710,15 @@ impl AppState {
         crate::sonos::play_target(self.clone(), target_id, owner, request).await
     }
 
+    pub async fn sonos_play_session_snapshot(
+        &self,
+        target_id: String,
+        owner: AuthenticatedAccount,
+        snapshot: &PlaybackSessionReadModel,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::play_session_snapshot(self.clone(), target_id, owner, snapshot).await
+    }
+
     pub async fn sonos_pause_target(
         &self,
         target_id: String,
@@ -1185,12 +1740,35 @@ impl AppState {
         crate::sonos::stop_target(self.clone(), target_id).await
     }
 
+    pub async fn sonos_stop_target_for_transfer(
+        &self,
+        target_id: String,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::stop_target_for_transfer(self.clone(), target_id).await
+    }
+
     pub async fn sonos_seek_target(
         &self,
         target_id: String,
         request: crate::api::sonos::SonosSeekRequest,
     ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
         crate::sonos::seek_target(self.clone(), target_id, request).await
+    }
+
+    pub async fn sonos_set_target_volume(
+        &self,
+        target_id: String,
+        request: crate::api::sonos::SonosVolumeRequest,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::set_target_volume(self.clone(), target_id, request).await
+    }
+
+    pub async fn sonos_set_target_mute(
+        &self,
+        target_id: String,
+        request: crate::api::sonos::SonosMuteRequest,
+    ) -> Result<crate::api::sonos::SonosPlaybackResponse, SonosOperationError> {
+        crate::sonos::set_target_mute(self.clone(), target_id, request).await
     }
 
     pub async fn sonos_next_target(
@@ -4564,6 +5142,170 @@ fn validate_password(password: &str) -> Result<(), ApiError> {
 ///
 /// Errors:
 /// - Returns `ApiError` when validation fails, persistence or I/O fails, an external process/provider fails, or a downstream operation returns that error.
+impl PlaybackSessionTarget {
+    pub fn kind(&self) -> PlaybackTargetKind {
+        match self {
+            Self::LocalAndroid { .. } => PlaybackTargetKind::LocalAndroid,
+            Self::Sonos { .. } => PlaybackTargetKind::Sonos,
+        }
+    }
+}
+
+impl PlaybackSessionRuntime {
+    fn new(revision: u64, snapshot_at: DateTime<Utc>) -> Self {
+        Self {
+            session_id: Uuid::new_v4(),
+            queue: Vec::new(),
+            context_type: None,
+            context_id: None,
+            current_index: None,
+            playback_state: PlaybackSessionState::Stopped,
+            position_seconds: 0,
+            duration_seconds: None,
+            repeat_mode: PlaybackRepeatMode::Off,
+            shuffle: false,
+            active_target: PlaybackSessionTarget::LocalAndroid {
+                attachment_id: None,
+            },
+            attachment: None,
+            transfer: None,
+            revision,
+            snapshot_at,
+        }
+    }
+
+    fn to_read_model(&self) -> PlaybackSessionReadModel {
+        PlaybackSessionReadModel {
+            session_id: self.session_id,
+            queue: self.queue.clone(),
+            context_type: self.context_type,
+            context_id: self.context_id,
+            current_index: self.current_index.map(|index| index as u32),
+            playback_state: self.playback_state,
+            position_seconds: self.position_seconds,
+            duration_seconds: self.duration_seconds,
+            repeat_mode: self.repeat_mode,
+            shuffle: self.shuffle,
+            active_target: self.active_target.clone(),
+            attachment: self.attachment.clone(),
+            transfer: self.transfer.clone(),
+            revision: self.revision,
+            snapshot_at: self.snapshot_at,
+        }
+    }
+}
+
+fn apply_playback_session_queue_replacement(
+    session: &mut PlaybackSessionRuntime,
+    replacement: PlaybackSessionQueueReplacement,
+) -> Result<(), ApiError> {
+    validate_playback_context(replacement.context_type, replacement.context_id)?;
+    let next_index = validate_session_queue_index(&replacement.queue, replacement.current_index)?;
+    let next_duration = replacement
+        .duration_seconds
+        .or_else(|| next_index.and_then(|index| replacement.queue[index].duration_seconds));
+    validate_progress_seconds(replacement.position_seconds.unwrap_or(0), next_duration)?;
+
+    session.queue = replacement.queue;
+    session.context_type = replacement.context_type;
+    session.context_id = replacement.context_id;
+    session.current_index = next_index;
+    session.playback_state = replacement
+        .playback_state
+        .unwrap_or(PlaybackSessionState::Stopped);
+    session.position_seconds = replacement.position_seconds.unwrap_or(0);
+    session.duration_seconds = next_duration;
+    session.transfer = None;
+    Ok(())
+}
+
+fn apply_playback_session_state_mutation(
+    session: &mut PlaybackSessionRuntime,
+    mutation: PlaybackSessionStateMutation,
+) -> Result<(), ApiError> {
+    let next_index = match mutation.current_index {
+        Some(index) => validate_session_queue_index(&session.queue, Some(index))?,
+        None => session.current_index,
+    };
+    let next_duration = mutation
+        .duration_seconds
+        .or_else(|| next_index.and_then(|index| session.queue[index].duration_seconds))
+        .or(session.duration_seconds);
+    let next_position = mutation.position_seconds.unwrap_or(session.position_seconds);
+    validate_progress_seconds(next_position, next_duration)?;
+    session.current_index = next_index;
+    session.duration_seconds = next_duration;
+    session.position_seconds = next_position;
+    if let Some(playback_state) = mutation.playback_state {
+        session.playback_state = playback_state;
+    }
+    if let Some(repeat_mode) = mutation.repeat_mode {
+        session.repeat_mode = repeat_mode;
+    }
+    if let Some(shuffle) = mutation.shuffle {
+        session.shuffle = shuffle;
+    }
+    Ok(())
+}
+
+fn apply_playback_session_snapshot(
+    session: &mut PlaybackSessionRuntime,
+    snapshot: PlaybackSessionReadModel,
+) {
+    session.session_id = snapshot.session_id;
+    session.queue = snapshot.queue;
+    session.context_type = snapshot.context_type;
+    session.context_id = snapshot.context_id;
+    session.current_index = snapshot.current_index.map(|index| index as usize);
+    session.playback_state = snapshot.playback_state;
+    session.position_seconds = snapshot.position_seconds;
+    session.duration_seconds = snapshot.duration_seconds;
+    session.repeat_mode = snapshot.repeat_mode;
+    session.shuffle = snapshot.shuffle;
+    session.active_target = snapshot.active_target;
+    session.attachment = snapshot.attachment;
+    session.transfer = snapshot.transfer;
+}
+
+pub fn playback_state_for_sonos_status(
+    status: SonosSessionStatus,
+    transport_state: Option<SonosTransportState>,
+) -> PlaybackSessionState {
+    if status == SonosSessionStatus::Reconnecting {
+        return PlaybackSessionState::Buffering;
+    }
+    match transport_state {
+        Some(SonosTransportState::Playing) => PlaybackSessionState::Playing,
+        Some(SonosTransportState::Buffering) => PlaybackSessionState::Buffering,
+        Some(SonosTransportState::Paused) => PlaybackSessionState::Paused,
+        Some(SonosTransportState::Stopped) => PlaybackSessionState::Stopped,
+        None => PlaybackSessionState::Playing,
+    }
+}
+
+fn validate_session_queue_index(
+    queue: &[PlaybackSessionQueueItem],
+    current_index: Option<u32>,
+) -> Result<Option<usize>, ApiError> {
+    if queue.is_empty() {
+        match current_index {
+            Some(index) if index != 0 => {
+                return Err(ApiError::BadRequest(
+                    "current_index cannot point outside the playback queue".into(),
+                ));
+            }
+            _ => return Ok(None),
+        }
+    }
+    let index = current_index.unwrap_or(0) as usize;
+    if index >= queue.len() {
+        return Err(ApiError::BadRequest(
+            "current_index cannot point outside the playback queue".into(),
+        ));
+    }
+    Ok(Some(index))
+}
+
 fn validate_progress_seconds(
     position_seconds: u32,
     duration_seconds: Option<u32>,
