@@ -2404,6 +2404,16 @@ async fn admin_user_management_creates_resets_and_deletes_users() {
     assert_eq!(duplicate_status, StatusCode::CONFLICT);
     assert_eq!(duplicate_body["code"], "conflict");
 
+    let (initial_login_status, initial_login) = get_json_with_credentials(
+        app.clone(),
+        "/api/v1/auth/me",
+        "temporary",
+        "initial-password",
+    )
+    .await;
+    assert_eq!(initial_login_status, StatusCode::OK);
+    assert_eq!(initial_login["username"], "temporary");
+
     let (reset_status, reset) = request_json(
         app.clone(),
         "POST",
@@ -4591,6 +4601,20 @@ async fn catalog_browse_returns_only_published_stable_items_with_cursor_paging()
     assert_eq!(podcasts_status, StatusCode::OK);
     assert_eq!(podcasts["podcasts"].as_array().unwrap().len(), 1);
     assert_eq!(podcasts["podcasts"][0]["title"], "History Daily");
+
+    let (startup_status, startup) =
+        get_json(app.clone(), "/api/v1/startup/snapshot", Some(TestAuth::User)).await;
+    assert_eq!(startup_status, StatusCode::OK);
+    assert_eq!(startup["account"]["username"], json!(USER_USERNAME));
+    assert_eq!(startup["home"]["sections"].as_array().unwrap().len(), 5);
+    assert_eq!(startup["artists"]["artists"][0]["name"], json!("The Beatles"));
+    assert_eq!(startup["albums"]["albums"][0]["title"], json!("Abbey Road"));
+    assert_eq!(
+        startup["tracks"]["tracks"][0]["title"],
+        json!("Come Together")
+    );
+    assert_eq!(startup["podcasts"]["podcasts"][0]["title"], json!("History Daily"));
+    assert_eq!(startup["tracks"]["page"]["sort"], json!("album_position"));
 
     let (episodes_status, episodes) =
         get_json(app, "/api/v1/catalog/episodes", Some(TestAuth::User)).await;
@@ -12500,6 +12524,7 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
     ));
     assert!(paths.contains_key("/api/v1/me/home"));
     assert!(paths.contains_key("/api/v1/me/favorites/tracks"));
+    assert!(paths.contains_key("/api/v1/startup/snapshot"));
     assert!(paths.contains_key("/api/v1/events"));
     assert!(paths.contains_key("/api/v1/sonos/targets"));
     for route in [
@@ -12662,7 +12687,7 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         "HomeResponse",
         "HomeSection",
         "HomeSectionId",
-        "HomeScreenPatch",
+        "HomeSectionsPatch",
         "PlaybackProgress",
         "PlaybackHistoryScreenPatch",
         "PlaybackPositionHint",
@@ -12684,13 +12709,17 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         "PlaybackSessionTransferRequest",
         "PlaybackTargetKind",
         "PlaybackTransferState",
-        "PlaylistScreenPatch",
+        "PlaylistDetailRemovePatch",
+        "PlaylistDetailReplacePatch",
+        "PlaylistListRemovePatch",
+        "PlaylistListUpsertPatch",
         "ScreenActionHint",
         "ScreenArtwork",
         "ScreenContextHint",
         "ScreenPatch",
         "ScreenSurface",
         "SearchTrackEntry",
+        "StartupSnapshotResponse",
         "DashboardSummaryResponse",
         "ErrorResponseDetails",
         "SonosDeliveryKind",
@@ -13041,6 +13070,7 @@ async fn openapi_documents_maintenance_and_provider_repair_endpoints() {
         ("/api/v1/sonos/targets/{target_id}/volume", "post"),
         ("/api/v1/sonos/targets/{target_id}/mute", "post"),
         ("/api/v1/me/home", "get"),
+        ("/api/v1/startup/snapshot", "get"),
         ("/api/v1/events", "get"),
     ];
 

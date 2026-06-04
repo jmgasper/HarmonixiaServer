@@ -9,14 +9,17 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    api::catalog::{artist_browse_items, ArtistBrowseItem},
+    api::catalog::{
+        artist_browse_items, page_metadata, ArtistBrowseItem, BrowseTracksResponse,
+    },
     api::home::{
-        action_hint, primary_artwork, progress_hint, PlaybackPositionHint, ScreenActionHint,
-        ScreenArtwork,
+        self, action_hint, primary_artwork, progress_hint, HomeResponse,
+        PlaybackPositionHint, ScreenActionHint, ScreenArtwork,
     },
     auth::AuthenticatedUser,
     domain::{
-        Album, ArtworkKind, CatalogEntityType, Episode, PlaybackItemType, Playlist, Podcast,
+        Album, ArtworkKind, AuthenticatedAccount, CatalogEntityType, Episode,
+        PlaybackItemType, PlaybackProgress, Playlist, Podcast,
     },
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -26,6 +29,7 @@ const STARTUP_BROWSE_LIMIT: u32 = 30;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/snapshot", get(startup_snapshot))
         .route("/playlists/snapshot", get(playlist_list_snapshot))
         .route("/artists/snapshot", get(artists_browse_snapshot))
         .route("/albums/snapshot", get(albums_browse_snapshot))
@@ -75,10 +79,73 @@ pub struct PodcastDetailReadModel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StartupSnapshotResponse {
+    pub revision: u64,
+    pub snapshot_at: DateTime<Utc>,
+    pub account: AuthenticatedAccount,
+    pub home: HomeResponse,
+    pub playlists: Vec<Playlist>,
+    pub artists: ArtistsBrowseSnapshot,
+    pub albums: AlbumsBrowseSnapshot,
+    pub tracks: BrowseTracksResponse,
+    pub podcasts: PodcastsBrowseSnapshot,
+    pub playback_progress: Vec<PlaybackProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PodcastDetailEpisode {
     pub episode: Episode,
     pub resume: Option<PlaybackPositionHint>,
     pub actions: Vec<ScreenActionHint>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/startup/snapshot",
+    tag = "startup",
+    security(("basicAuth" = [])),
+    responses(
+        (status = 200, description = "Combined startup snapshot for first-screen hydration with authenticated account, Home, playlists, first catalog browse pages, and playback progress in one request.", body = StartupSnapshotResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse)
+    )
+)]
+pub async fn startup_snapshot(
+    State(state): State<AppState>,
+    AuthenticatedUser(account): AuthenticatedUser,
+) -> Result<Json<StartupSnapshotResponse>, ApiError> {
+    let account_id = account.id;
+    let revision = state.current_revision();
+    let snapshot_at = Utc::now();
+    let (
+        home,
+        playlists,
+        artists,
+        albums,
+        tracks,
+        podcasts,
+        playback_progress,
+    ) = tokio::try_join!(
+        home::home_response(&state, account_id),
+        state.playlists_for_startup_snapshot(account_id),
+        startup_artists_snapshot(&state, account_id),
+        startup_albums_snapshot(&state),
+        startup_tracks_snapshot(&state),
+        startup_podcasts_snapshot(&state),
+        state.playback_progress_for_account(account_id),
+    )?;
+
+    Ok(Json(StartupSnapshotResponse {
+        revision,
+        snapshot_at,
+        account,
+        home,
+        playlists,
+        artists,
+        albums,
+        tracks,
+        podcasts,
+        playback_progress,
+    }))
 }
 
 #[utoipa::path(
@@ -116,13 +183,7 @@ pub async fn artists_browse_snapshot(
     State(state): State<AppState>,
     AuthenticatedUser(account): AuthenticatedUser,
 ) -> Result<Json<ArtistsBrowseSnapshot>, ApiError> {
-    let artists = state.startup_browse_artists(STARTUP_BROWSE_LIMIT).await?;
-    Ok(Json(ArtistsBrowseSnapshot {
-        revision: state.current_revision(),
-        snapshot_at: Utc::now(),
-        artists: artist_browse_items(&state, account.id, artists).await?,
-        limit: STARTUP_BROWSE_LIMIT,
-    }))
+    Ok(Json(startup_artists_snapshot(&state, account.id).await?))
 }
 
 #[utoipa::path(
@@ -139,12 +200,7 @@ pub async fn albums_browse_snapshot(
     State(state): State<AppState>,
     AuthenticatedUser(_account): AuthenticatedUser,
 ) -> Result<Json<AlbumsBrowseSnapshot>, ApiError> {
-    Ok(Json(AlbumsBrowseSnapshot {
-        revision: state.current_revision(),
-        snapshot_at: Utc::now(),
-        albums: state.startup_browse_albums(STARTUP_BROWSE_LIMIT).await?,
-        limit: STARTUP_BROWSE_LIMIT,
-    }))
+    Ok(Json(startup_albums_snapshot(&state).await?))
 }
 
 #[utoipa::path(
@@ -161,12 +217,7 @@ pub async fn podcasts_browse_snapshot(
     State(state): State<AppState>,
     AuthenticatedUser(_account): AuthenticatedUser,
 ) -> Result<Json<PodcastsBrowseSnapshot>, ApiError> {
-    Ok(Json(PodcastsBrowseSnapshot {
-        revision: state.current_revision(),
-        snapshot_at: Utc::now(),
-        podcasts: state.startup_browse_podcasts(STARTUP_BROWSE_LIMIT).await?,
-        limit: STARTUP_BROWSE_LIMIT,
-    }))
+    Ok(Json(startup_podcasts_snapshot(&state).await?))
 }
 
 #[utoipa::path(
@@ -226,6 +277,53 @@ pub async fn podcast_detail(
         primary_artwork,
         episodes: episode_entries,
     }))
+}
+
+async fn startup_artists_snapshot(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<ArtistsBrowseSnapshot, ApiError> {
+    let artists = state.startup_browse_artists(STARTUP_BROWSE_LIMIT).await?;
+    Ok(ArtistsBrowseSnapshot {
+        revision: state.current_revision(),
+        snapshot_at: Utc::now(),
+        artists: artist_browse_items(state, account_id, artists).await?,
+        limit: STARTUP_BROWSE_LIMIT,
+    })
+}
+
+async fn startup_albums_snapshot(
+    state: &AppState,
+) -> Result<AlbumsBrowseSnapshot, ApiError> {
+    Ok(AlbumsBrowseSnapshot {
+        revision: state.current_revision(),
+        snapshot_at: Utc::now(),
+        albums: state.startup_browse_albums(STARTUP_BROWSE_LIMIT).await?,
+        limit: STARTUP_BROWSE_LIMIT,
+    })
+}
+
+async fn startup_tracks_snapshot(
+    state: &AppState,
+) -> Result<BrowseTracksResponse, ApiError> {
+    let page = state
+        .browse_tracks(Some(STARTUP_BROWSE_LIMIT), None, Some("album_position"))
+        .await?;
+    Ok(BrowseTracksResponse {
+        page: page_metadata(&page),
+        tracks: page.items,
+    })
+}
+
+async fn startup_podcasts_snapshot(
+    state: &AppState,
+) -> Result<PodcastsBrowseSnapshot, ApiError> {
+    Ok(PodcastsBrowseSnapshot {
+        revision: state.current_revision(),
+        snapshot_at: Utc::now(),
+        podcasts: state.startup_browse_podcasts(STARTUP_BROWSE_LIMIT).await?,
+        limit: STARTUP_BROWSE_LIMIT,
+    })
 }
 
 #[cfg(test)]

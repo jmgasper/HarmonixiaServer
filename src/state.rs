@@ -63,6 +63,9 @@ use crate::{
     },
 };
 
+const AUTH_CACHE_TTL_SECONDS: i64 = 60;
+const AUTH_CACHE_MAX_ENTRIES: usize = 1024;
+
 #[derive(Debug, Clone)]
 /// Represents server config in the application state facade used by HTTP handlers and background workers.
 ///
@@ -573,6 +576,7 @@ pub struct AppState {
 struct AppStateInner {
     config: ServerConfig,
     system_config: RwLock<SystemConfig>,
+    auth_cache: RwLock<HashMap<AuthCacheKey, AuthCacheEntry>>,
     event_stream_epoch: Uuid,
     event_sequence: AtomicU64,
     event_tx: broadcast::Sender<AppEvent>,
@@ -583,6 +587,16 @@ struct AppStateInner {
     transcode_admission: TranscodeAdmission,
     hls_generation_coordinator: HlsGenerationCoordinator,
     repository: PgMaintenanceRepository,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AuthCacheKey([u8; 32]);
+
+#[derive(Debug, Clone)]
+struct AuthCacheEntry {
+    account: AuthenticatedAccount,
+    account_updated_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -696,6 +710,7 @@ impl AppState {
                 ),
                 hls_generation_coordinator: HlsGenerationCoordinator::new(),
                 system_config: RwLock::new(system_config),
+                auth_cache: RwLock::new(HashMap::new()),
                 event_stream_epoch: Uuid::new_v4(),
                 event_sequence: AtomicU64::new(0),
                 event_tx,
@@ -2243,6 +2258,8 @@ impl AppState {
         if username.is_empty() {
             return Ok(None);
         }
+        let cache_key = auth_cache_key(username, password);
+        let now = Utc::now();
 
         let Some(account) = self
             .inner
@@ -2254,11 +2271,66 @@ impl AppState {
             return Ok(None);
         };
 
+        if let Some(cached_account) =
+            self.cached_authenticated_account(cache_key, account.updated_at, now)
+        {
+            return Ok(Some(cached_account));
+        }
+
         if verify_password(password, &account.password_hash) {
-            Ok(Some(account.into()))
+            let authenticated = AuthenticatedAccount::from(account.clone());
+            self.cache_authenticated_account(
+                cache_key,
+                authenticated.clone(),
+                account.updated_at,
+                now,
+            );
+            Ok(Some(authenticated))
         } else {
             Ok(None)
         }
+    }
+
+    fn cached_authenticated_account(
+        &self,
+        cache_key: AuthCacheKey,
+        account_updated_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<AuthenticatedAccount> {
+        self.inner
+            .auth_cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&cache_key).cloned())
+            .filter(|entry| entry.account_updated_at == account_updated_at)
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| entry.account)
+    }
+
+    fn cache_authenticated_account(
+        &self,
+        cache_key: AuthCacheKey,
+        account: AuthenticatedAccount,
+        account_updated_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) {
+        let Ok(mut cache) = self.inner.auth_cache.write() else {
+            return;
+        };
+        if cache.len() >= AUTH_CACHE_MAX_ENTRIES {
+            cache.retain(|_, entry| entry.expires_at > now);
+            if cache.len() >= AUTH_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            cache_key,
+            AuthCacheEntry {
+                account,
+                account_updated_at,
+                expires_at: now + Duration::seconds(AUTH_CACHE_TTL_SECONDS),
+            },
+        );
     }
 
     /// Creates a new resource for application state facade used by HTTP handlers and background workers.
@@ -4387,6 +4459,15 @@ fn constant_time_bytes_equal(left: &[u8], right: &[u8]) -> bool {
         .zip(right.iter())
         .fold(0_u8, |diff, (left, right)| diff | (left ^ right))
         == 0
+}
+
+fn auth_cache_key(username: &str, password: &str) -> AuthCacheKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"harmonixia-basic-auth-v1");
+    hasher.update(username.trim().to_ascii_lowercase().as_bytes());
+    hasher.update([0]);
+    hasher.update(password.as_bytes());
+    AuthCacheKey(hasher.finalize().into())
 }
 
 /// Validates data for application state facade used by HTTP handlers and background workers.

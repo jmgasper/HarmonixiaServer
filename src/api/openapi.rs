@@ -59,6 +59,7 @@ use crate::{
     api::startup::{
         AlbumsBrowseSnapshot, ArtistsBrowseSnapshot, PlaylistListSnapshot,
         PodcastDetailEpisode, PodcastDetailReadModel, PodcastsBrowseSnapshot,
+        StartupSnapshotResponse,
     },
     api::sync::{
         AlbumSyncSnapshot, DownloadVariantEntry, PlaylistSyncSnapshot,
@@ -148,6 +149,7 @@ use crate::{
         crate::api::favorites::add_track_favorite,
         crate::api::favorites::remove_track_favorite,
         crate::api::startup::playlist_list_snapshot,
+        crate::api::startup::startup_snapshot,
         crate::api::startup::artists_browse_snapshot,
         crate::api::startup::albums_browse_snapshot,
         crate::api::startup::podcasts_browse_snapshot,
@@ -373,6 +375,7 @@ use crate::{
             ScreenPatch,
             ScreenSurface,
             SearchTrackEntry,
+            StartupSnapshotResponse,
             SyncPlaylistItemEntry,
             SyncTrackEntry,
             TranscodeSlotUsage,

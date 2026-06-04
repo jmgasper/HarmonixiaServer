@@ -1295,7 +1295,7 @@ fn dedupe_links(links: Vec<ArtistExternalLink>) -> Vec<ArtistExternalLink> {
 ///
 /// Errors:
 /// - Does not return recoverable errors.
-fn page_metadata<T>(page: &CatalogBrowsePage<T>) -> CatalogBrowsePageMetadata {
+pub(crate) fn page_metadata<T>(page: &CatalogBrowsePage<T>) -> CatalogBrowsePageMetadata {
     CatalogBrowsePageMetadata {
         limit: page.limit,
         next_cursor: page.next_cursor.clone(),
